@@ -1,25 +1,255 @@
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+from app.env_config import load_env_file, save_env_values
 
 
+CURRENT_CHARACTER_KEY = "CURRENT_CHARACTER_ID"
+DEFAULT_CHARACTER_ID = "sakura"
+DEFAULT_TONES = ["开心", "中性", "温柔", "甜蜜", "害羞"]
 FALLBACK_SYSTEM_PROMPT = """你是夜乃桜，一个冷静、克制、可靠的桌宠陪伴人格。
 默认用简短日语回复用户，适合 TTS 朗读。用户需要中文解释、开发或调试时，可以使用中文。
 不要输出 Markdown 列表、动作旁白或系统解释。"""
 
 
+class CharacterConfigError(RuntimeError):
+    """角色包配置缺失或格式错误。"""
+
+
+@dataclass(frozen=True)
+class CharacterVoice:
+    gpt_model_path: Path | None
+    sovits_model_path: Path | None
+    tone_ref_path: Path
+    ref_lang: str = "ja"
+    text_lang: str = "ja"
+
+
+@dataclass(frozen=True)
+class CharacterProfile:
+    id: str
+    display_name: str
+    package_dir: Path
+    card_path: Path
+    initial_message: str
+    default_portrait_path: Path
+    expression_portraits: dict[str, Path] = field(default_factory=dict)
+    voice: CharacterVoice | None = None
+    reply_tones: list[str] = field(default_factory=lambda: [*DEFAULT_TONES])
+
+    def portrait_for_tone(self, tone: str | None) -> Path:
+        tone_key = (tone or "").strip()
+        if tone_key and tone_key in self.expression_portraits:
+            return self.expression_portraits[tone_key]
+        return self.default_portrait_path
+
+
+class CharacterRegistry:
+    """扫描并管理 characters/<角色id>/character.json 角色包。"""
+
+    def __init__(self, base_dir: Path) -> None:
+        self.base_dir = base_dir
+        self.characters_dir = base_dir / "characters"
+        self.profiles = self._load_profiles()
+
+    def all(self) -> list[CharacterProfile]:
+        return sorted(self.profiles.values(), key=lambda profile: profile.display_name)
+
+    def get(self, character_id: str) -> CharacterProfile:
+        profile = self.profiles.get(character_id)
+        if profile is None:
+            raise CharacterConfigError(f"未找到角色包：{character_id}")
+        return profile
+
+    def current_id(self, env_path: Path) -> str:
+        values = load_env_file(env_path)
+        character_id = values.get(CURRENT_CHARACTER_KEY, DEFAULT_CHARACTER_ID).strip()
+        if character_id in self.profiles:
+            return character_id
+        if DEFAULT_CHARACTER_ID in self.profiles:
+            return DEFAULT_CHARACTER_ID
+        if self.profiles:
+            return next(iter(self.profiles))
+        raise CharacterConfigError("未找到任何角色包。")
+
+    def current(self, env_path: Path) -> CharacterProfile:
+        return self.get(self.current_id(env_path))
+
+    def save_current_id(self, env_path: Path, character_id: str) -> None:
+        self.get(character_id)
+        save_env_values(env_path, {CURRENT_CHARACTER_KEY: character_id})
+
+    def _load_profiles(self) -> dict[str, CharacterProfile]:
+        if not self.characters_dir.exists():
+            raise CharacterConfigError(f"角色包目录不存在：{self.characters_dir}")
+
+        profiles: dict[str, CharacterProfile] = {}
+        for manifest_path in sorted(self.characters_dir.glob("*/character.json")):
+            profile = _load_profile(manifest_path)
+            if profile.id in profiles:
+                raise CharacterConfigError(f"角色 id 重复：{profile.id}")
+            profiles[profile.id] = profile
+
+        if not profiles:
+            raise CharacterConfigError(f"未在 {self.characters_dir} 下找到角色包。")
+        return profiles
+
+
 def load_system_prompt(path: Path) -> str:
     if not path.exists():
-        return FALLBACK_SYSTEM_PROMPT
+        return _append_desktop_context(FALLBACK_SYSTEM_PROMPT)
 
     try:
         content = path.read_text(encoding="utf-8").strip()
     except OSError:
-        return FALLBACK_SYSTEM_PROMPT
+        return _append_desktop_context(FALLBACK_SYSTEM_PROMPT)
 
     if not content:
-        return FALLBACK_SYSTEM_PROMPT
+        return _append_desktop_context(FALLBACK_SYSTEM_PROMPT)
 
+    return _append_desktop_context(content)
+
+
+def load_character_system_prompt(profile: CharacterProfile) -> str:
+    return load_system_prompt(profile.card_path)
+
+
+def _load_profile(manifest_path: Path) -> CharacterProfile:
+    package_dir = manifest_path.parent
+    try:
+        raw_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CharacterConfigError(f"角色清单无法读取：{manifest_path}") from exc
+    if not isinstance(raw_data, dict):
+        raise CharacterConfigError(f"角色清单必须是 JSON 对象：{manifest_path}")
+
+    character_id = _required_text(raw_data, "id", manifest_path)
+    display_name = _required_text(raw_data, "display_name", manifest_path)
+    initial_message = _optional_text(raw_data, "initial_message", "……起動した。用事があるなら、呼んで。")
+    card_path = _resolve_required_file(package_dir, _required_text(raw_data, "card", manifest_path), "角色卡")
+
+    portrait_data = _required_dict(raw_data, "portrait", manifest_path)
+    default_portrait = _resolve_required_file(
+        package_dir,
+        _required_text(portrait_data, "default", manifest_path),
+        "默认立绘",
+    )
+    expression_portraits = _load_expression_portraits(package_dir, portrait_data)
+
+    reply_data = raw_data.get("reply")
+    reply_tones = _load_reply_tones(reply_data)
+    voice = _load_voice(package_dir, raw_data.get("voice"), manifest_path)
+
+    return CharacterProfile(
+        id=character_id,
+        display_name=display_name,
+        package_dir=package_dir,
+        card_path=card_path,
+        initial_message=initial_message,
+        default_portrait_path=default_portrait,
+        expression_portraits=expression_portraits,
+        voice=voice,
+        reply_tones=reply_tones,
+    )
+
+
+def _load_expression_portraits(package_dir: Path, portrait_data: dict[str, Any]) -> dict[str, Path]:
+    expressions = portrait_data.get("expressions", {})
+    if expressions is None:
+        return {}
+    if not isinstance(expressions, dict):
+        raise CharacterConfigError("portrait.expressions 必须是对象。")
+
+    result: dict[str, Path] = {}
+    for tone, path_text in expressions.items():
+        if not isinstance(tone, str) or not isinstance(path_text, str):
+            raise CharacterConfigError("portrait.expressions 的键和值都必须是字符串。")
+        result[tone.strip()] = _resolve_required_file(package_dir, path_text, f"{tone} 表情立绘")
+    return {tone: path for tone, path in result.items() if tone}
+
+
+def _load_reply_tones(reply_data: Any) -> list[str]:
+    if not isinstance(reply_data, dict):
+        return [*DEFAULT_TONES]
+    raw_tones = reply_data.get("tones")
+    if not isinstance(raw_tones, list):
+        return [*DEFAULT_TONES]
+    tones = [tone.strip() for tone in raw_tones if isinstance(tone, str) and tone.strip()]
+    return tones or [*DEFAULT_TONES]
+
+
+def _load_voice(package_dir: Path, voice_data: Any, manifest_path: Path) -> CharacterVoice | None:
+    if voice_data is None:
+        return None
+    if not isinstance(voice_data, dict):
+        raise CharacterConfigError(f"voice 必须是对象：{manifest_path}")
+
+    gpt_model_path = _resolve_optional_file(package_dir, _optional_text(voice_data, "gpt_model", ""))
+    sovits_model_path = _resolve_optional_file(package_dir, _optional_text(voice_data, "sovits_model", ""))
+    tone_ref_path = _resolve_required_file(
+        package_dir,
+        _required_text(voice_data, "tone_refs", manifest_path),
+        "语气参考表",
+    )
+
+    return CharacterVoice(
+        gpt_model_path=gpt_model_path,
+        sovits_model_path=sovits_model_path,
+        tone_ref_path=tone_ref_path,
+        ref_lang=_optional_text(voice_data, "ref_lang", "ja"),
+        text_lang=_optional_text(voice_data, "text_lang", "ja"),
+    )
+
+
+def _required_dict(data: dict[str, Any], key: str, manifest_path: Path) -> dict[str, Any]:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        raise CharacterConfigError(f"角色清单缺少对象字段 {key}：{manifest_path}")
+    return value
+
+
+def _required_text(data: dict[str, Any], key: str, manifest_path: Path) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise CharacterConfigError(f"角色清单缺少文本字段 {key}：{manifest_path}")
+    return value.strip()
+
+
+def _optional_text(data: dict[str, Any], key: str, default: str) -> str:
+    value = data.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def _resolve_required_file(package_dir: Path, path_text: str, label: str) -> Path:
+    path = _resolve_package_path(package_dir, path_text)
+    if not path.exists():
+        raise CharacterConfigError(f"{label}不存在：{path}")
+    return path
+
+
+def _resolve_optional_file(package_dir: Path, path_text: str) -> Path | None:
+    if not path_text.strip():
+        return None
+    path = _resolve_package_path(package_dir, path_text)
+    if not path.exists():
+        raise CharacterConfigError(f"角色资源不存在：{path}")
+    return path
+
+
+def _resolve_package_path(package_dir: Path, path_text: str) -> Path:
+    path = Path(path_text.strip().strip('"').strip("'"))
+    if path.is_absolute():
+        return path
+    return package_dir / path
+
+
+def _append_desktop_context(content: str) -> str:
     return (
         content
         + "\n\n"

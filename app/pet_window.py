@@ -20,6 +20,13 @@ from PySide6.QtWidgets import (
 )
 
 from app.api_client import OpenAICompatibleClient
+from app.character_loader import (
+    DEFAULT_CHARACTER_ID,
+    CharacterConfigError,
+    CharacterProfile,
+    CharacterRegistry,
+    load_character_system_prompt,
+)
 from app.chat_history import ChatHistoryStore
 from app.chat_reply import ChatReply, ChatSegment
 from app.chat_worker import ChatWorker
@@ -46,20 +53,22 @@ class PetWindow(QWidget):
     def __init__(
         self,
         base_dir: Path,
-        portrait_path: Path,
+        character_registry: CharacterRegistry,
+        character_profile: CharacterProfile,
         api_client: OpenAICompatibleClient,
-        system_prompt: str,
         tts_provider: TTSProvider,
     ) -> None:
         super().__init__()
         self.base_dir = base_dir
         self.env_path = base_dir / ".env"
-        self.portrait_path = portrait_path
+        self.character_registry = character_registry
+        self.character_profile = character_profile
+        self.portrait_path = character_profile.default_portrait_path
         self.api_client = api_client
-        self.system_prompt = system_prompt
+        self.system_prompt = load_character_system_prompt(character_profile)
         self.tts_provider = tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
-        self.history_store = ChatHistoryStore(base_dir / "data" / "chat_history.jsonl")
+        self.history_store = self._create_history_store(character_profile)
         self.subtitle_language = self._load_subtitle_language()
         self.history_window: HistoryWindow | None = None
         self.messages: list[dict[str, str]] = []
@@ -81,7 +90,7 @@ class PetWindow(QWidget):
         self.speech_timer.setInterval(SPEECH_TYPING_INTERVAL_MS)
         self.speech_timer.timeout.connect(self._show_next_speech_char)
 
-        self.setWindowTitle("夜乃桜")
+        self.setWindowTitle(character_profile.display_name)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -99,10 +108,10 @@ class PetWindow(QWidget):
         self.bubble.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.bubble.customContextMenuRequested.connect(self._show_context_menu)
 
-        self.name_label = QLabel("夜乃桜", self.bubble)
+        self.name_label = QLabel(character_profile.display_name, self.bubble)
         self.name_label.setObjectName("speakerName")
 
-        self.speech_label = QLabel("……起動した。用事があるなら、呼んで。", self.bubble)
+        self.speech_label = QLabel(character_profile.initial_message, self.bubble)
         self.speech_label.setObjectName("speechText")
         self.speech_label.setWordWrap(True)
         self.speech_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
@@ -124,7 +133,7 @@ class PetWindow(QWidget):
 
         self.input_edit = QLineEdit(self.input_bar)
         self.input_edit.setObjectName("petInput")
-        self.input_edit.setPlaceholderText("桜に話しかける...")
+        self.input_edit.setPlaceholderText(f"{character_profile.display_name}に話しかける...")
         self.input_edit.setFixedHeight(34)
         self.input_edit.returnPressed.connect(self.send_message)
 
@@ -257,6 +266,16 @@ class PetWindow(QWidget):
             )
         return pixmap
 
+    def _apply_portrait_for_tone(self, tone: str | None) -> None:
+        next_portrait_path = self.character_profile.portrait_for_tone(tone)
+        if next_portrait_path == self.portrait_path:
+            return
+        self.portrait_path = next_portrait_path
+        self.pixmap = self._load_portrait()
+        self._apply_portrait()
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setIcon(QIcon(self.pixmap) if not self.pixmap.isNull() else QIcon())
+
     def _apply_portrait(self) -> None:
         if self.pixmap.isNull():
             self.resize(*self.stage_size)
@@ -312,7 +331,7 @@ class PetWindow(QWidget):
     def _create_tray_icon(self) -> None:
         icon = QIcon(self.pixmap) if not self.pixmap.isNull() else QIcon()
         self.tray_icon = QSystemTrayIcon(icon, self)
-        self.tray_icon.setToolTip("夜乃桜")
+        self.tray_icon.setToolTip(self.character_profile.display_name)
         self.tray_icon.setContextMenu(self._build_menu())
         self.tray_icon.activated.connect(self._handle_tray_activated)
         self.tray_icon.show()
@@ -384,7 +403,12 @@ class PetWindow(QWidget):
         self._set_busy(True)
 
         self.thread = QThread(self)
-        self.worker = ChatWorker(self.api_client, self.system_prompt, next_messages)
+        self.worker = ChatWorker(
+            self.api_client,
+            self.system_prompt,
+            next_messages,
+            self.character_profile.reply_tones,
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self._handle_reply)
@@ -471,22 +495,42 @@ class PetWindow(QWidget):
     @Slot()
     def show_settings(self) -> None:
         try:
-            tts_settings = GPTSoVITSTTSSettings.load(self.env_path, self.base_dir, validate_enabled=False)
+            tts_settings = GPTSoVITSTTSSettings.load(
+                self.env_path,
+                self.base_dir,
+                validate_enabled=False,
+                character_profile=self.character_profile,
+            )
         except (OSError, TTSConfigError) as exc:
             QMessageBox.warning(self, "配置读取失败", f"TTS 配置读取失败，将使用默认值打开设置：{exc}")
             tts_settings = self._default_tts_settings()
 
-        dialog = SettingsDialog(self.api_client.settings, tts_settings, self.base_dir, self)
+        dialog = SettingsDialog(
+            self.api_client.settings,
+            tts_settings,
+            self.base_dir,
+            self.character_registry,
+            self.character_profile,
+            self,
+        )
         if (
             dialog.exec() != QDialog.DialogCode.Accepted
             or dialog.result_api_settings is None
             or dialog.result_tts_settings is None
+            or dialog.result_character_id is None
         ):
+            return
+
+        try:
+            selected_profile = self.character_registry.get(dialog.result_character_id)
+        except CharacterConfigError as exc:
+            QMessageBox.critical(self, "角色配置无效", str(exc))
             return
 
         try:
             dialog.result_api_settings.save(self.env_path)
             dialog.result_tts_settings.save(self.env_path, self.base_dir)
+            self.character_registry.save_current_id(self.env_path, selected_profile.id)
         except OSError as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存设置：{exc}")
             return
@@ -498,9 +542,7 @@ class PetWindow(QWidget):
         self.api_client.update_settings(dialog.result_api_settings)
         self.retired_tts_providers.append(self.tts_provider)
         self.tts_provider = new_tts_provider
-        self.reply_sequence_id += 1
-        self.pending_reply_segments = []
-        self._reset_current_segment_progress()
+        self._apply_character(selected_profile)
         QMessageBox.information(self, "保存成功", "设置已保存，后续聊天和朗读将使用新配置。")
 
     @Slot(bool)
@@ -537,6 +579,16 @@ class PetWindow(QWidget):
             return None
 
     def _default_tts_settings(self) -> GPTSoVITSTTSSettings:
+        if self.character_profile.voice is not None:
+            return GPTSoVITSTTSSettings.from_character_profile(
+                character_profile=self.character_profile,
+                enabled=False,
+                api_url="http://127.0.0.1:9880/tts",
+                ref_lang=self.character_profile.voice.ref_lang,
+                text_lang=self.character_profile.voice.text_lang,
+                timeout_seconds=60,
+                validate_enabled=False,
+            )
         return GPTSoVITSTTSSettings(
             enabled=False,
             api_url="http://127.0.0.1:9880/tts",
@@ -570,6 +622,7 @@ class PetWindow(QWidget):
         self.current_segment_speech_done = False
         self.current_segment_tts_done = False
         self.reply_advance_scheduled = False
+        self._apply_portrait_for_tone(segment.tone)
         self.tts_provider.speak(
             segment.text,
             segment.tone,
@@ -649,6 +702,48 @@ class PetWindow(QWidget):
         if language == SUBTITLE_LANGUAGE_ZH:
             return SUBTITLE_LANGUAGE_ZH
         return SUBTITLE_LANGUAGE_JA
+
+    def _apply_character(self, profile: CharacterProfile) -> None:
+        previous_character_id = self.character_profile.id
+        self.character_profile = profile
+        self.portrait_path = profile.default_portrait_path
+        self.system_prompt = load_character_system_prompt(profile)
+        self.setWindowTitle(profile.display_name)
+        self.name_label.setText(profile.display_name)
+        self.input_edit.setPlaceholderText(f"{profile.display_name}に話しかける...")
+        self.pixmap = self._load_portrait()
+        self._apply_portrait()
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setToolTip(profile.display_name)
+            self.tray_icon.setIcon(QIcon(self.pixmap) if not self.pixmap.isNull() else QIcon())
+
+        self.history_store = self._create_history_store(profile)
+        if self.history_window is not None:
+            self.history_window.set_history_store(self.history_store, profile.display_name)
+
+        if profile.id != previous_character_id:
+            self.messages = []
+            self.reply_sequence_id += 1
+            self.pending_reply_segments = []
+            self._reset_current_segment_progress()
+            self.set_speech(profile.initial_message)
+
+    def _create_history_store(self, profile: CharacterProfile) -> ChatHistoryStore:
+        history_path = self.base_dir / "data" / "chat_history" / f"{profile.id}.jsonl"
+        self._migrate_legacy_history(profile, history_path)
+        return ChatHistoryStore(history_path, profile.display_name)
+
+    def _migrate_legacy_history(self, profile: CharacterProfile, history_path: Path) -> None:
+        if profile.id != DEFAULT_CHARACTER_ID or history_path.exists():
+            return
+        legacy_path = self.base_dir / "data" / "chat_history.jsonl"
+        if not legacy_path.exists():
+            return
+        try:
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            history_path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError as exc:
+            print(f"[History] 旧历史迁移失败：{exc}")
 
 
 def _rounded_japanese_font(point_size: int, weight: QFont.Weight) -> QFont:

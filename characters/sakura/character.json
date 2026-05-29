@@ -1,0 +1,25 @@
+{
+  "id": "sakura",
+  "display_name": "夜乃桜",
+  "initial_message": "……起動した。用事があるなら、呼んで。",
+  "card": "card.md",
+  "portrait": {
+    "default": "portraits/ST31A_A020_结果.png",
+    "expressions": {
+      "中性": "portraits/ST31A_A020_结果.png",
+      "开心": "portraits/ST31A_A110_结果.png",
+      "温柔": "portraits/ST31A_A120_结果.png",
+      "甜蜜": "portraits/ST31A_A150_结果.png",
+      "害羞": "portraits/ST31A_A041_结果.png"
+    }
+  },
+  "voice": {
+    "gpt_model": "voice/models/Sakura-e20.ckpt",
+    "sovits_model": "voice/models/Sakura_e8_s5528.pth",
+    "text_lang": "ja",
+    "tone_refs": "voice/refs/ref.txt"
+  },
+  "reply": {
+    "tones": ["开心", "中性", "温柔", "甜蜜", "害羞"]
+  }
+}

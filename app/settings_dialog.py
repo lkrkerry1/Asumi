@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.api_client import ApiSettings, OpenAICompatibleClient
+from app.character_loader import CharacterProfile, CharacterRegistry
 from app.tts import GPTSoVITSTTSSettings, TTSConfigError
 
 
@@ -49,20 +51,27 @@ class SettingsDialog(QDialog):
         api_settings: ApiSettings,
         tts_settings: GPTSoVITSTTSSettings,
         base_dir: Path,
+        character_registry: CharacterRegistry | None = None,
+        current_character: CharacterProfile | None = None,
         parent=None,  # type: ignore[no-untyped-def]
     ) -> None:
         super().__init__(parent)
         self.base_dir = base_dir
         self.tts_settings = tts_settings
+        self.character_registry = character_registry
+        self.current_character = current_character
         self.result_api_settings: ApiSettings | None = None
         self.result_tts_settings: GPTSoVITSTTSSettings | None = None
+        self.result_character_id: str | None = None
         self._api_test_thread: QThread | None = None
         self._api_test_worker: ApiConnectionTestWorker | None = None
 
         self.setWindowTitle("设置")
-        self.resize(560, 360)
+        self.resize(560, 400)
 
         tabs = QTabWidget(self)
+        if character_registry is not None and current_character is not None:
+            tabs.addTab(self._build_character_tab(character_registry, current_character), "角色")
         tabs.addTab(self._build_api_tab(api_settings), "API")
         tabs.addTab(self._build_tts_tab(tts_settings), "TTS")
 
@@ -124,6 +133,25 @@ class SettingsDialog(QDialog):
             }
             """
         )
+
+    def _build_character_tab(
+        self,
+        character_registry: CharacterRegistry,
+        current_character: CharacterProfile,
+    ) -> QWidget:
+        tab = QWidget(self)
+        self.character_combo = QComboBox(tab)
+        for profile in character_registry.all():
+            self.character_combo.addItem(profile.display_name, profile.id)
+            if profile.id == current_character.id:
+                self.character_combo.setCurrentIndex(self.character_combo.count() - 1)
+
+        form_layout = QFormLayout()
+        form_layout.setContentsMargins(16, 18, 16, 16)
+        form_layout.setSpacing(12)
+        form_layout.addRow("当前角色", self.character_combo)
+        tab.setLayout(form_layout)
+        return tab
 
     def _build_api_tab(self, settings: ApiSettings) -> QWidget:
         tab = QWidget(self)
@@ -197,6 +225,7 @@ class SettingsDialog(QDialog):
 
         self.result_api_settings = api_settings
         self.result_tts_settings = tts_settings
+        self.result_character_id = self._selected_character_id()
         super().accept()
 
     def reject(self) -> None:
@@ -268,8 +297,6 @@ class SettingsDialog(QDialog):
     def _validated_tts_settings(self) -> GPTSoVITSTTSSettings | None:
         enabled = self.tts_enabled_check.isChecked()
         api_url = self.tts_api_url_edit.text().strip()
-        ref_audio_path = self.tts_settings.ref_audio_path
-        ref_text_path = self.tts_settings.ref_text_path
         ref_lang = self.ref_lang_edit.text().strip()
         text_lang = self.text_lang_edit.text().strip()
 
@@ -277,17 +304,31 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "配置无效", "TTS API URL 必须是有效的 http 或 https 地址。")
             return None
 
-        settings = GPTSoVITSTTSSettings(
-            enabled=enabled,
-            api_url=api_url,
-            ref_audio_path=ref_audio_path,
-            ref_text_path=ref_text_path,
-            ref_text=self.tts_settings.ref_text,
-            ref_lang=ref_lang,
-            text_lang=text_lang,
-            timeout_seconds=self.tts_timeout_spin.value(),
-            tone_references=self.tts_settings.tone_references,
-        )
+        selected_profile = self._selected_character_profile()
+        if selected_profile is not None:
+            settings = GPTSoVITSTTSSettings.from_character_profile(
+                character_profile=selected_profile,
+                enabled=enabled,
+                api_url=api_url,
+                ref_lang=ref_lang,
+                text_lang=text_lang,
+                timeout_seconds=self.tts_timeout_spin.value(),
+                validate_enabled=False,
+            )
+        else:
+            settings = GPTSoVITSTTSSettings(
+                enabled=enabled,
+                api_url=api_url,
+                ref_audio_path=self.tts_settings.ref_audio_path,
+                ref_text_path=self.tts_settings.ref_text_path,
+                ref_text=self.tts_settings.ref_text,
+                gpt_model_path=self.tts_settings.gpt_model_path,
+                sovits_model_path=self.tts_settings.sovits_model_path,
+                ref_lang=ref_lang,
+                text_lang=text_lang,
+                timeout_seconds=self.tts_timeout_spin.value(),
+                tone_references=self.tts_settings.tone_references,
+            )
         if enabled:
             try:
                 settings.validate()
@@ -295,6 +336,20 @@ class SettingsDialog(QDialog):
                 QMessageBox.warning(self, "配置无效", str(exc))
                 return None
         return settings
+
+    def _selected_character_id(self) -> str | None:
+        if self.character_registry is None or not hasattr(self, "character_combo"):
+            return self.current_character.id if self.current_character is not None else None
+        character_id = self.character_combo.currentData()
+        if isinstance(character_id, str) and character_id.strip():
+            return character_id.strip()
+        return self.current_character.id if self.current_character is not None else None
+
+    def _selected_character_profile(self) -> CharacterProfile | None:
+        character_id = self._selected_character_id()
+        if character_id is None or self.character_registry is None:
+            return self.current_character
+        return self.character_registry.get(character_id)
 
 
 def _is_http_url(url: str) -> bool:

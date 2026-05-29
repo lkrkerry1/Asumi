@@ -9,15 +9,19 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
+from urllib.parse import urlencode, urlparse, urlunparse
 
-from PySide6.QtCore import QObject, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 
+from app.character_loader import CharacterProfile
 from app.chat_reply import DEFAULT_TONE
 from app.env_config import load_env_file, save_env_values
 
 
 TTSCallback = Callable[[], None]
+_AUDIO_CLEANUP_DELAY_MS = 200
+_AUDIO_CLEANUP_MAX_ATTEMPTS = 5
 
 
 class TTSProvider(Protocol):
@@ -67,6 +71,8 @@ class GPTSoVITSTTSSettings:
     ref_audio_path: Path
     ref_text_path: Path
     ref_text: str
+    gpt_model_path: Path | None = None
+    sovits_model_path: Path | None = None
     ref_lang: str = "ja"
     text_lang: str = "ja"
     timeout_seconds: int = 60
@@ -78,9 +84,45 @@ class GPTSoVITSTTSSettings:
         env_path: Path,
         base_dir: Path,
         validate_enabled: bool = True,
+        character_profile: CharacterProfile | None = None,
     ) -> "GPTSoVITSTTSSettings":
         values = load_env_file(env_path)
         enabled = _is_enabled(_get_env_value(values, "TTS_ENABLED", "false"))
+
+        timeout_text = _get_env_value(values, "GPT_SOVITS_TIMEOUT_SECONDS", "60")
+        try:
+            timeout_seconds = int(timeout_text)
+        except ValueError:
+            timeout_seconds = 60
+
+        if character_profile is not None:
+            ref_lang_default = (
+                character_profile.voice.ref_lang
+                if character_profile.voice is not None
+                else "ja"
+            )
+            default_text_lang = character_profile.voice.text_lang if character_profile.voice is not None else "ja"
+            return cls.from_character_profile(
+                character_profile=character_profile,
+                enabled=enabled,
+                api_url=_get_env_value(
+                    values,
+                    "GPT_SOVITS_API_URL",
+                    "http://127.0.0.1:9880/tts",
+                ).strip(),
+                ref_lang=_get_env_value(
+                    values,
+                    "GPT_SOVITS_REF_LANG",
+                    ref_lang_default,
+                ).strip(),
+                text_lang=_get_env_value(
+                    values,
+                    "GPT_SOVITS_TEXT_LANG",
+                    default_text_lang,
+                ).strip(),
+                timeout_seconds=timeout_seconds,
+                validate_enabled=validate_enabled,
+            )
 
         ref_audio_text = _get_env_value(
             values,
@@ -105,12 +147,6 @@ class GPTSoVITSTTSSettings:
         if not ref_text and ref_text_path.exists():
             ref_text = ref_text_path.read_text(encoding="utf-8").strip()
 
-        timeout_text = _get_env_value(values, "GPT_SOVITS_TIMEOUT_SECONDS", "60")
-        try:
-            timeout_seconds = int(timeout_text)
-        except ValueError:
-            timeout_seconds = 60
-
         settings = cls(
             enabled=enabled,
             api_url=_get_env_value(
@@ -130,9 +166,62 @@ class GPTSoVITSTTSSettings:
             settings.validate()
         return settings
 
+    @classmethod
+    def from_character_profile(
+        cls,
+        character_profile: CharacterProfile,
+        enabled: bool,
+        api_url: str,
+        ref_lang: str,
+        text_lang: str,
+        timeout_seconds: int,
+        validate_enabled: bool = True,
+    ) -> "GPTSoVITSTTSSettings":
+        if character_profile.voice is None:
+            settings = cls(
+                enabled=enabled,
+                api_url=api_url,
+                ref_audio_path=character_profile.package_dir,
+                ref_text_path=character_profile.package_dir,
+                ref_text="",
+                ref_lang=ref_lang,
+                text_lang=text_lang,
+                timeout_seconds=timeout_seconds,
+            )
+            if enabled and validate_enabled:
+                settings.validate()
+            return settings
+
+        voice = character_profile.voice
+        tone_references = _load_tone_references(
+            voice.tone_ref_path,
+            character_profile.package_dir,
+        )
+        neutral_reference = _select_neutral_reference(tone_references)
+        settings = cls(
+            enabled=enabled,
+            api_url=api_url,
+            ref_audio_path=neutral_reference.ref_audio_path if neutral_reference else character_profile.package_dir,
+            ref_text_path=neutral_reference.ref_audio_path if neutral_reference else character_profile.package_dir,
+            ref_text=neutral_reference.ref_text if neutral_reference else "",
+            gpt_model_path=voice.gpt_model_path,
+            sovits_model_path=voice.sovits_model_path,
+            ref_lang=ref_lang,
+            text_lang=text_lang,
+            timeout_seconds=timeout_seconds,
+            tone_references=tone_references,
+        )
+        if enabled and validate_enabled:
+            settings.validate()
+        return settings
+
     def validate(self) -> None:
         if not self.api_url:
             raise TTSConfigError("缺少 GPT_SOVITS_API_URL。")
+        if self.gpt_model_path is not None and not self.gpt_model_path.exists():
+            raise TTSConfigError(f"GPT 模型不存在：{self.gpt_model_path}")
+        if self.sovits_model_path is not None and not self.sovits_model_path.exists():
+            raise TTSConfigError(f"SoVITS 模型不存在：{self.sovits_model_path}")
         if self.tone_references:
             for references in self.tone_references.values():
                 for reference in references:
@@ -182,12 +271,14 @@ class GPTSoVITSTTSProvider(QObject):
         self._current_started: TTSCallback | None = None
         self._current_finished: TTSCallback | None = None
         self._current_started_emitted = False
+        self._finishing_audio = False
         self._request_lock = threading.Lock()
         self._pending_requests: list[
             tuple[str, str | None, TTSCallback | None, TTSCallback | None]
         ] = []
         self._request_running = False
         self._tone_indices: dict[str, int] = {}
+        self._weights_ready = False
 
         self._audio_output = QAudioOutput(self)
         self._player = QMediaPlayer(self)
@@ -237,31 +328,34 @@ class GPTSoVITSTTSProvider(QObject):
         on_started: TTSCallback | None,
         on_finished: TTSCallback | None,
     ) -> None:
-        reference = self._select_reference(tone)
-        payload = {
-            "text": text,
-            "text_lang": self.settings.text_lang,
-            "ref_audio_path": str(reference.ref_audio_path),
-            "prompt_text": reference.ref_text,
-            "prompt_lang": reference.ref_lang,
-            "text_split_method": "cut1",
-            "batch_size": 1,
-            "media_type": "wav",
-            "streaming_mode": False,
-            "top_k": 15,
-            "top_p": 1,
-            "temperature": 1,
-            "repetition_penalty": 1.2,
-        }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            url=self.settings.api_url,
-            data=body,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-
         try:
+            if not self._ensure_character_weights(on_started, on_finished):
+                return
+
+            reference = self._select_reference(tone)
+            payload = {
+                "text": text,
+                "text_lang": self.settings.text_lang,
+                "ref_audio_path": str(reference.ref_audio_path),
+                "prompt_text": reference.ref_text,
+                "prompt_lang": reference.ref_lang,
+                "text_split_method": "cut1",
+                "batch_size": 1,
+                "media_type": "wav",
+                "streaming_mode": False,
+                "top_k": 15,
+                "top_p": 1,
+                "temperature": 1,
+                "repetition_penalty": 1.2,
+            }
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            request = urllib.request.Request(
+                url=self.settings.api_url,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+
             try:
                 with urllib.request.urlopen(
                     request,
@@ -299,6 +393,54 @@ class GPTSoVITSTTSProvider(QObject):
             with self._request_lock:
                 self._request_running = False
             self._start_next_request()
+
+    def _ensure_character_weights(
+        self,
+        on_started: TTSCallback | None,
+        on_finished: TTSCallback | None,
+    ) -> bool:
+        if self._weights_ready:
+            return True
+
+        for endpoint, path in (
+            ("set_gpt_weights", self.settings.gpt_model_path),
+            ("set_sovits_weights", self.settings.sovits_model_path),
+        ):
+            if path is None:
+                continue
+            if not self._request_weight_switch(endpoint, path, on_started, on_finished):
+                return False
+
+        self._weights_ready = True
+        return True
+
+    def _request_weight_switch(
+        self,
+        endpoint: str,
+        weights_path: Path,
+        on_started: TTSCallback | None,
+        on_finished: TTSCallback | None,
+    ) -> bool:
+        url = _build_tts_endpoint_url(
+            self.settings.api_url,
+            endpoint,
+            {"weights_path": str(weights_path)},
+        )
+        request = urllib.request.Request(url=url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self.settings.timeout_seconds) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            self._fail_request(f"GPT-SoVITS 切换权重失败 HTTP {exc.code}: {error_body}", on_started, on_finished)
+            return False
+        except urllib.error.URLError as exc:
+            self._fail_request(f"GPT-SoVITS 切换权重失败：{exc.reason}", on_started, on_finished)
+            return False
+        except TimeoutError:
+            self._fail_request("GPT-SoVITS 切换权重超时。", on_started, on_finished)
+            return False
+        return True
 
     def _select_reference(self, tone: str | None) -> ToneReference:
         tone_key = (tone or DEFAULT_TONE).strip() or DEFAULT_TONE
@@ -369,7 +511,7 @@ class GPTSoVITSTTSProvider(QObject):
         self._finished.emit(on_finished)
 
     def _play_next(self) -> None:
-        if not self._pending_audio:
+        if self._current_audio is not None or not self._pending_audio:
             return
         (
             self._current_audio,
@@ -387,31 +529,60 @@ class GPTSoVITSTTSProvider(QObject):
         self._started.emit(self._current_started)
 
     def _finish_current_audio(self) -> None:
-        on_finished = self._current_finished
-        self._emit_current_started()
-        self._cleanup_current_audio()
-        self._finished.emit(on_finished)
-
-    def _cleanup_current_audio(self) -> None:
-        if self._current_audio is None:
-            self._current_started = None
-            self._current_finished = None
-            self._current_started_emitted = False
+        if self._finishing_audio:
             return
+        audio_path = self._current_audio
+        on_finished = self._current_finished
+        if audio_path is None:
+            self._reset_current_audio_state()
+            return
+        self._finishing_audio = True
         try:
-            self._current_audio.unlink(missing_ok=True)
-        except OSError as exc:
-            self._log_error(f"临时音频清理失败：{exc}")
+            self._emit_current_started()
+            self._release_player_source()
+            self._reset_current_audio_state()
+            self._schedule_audio_cleanup(audio_path)
+            self._finished.emit(on_finished)
+        finally:
+            self._finishing_audio = False
+
+    def _release_player_source(self) -> None:
+        self._player.stop()
+        self._player.setSource(QUrl())
+
+    def _reset_current_audio_state(self) -> None:
         self._current_audio = None
         self._current_started = None
         self._current_finished = None
         self._current_started_emitted = False
 
+    def _schedule_audio_cleanup(self, audio_path: Path, attempt: int = 1) -> None:
+        QTimer.singleShot(
+            _AUDIO_CLEANUP_DELAY_MS,
+            lambda path=audio_path, current_attempt=attempt: self._cleanup_audio_file(
+                path,
+                current_attempt,
+            ),
+        )
 
-def create_tts_provider(base_dir: Path) -> TTSProvider:
+    def _cleanup_audio_file(self, audio_path: Path, attempt: int) -> None:
+        try:
+            audio_path.unlink(missing_ok=True)
+        except OSError as exc:
+            if attempt < _AUDIO_CLEANUP_MAX_ATTEMPTS:
+                self._schedule_audio_cleanup(audio_path, attempt + 1)
+                return
+            self._log_error(f"临时音频清理失败：{exc}")
+
+
+def create_tts_provider(base_dir: Path, character_profile: CharacterProfile | None = None) -> TTSProvider:
     """按当前 .env 创建 TTS provider，配置无效时自动降级为静音实现。"""
     try:
-        settings = GPTSoVITSTTSSettings.load(base_dir / ".env", base_dir)
+        settings = GPTSoVITSTTSSettings.load(
+            base_dir / ".env",
+            base_dir,
+            character_profile=character_profile,
+        )
         if settings.enabled:
             return GPTSoVITSTTSProvider(settings)
     except TTSConfigError as exc:
@@ -434,8 +605,8 @@ def _resolve_path(path_text: str, base_dir: Path) -> Path:
     return base_dir / path
 
 
-def _load_tone_references(ref_path: Path, base_dir: Path) -> dict[str, list[ToneReference]]:
-    if not ref_path.exists():
+def _load_tone_references(ref_path: Path | None, base_dir: Path) -> dict[str, list[ToneReference]]:
+    if ref_path is None or not ref_path.exists():
         return {}
 
     tone_references: dict[str, list[ToneReference]] = {}
@@ -450,7 +621,7 @@ def _load_tone_references(ref_path: Path, base_dir: Path) -> dict[str, list[Tone
 
         audio_text, _source, lang, prompt_text, tone = [part.strip() for part in parts]
         audio_path = _resolve_path(audio_text, base_dir)
-        copied_path = base_dir / "ref" / "tone_refs" / audio_path.name
+        copied_path = ref_path.parent / "tone_refs" / audio_path.name
         if copied_path.exists():
             audio_path = copied_path
 
@@ -466,8 +637,32 @@ def _load_tone_references(ref_path: Path, base_dir: Path) -> dict[str, list[Tone
     return tone_references
 
 
+def _select_neutral_reference(
+    tone_references: dict[str, list[ToneReference]],
+) -> ToneReference | None:
+    neutral_references = tone_references.get(DEFAULT_TONE)
+    if neutral_references:
+        return neutral_references[0]
+    for references in tone_references.values():
+        if references:
+            return references[0]
+    return None
+
+
 def _normalize_lang(lang: str) -> str:
     normalized = lang.strip().lower()
     if normalized == "ja":
         return "ja"
     return normalized or "ja"
+
+
+def _build_tts_endpoint_url(base_url: str, endpoint: str, query: dict[str, str]) -> str:
+    parsed_url = urlparse(base_url)
+    base_path = parsed_url.path.rsplit("/", 1)[0]
+    endpoint_path = f"{base_path}/{endpoint}" if base_path else f"/{endpoint}"
+    return urlunparse(
+        parsed_url._replace(
+            path=endpoint_path,
+            query=urlencode(query),
+        )
+    )

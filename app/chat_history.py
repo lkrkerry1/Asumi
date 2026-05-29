@@ -22,8 +22,9 @@ class ChatHistoryEntry:
 class ChatHistoryStore:
     """按 JSONL 保存聊天历史，避免单条坏记录影响整体读取。"""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, assistant_name: str = "桜") -> None:
         self.path = path
+        self.assistant_name = assistant_name
 
     def append(self, role: str, content: str, translation: str = "") -> None:
         entry = {

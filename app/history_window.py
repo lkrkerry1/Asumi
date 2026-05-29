@@ -80,13 +80,21 @@ class HistoryWindow(QDialog):
         self.subtitle_language = subtitle_language
         self.refresh()
 
+    def set_history_store(self, history_store: ChatHistoryStore, assistant_name: str) -> None:
+        self.history_store = history_store
+        self.history_store.assistant_name = assistant_name
+        self.refresh()
+
     def refresh(self) -> None:
         entries = self.history_store.load()
         if not entries:
             self.history_view.setHtml("<p>暂无历史记录。</p>")
             return
         self.history_view.setHtml(
-            "".join(_format_entry(entry, self.subtitle_language) for entry in entries)
+            "".join(
+                _format_entry(entry, self.subtitle_language, self.history_store.assistant_name)
+                for entry in entries
+            )
         )
         scrollbar = self.history_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
@@ -105,10 +113,10 @@ class HistoryWindow(QDialog):
         self.refresh()
 
 
-def _format_entry(entry: ChatHistoryEntry, subtitle_language: str) -> str:
+def _format_entry(entry: ChatHistoryEntry, subtitle_language: str, assistant_name: str) -> str:
     role_name = {
         "user": "你",
-        "assistant": "桜",
+        "assistant": assistant_name,
         "error": "错误",
     }.get(entry.role, entry.role)
     time_text = entry.created_at.replace("T", " ").split("+", 1)[0]

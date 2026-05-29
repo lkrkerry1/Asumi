@@ -12,7 +12,7 @@ from app.chat_reply import ChatReply, parse_chat_reply
 from app.env_config import load_env_file, save_env_values
 
 
-SEGMENTED_REPLY_INSTRUCTION = """
+SEGMENTED_REPLY_INSTRUCTION_TEMPLATE = """
 你必须只返回 JSON，不要使用 Markdown 代码块，不要输出额外解释。
 JSON 格式如下：
 {"segments":[{"ja":"日文原文","zh":"中文译文","tone":"中性"}]}
@@ -22,7 +22,7 @@ JSON 格式如下：
 - 单段建议 35-90 个中文或日文字符；内容需要完整自然，宁可少分段也不要短到像碎片。
 - 如果用户只问很简单的问题，可以只输出 1-2 段。
 - 需要对每段文本的语气进行标注，语气标签放在 tone 字段中。
-- tone 只能从这些类别中选择：开心、中性、温柔、甜蜜、害羞。
+- tone 只能从这些类别中选择：{tones}。
 - ja 中只写夜乃桜要说出口的日文原文，必须是日语，适合直接交给日语 TTS 朗读。
 - zh 中只写 ja 对应的自然中文译文，必须是中文，不要添加解释、括号动作、语气标签或额外内容。
 - 无论用户使用什么语言，ja 和 zh 都必须同时输出；不要只输出其中一种语言。
@@ -138,7 +138,12 @@ class OpenAICompatibleClient:
 
         return str(content).strip() or "OK"
 
-    def chat(self, system_prompt: str, messages: list[dict[str, str]]) -> ChatReply:
+    def chat(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        reply_tones: list[str] | None = None,
+    ) -> ChatReply:
         if not self.settings.api_key:
             raise ApiConfigError("缺少 API_KEY。请在 .env 中配置 API_KEY、BASE_URL、MODEL。")
         if not self.settings.base_url:
@@ -146,12 +151,13 @@ class OpenAICompatibleClient:
         if not self.settings.model:
             raise ApiConfigError("缺少 MODEL。")
 
+        segmented_reply_instruction = _build_segmented_reply_instruction(reply_tones)
         payload = {
             "model": self.settings.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": f"{system_prompt.strip()}\n\n{SEGMENTED_REPLY_INSTRUCTION.strip()}",
+                    "content": f"{system_prompt.strip()}\n\n{segmented_reply_instruction}",
                 },
                 *messages,
             ],
@@ -199,4 +205,11 @@ class OpenAICompatibleClient:
             raise ApiRequestError(f"API 返回格式无法解析：{response_body}") from exc
 
         return data
+
+
+def _build_segmented_reply_instruction(reply_tones: list[str] | None) -> str:
+    tones = [tone.strip() for tone in reply_tones or [] if tone.strip()]
+    if not tones:
+        tones = ["开心", "中性", "温柔", "甜蜜", "害羞"]
+    return SEGMENTED_REPLY_INSTRUCTION_TEMPLATE.strip().replace("{tones}", "、".join(tones))
 
