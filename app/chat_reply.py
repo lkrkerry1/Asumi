@@ -30,6 +30,19 @@ class ChatReply:
         return "\n".join(segment.text for segment in self.segments if segment.text.strip()).strip()
 
     @property
+    def translation(self) -> str:
+        return "\n".join(
+            segment.display_text("zh")
+            for segment in self.segments
+            if segment.display_text("zh").strip()
+        ).strip()
+
+    def display_text(self, subtitle_language: str) -> str:
+        if subtitle_language == "zh":
+            return self.translation or self.text
+        return self.text
+
+    @property
     def tone(self) -> str:
         for segment in self.segments:
             if segment.text.strip() and segment.tone.strip():
@@ -61,15 +74,11 @@ def _parse_segments(data: dict[str, Any]) -> list[ChatSegment]:
         segments = [_parse_segment(item) for item in raw_segments]
         return [segment for segment in segments if segment is not None]
 
-    reply = data.get("reply")
-    if isinstance(reply, str) and reply.strip():
+    text = _clean_first_text(data, "ja", "japanese", "reply", "text")
+    if text:
         tone = data.get("tone")
-        return [ChatSegment(reply.strip(), _clean_tone(tone), _clean_translation(data.get("translation")))]
-
-    text = data.get("text")
-    if isinstance(text, str) and text.strip():
-        tone = data.get("tone")
-        return [ChatSegment(text.strip(), _clean_tone(tone), _clean_translation(data.get("translation")))]
+        translation = _clean_first_text(data, "zh", "chinese", "translation")
+        return [_build_segment(text, tone, translation)]
 
     return []
 
@@ -81,14 +90,19 @@ def _parse_segment(item: Any) -> ChatSegment | None:
     if not isinstance(item, dict):
         return None
 
-    text = item.get("text")
-    if not isinstance(text, str) or not text.strip():
+    text = _clean_first_text(item, "ja", "japanese", "text")
+    if not text:
         return None
-    return ChatSegment(
-        text.strip(),
-        _clean_tone(item.get("tone")),
-        _clean_translation(item.get("translation")),
-    )
+    translation = _clean_first_text(item, "zh", "chinese", "translation")
+    return _build_segment(text, item.get("tone"), translation)
+
+
+def _build_segment(text: str, tone: Any, translation: str) -> ChatSegment:
+    text = text.strip()
+    translation = translation.strip()
+    if _looks_chinese(text) and _looks_japanese(translation):
+        text, translation = translation, text
+    return ChatSegment(text, _clean_tone(tone), translation)
 
 
 def _clean_tone(value: Any) -> str:
@@ -97,10 +111,23 @@ def _clean_tone(value: Any) -> str:
     return DEFAULT_TONE
 
 
-def _clean_translation(value: Any) -> str:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
+def _clean_first_text(data: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return ""
+
+
+def _looks_japanese(value: str) -> bool:
+    return any(
+        "\u3040" <= char <= "\u30ff" or "\uff66" <= char <= "\uff9f"
+        for char in value
+    )
+
+
+def _looks_chinese(value: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in value) and not _looks_japanese(value)
 
 
 def _try_load_json(content: str) -> Any | None:

@@ -397,7 +397,7 @@ class PetWindow(QWidget):
     @Slot(object)
     def _handle_reply(self, reply: ChatReply) -> None:
         self.messages.append({"role": "assistant", "content": reply.text})
-        self._record_history("assistant", reply.text)
+        self._record_history("assistant", reply.text, reply.translation)
         self._show_reply_segments(reply.segments)
 
     @Slot(str)
@@ -457,7 +457,12 @@ class PetWindow(QWidget):
     @Slot()
     def show_history(self) -> None:
         if self.history_window is None:
-            self.history_window = HistoryWindow(self.history_store, self)
+            self.history_window = HistoryWindow(
+                self.history_store,
+                self.subtitle_language,
+                self,
+            )
+        self.history_window.set_subtitle_language(self.subtitle_language)
         self.history_window.refresh()
         self.history_window.show()
         self.history_window.raise_()
@@ -516,6 +521,8 @@ class PetWindow(QWidget):
 
         self._apply_speech_font()
         self._restart_current_segment_speech()
+        if self.history_window is not None:
+            self.history_window.set_subtitle_language(self.subtitle_language)
 
     def _create_tts_provider_from_settings(
         self,
@@ -541,9 +548,9 @@ class PetWindow(QWidget):
             timeout_seconds=60,
         )
 
-    def _record_history(self, role: str, content: str) -> None:
+    def _record_history(self, role: str, content: str, translation: str = "") -> None:
         try:
-            self.history_store.append(role, content)
+            self.history_store.append(role, content, translation)
         except OSError as exc:
             print(f"[History] 写入失败：{exc}")
 

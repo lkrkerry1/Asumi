@@ -8,9 +8,15 @@ from app.chat_history import ChatHistoryEntry, ChatHistoryStore
 
 
 class HistoryWindow(QDialog):
-    def __init__(self, history_store: ChatHistoryStore, parent=None) -> None:  # type: ignore[no-untyped-def]
+    def __init__(
+        self,
+        history_store: ChatHistoryStore,
+        subtitle_language: str = "ja",
+        parent=None,  # type: ignore[no-untyped-def]
+    ) -> None:
         super().__init__(parent)
         self.history_store = history_store
+        self.subtitle_language = subtitle_language
 
         self.setWindowTitle("历史记录")
         self.resize(560, 640)
@@ -68,12 +74,20 @@ class HistoryWindow(QDialog):
         )
         self.refresh()
 
+    def set_subtitle_language(self, subtitle_language: str) -> None:
+        if subtitle_language == self.subtitle_language:
+            return
+        self.subtitle_language = subtitle_language
+        self.refresh()
+
     def refresh(self) -> None:
         entries = self.history_store.load()
         if not entries:
             self.history_view.setHtml("<p>暂无历史记录。</p>")
             return
-        self.history_view.setHtml("".join(_format_entry(entry) for entry in entries))
+        self.history_view.setHtml(
+            "".join(_format_entry(entry, self.subtitle_language) for entry in entries)
+        )
         scrollbar = self.history_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -91,14 +105,14 @@ class HistoryWindow(QDialog):
         self.refresh()
 
 
-def _format_entry(entry: ChatHistoryEntry) -> str:
+def _format_entry(entry: ChatHistoryEntry, subtitle_language: str) -> str:
     role_name = {
         "user": "你",
         "assistant": "桜",
         "error": "错误",
     }.get(entry.role, entry.role)
     time_text = entry.created_at.replace("T", " ").split("+", 1)[0]
-    content = escape(entry.content).replace("\n", "<br>")
+    content = escape(entry.display_content(subtitle_language)).replace("\n", "<br>")
     return (
         "<div style='margin: 0 0 14px 0;'>"
         f"<div style='color: #5f8790; font-size: 12px;'>{escape(time_text)}</div>"

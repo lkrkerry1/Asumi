@@ -11,6 +11,12 @@ class ChatHistoryEntry:
     created_at: str
     role: str
     content: str
+    translation: str = ""
+
+    def display_content(self, subtitle_language: str) -> str:
+        if self.role == "assistant" and subtitle_language == "zh" and self.translation.strip():
+            return self.translation.strip()
+        return self.content
 
 
 class ChatHistoryStore:
@@ -19,12 +25,14 @@ class ChatHistoryStore:
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def append(self, role: str, content: str) -> None:
+    def append(self, role: str, content: str, translation: str = "") -> None:
         entry = {
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "role": role,
             "content": content,
         }
+        if translation.strip():
+            entry["translation"] = translation.strip()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -48,9 +56,19 @@ class ChatHistoryStore:
             created_at = data.get("created_at")
             role = data.get("role")
             content = data.get("content")
+            translation = data.get("translation", "")
             if not all(isinstance(value, str) for value in (created_at, role, content)):
                 continue
-            entries.append(ChatHistoryEntry(created_at=created_at, role=role, content=content))
+            if not isinstance(translation, str):
+                translation = ""
+            entries.append(
+                ChatHistoryEntry(
+                    created_at=created_at,
+                    role=role,
+                    content=content,
+                    translation=translation,
+                )
+            )
         return entries
 
     def clear(self) -> None:
