@@ -46,6 +46,7 @@ from app.tts import (
     GPTSoVITSTTSSettings,
     NullTTSProvider,
     TTSConfigError,
+    TTSPreparedAudio,
     TTSProvider,
 )
 
@@ -99,6 +100,8 @@ class PetWindow(QWidget):
         self.speech_index = 0
         self.pending_reply_segments: list[ChatSegment] = []
         self.current_segment: ChatSegment | None = None
+        self.prepared_next_segment: ChatSegment | None = None
+        self.prepared_next_tts: TTSPreparedAudio | None = None
         self.reply_sequence_id = 0
         self.reply_advance_token = 0
         self.current_segment_sequence_id: int | None = None
@@ -573,6 +576,7 @@ class PetWindow(QWidget):
             return
 
         self.api_client.update_settings(dialog.result_api_settings)
+        self._discard_prepared_next_tts()
         self.retired_tts_providers.append(self.tts_provider)
         self.tts_provider = new_tts_provider
         self._apply_character(selected_profile)
@@ -704,12 +708,21 @@ class PetWindow(QWidget):
         self.current_segment_tts_done = False
         self.reply_advance_scheduled = False
         self._preload_portrait_for_tone(segment.tone)
-        self.tts_provider.speak(
-            segment.text,
-            segment.tone,
-            on_finished=lambda: self._mark_segment_tts_done(sequence_id),
-            on_started=lambda: self._start_segment_speech(sequence_id),
-        )
+        prepared_tts = self._take_prepared_tts_for_segment(segment)
+        if prepared_tts is None:
+            self.tts_provider.speak(
+                segment.text,
+                segment.tone,
+                on_finished=lambda: self._mark_segment_tts_done(sequence_id),
+                on_started=lambda: self._start_segment_speech(sequence_id),
+            )
+        else:
+            self.tts_provider.speak_prepared(
+                prepared_tts,
+                on_started=lambda: self._start_segment_speech(sequence_id),
+                on_finished=lambda: self._mark_segment_tts_done(sequence_id),
+            )
+        self._prepare_next_reply_segment()
 
     def _start_segment_speech(self, sequence_id: int) -> None:
         if (
@@ -758,12 +771,47 @@ class PetWindow(QWidget):
         self._show_next_reply_segment(sequence_id)
 
     def _reset_current_segment_progress(self) -> None:
+        self._discard_prepared_next_tts()
         self.current_segment = None
         self.reply_advance_token += 1
         self.current_segment_sequence_id = None
         self.current_segment_speech_done = False
         self.current_segment_tts_done = True
         self.reply_advance_scheduled = False
+
+    def _prepare_next_reply_segment(self) -> None:
+        if not self.pending_reply_segments:
+            self._discard_prepared_next_tts()
+            return
+
+        next_segment = self.pending_reply_segments[0]
+        if self.prepared_next_segment is next_segment and self.prepared_next_tts is not None:
+            return
+
+        self._discard_prepared_next_tts()
+        self.prepared_next_segment = next_segment
+        self.prepared_next_tts = self.tts_provider.prepare(
+            next_segment.text,
+            next_segment.tone,
+        )
+
+    def _take_prepared_tts_for_segment(
+        self,
+        segment: ChatSegment,
+    ) -> TTSPreparedAudio | None:
+        if self.prepared_next_segment is not segment:
+            return None
+
+        prepared_tts = self.prepared_next_tts
+        self.prepared_next_segment = None
+        self.prepared_next_tts = None
+        return prepared_tts
+
+    def _discard_prepared_next_tts(self) -> None:
+        if self.prepared_next_tts is not None:
+            self.tts_provider.discard_prepared(self.prepared_next_tts)
+        self.prepared_next_segment = None
+        self.prepared_next_tts = None
 
     def _restart_current_segment_speech(self) -> None:
         if self.current_segment_sequence_id is None or self.current_segment is None:
