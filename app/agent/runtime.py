@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from app.agent.actions import AgentAction, AgentEvent, AgentResult, MemoryUpdate
+from app.agent.actions import AgentAction, AgentEvent, AgentResult, MemoryUpdate, PendingToolAction
 from app.agent.memory import MemoryStore
 from app.agent.tool_registry import ToolExecutionResult, ToolRegistry
 from app.api_client import OpenAICompatibleClient
@@ -50,10 +50,18 @@ class AgentRuntime:
         if not tool_calls:
             return AgentResult(reply=_parse_agent_reply(agent_data, first_content))
 
-        execution_results = [
-            self.tools.execute(call["name"], call["arguments"])
-            for call in tool_calls[:MAX_TOOL_CALLS_PER_TURN]
-        ]
+        execution_results: list[ToolExecutionResult] = []
+        pending_actions: list[PendingToolAction] = []
+        for call in tool_calls[:MAX_TOOL_CALLS_PER_TURN]:
+            prepared = self.tools.prepare_or_execute(
+                call["name"],
+                call["arguments"],
+                call.get("reason", ""),
+            )
+            if isinstance(prepared, PendingToolAction):
+                pending_actions.append(prepared)
+            else:
+                execution_results.append(prepared)
         if len(tool_calls) > MAX_TOOL_CALLS_PER_TURN:
             execution_results.append(
                 ToolExecutionResult(
@@ -62,6 +70,19 @@ class AgentRuntime:
                     content="",
                     error=f"单轮最多执行 {MAX_TOOL_CALLS_PER_TURN} 个工具调用，后续调用已跳过。",
                 )
+            )
+
+        if pending_actions:
+            return AgentResult(
+                reply=_build_pending_action_reply(pending_actions),
+                actions=[
+                    AgentAction(
+                        type="pending_action",
+                        payload=action.to_dict(),
+                    )
+                    for action in pending_actions
+                ],
+                memory_updates=_extract_memory_updates(execution_results),
             )
 
         try:
@@ -90,6 +111,56 @@ class AgentRuntime:
                 for result in execution_results
             ],
             memory_updates=_extract_memory_updates(execution_results),
+        )
+
+    def handle_confirmed_action(self, action: PendingToolAction) -> AgentResult:
+        result = self.tools.execute(action.tool_name, action.arguments)
+        try:
+            reply = self.api_client.chat(
+                self._build_final_reply_prompt(),
+                [
+                    {
+                        "role": "user",
+                        "content": _format_tool_results_for_model([result]),
+                    }
+                ],
+                self.reply_tones,
+            )
+        except Exception as exc:
+            print(f"[AgentRuntime] 确认动作总结失败，使用本地兜底回复：{exc}")
+            reply = _build_fallback_tool_reply([result])
+        return AgentResult(
+            reply=reply,
+            actions=[
+                AgentAction(
+                    type="tool_call",
+                    payload=result.to_dict(),
+                )
+            ],
+        )
+
+    def handle_cancelled_action(self, action: PendingToolAction) -> AgentResult:
+        return AgentResult(
+            reply=parse_chat_reply(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "ja": "わかった。実行しないでおくね。",
+                                "zh": "知道了。我不会执行这个动作。",
+                                "tone": "中性",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            ),
+            actions=[
+                AgentAction(
+                    type="cancelled_action",
+                    payload=action.to_dict(),
+                )
+            ],
         )
 
     def handle_event(self, event: AgentEvent) -> AgentResult:
@@ -152,7 +223,7 @@ class AgentRuntime:
     ]
   }},
   "tool_calls": [
-    {{"name": "工具名", "arguments": {{}}}}
+    {{"name": "工具名", "arguments": {{}}, "reason": "为什么需要这个工具"}}
   ]
 }}
 
@@ -169,6 +240,7 @@ class AgentRuntime:
 - zh 中只写 ja 对应的自然中文译文，必须是中文。
 - 如果工具可以帮助完成用户请求，优先用 tool_calls 表达要执行的动作。
 - 不要臆造工具名；只能使用上面列出的工具。
+- requires_confirmation 为 true 的工具只会在用户确认后执行；你仍然可以发起 tool_calls，但必须说明原因。
 - 用户说“几分钟后/几秒后/一会儿后”等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。
 - 只有用户给出明确日期或钟点时，add_reminder 才使用 trigger_at。
 - 不要静默写入长期记忆；只有用户明确要求记住时，才使用 propose_memory_update。
@@ -236,11 +308,14 @@ def _parse_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
             continue
         name = item.get("name")
         arguments = item.get("arguments", {})
+        reason = item.get("reason", "")
         if not isinstance(name, str) or not name.strip():
             continue
         if not isinstance(arguments, dict):
             arguments = {}
-        tool_calls.append({"name": name.strip(), "arguments": arguments})
+        if not isinstance(reason, str):
+            reason = ""
+        tool_calls.append({"name": name.strip(), "arguments": arguments, "reason": reason.strip()})
     return tool_calls
 
 
@@ -260,6 +335,49 @@ def _format_tool_results_for_model(results: list[ToolExecutionResult]) -> str:
             indent=2,
         )
     )
+
+
+def _build_pending_action_reply(actions: list[PendingToolAction]) -> ChatReply:
+    if len(actions) == 1:
+        action = actions[0]
+        text = _describe_pending_action(action)
+        return parse_chat_reply(
+            json.dumps(
+                {
+                    "segments": [
+                        {
+                            "ja": "実行する前に確認させて。",
+                            "zh": f"执行前需要你确认：{text}",
+                            "tone": "提醒",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    return parse_chat_reply(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "ja": "いくつか確認が必要な操作があるよ。",
+                        "zh": f"有 {len(actions)} 个动作需要你确认，我会先处理第一个。",
+                        "tone": "提醒",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def _describe_pending_action(action: PendingToolAction) -> str:
+    if action.tool_name == "open_url":
+        return f"打开网页 {action.arguments.get('url', '')}"
+    if action.tool_name == "open_local_folder":
+        return f"打开文件夹 {action.arguments.get('path', '')}"
+    return f"执行 {action.tool_name}"
 
 
 def _build_fallback_tool_reply(results: list[ToolExecutionResult]) -> ChatReply:
@@ -323,6 +441,14 @@ def _summarize_tool_results(results: list[ToolExecutionResult]) -> str:
             elif isinstance(result.content.get("memory"), dict):
                 memory = result.content["memory"]
                 parts.append(f"记忆「{memory.get('content', '')}」已确认。")
+            elif result.tool_name == "open_url":
+                parts.append(f"网页已打开：{result.content.get('url', '')}。")
+            elif result.tool_name == "open_local_folder":
+                parts.append(f"文件夹已打开：{result.content.get('path', '')}。")
+            elif result.tool_name == "read_note":
+                parts.append(f"笔记「{result.content.get('name', '')}」已读取。")
+            elif result.tool_name == "write_note":
+                parts.append(f"笔记「{result.content.get('name', '')}」已保存。")
             else:
                 parts.append(f"{result.tool_name} 已完成。")
         else:

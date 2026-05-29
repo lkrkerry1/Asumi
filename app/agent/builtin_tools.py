@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.agent.desktop_tools import NotesStore, open_local_folder, open_url
 from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
 from app.agent.tool_registry import Tool, ToolRegistry
@@ -17,6 +18,7 @@ def create_builtin_tool_registry(
     reminders: ReminderStore | None = None,
 ) -> ToolRegistry:
     store = TodoStore(base_dir / "data" / "tasks.json")
+    notes = NotesStore(base_dir / "data" / "notes")
     memory = memory or MemoryStore(base_dir / "data" / "memory.json")
     reminders = reminders or ReminderStore(base_dir / "data" / "reminders.json")
     return ToolRegistry(
@@ -102,6 +104,57 @@ def create_builtin_tool_registry(
                     "required": ["id"],
                 },
                 handler=reminders.cancel_reminder,
+            ),
+            Tool(
+                name="read_note",
+                description="读取 data/notes/ 下的文本笔记。只能读取笔记名，不能读取任意路径。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "笔记名，可省略 .txt 后缀。"},
+                    },
+                    "required": ["name"],
+                },
+                handler=notes.read_note,
+            ),
+            Tool(
+                name="write_note",
+                description="写入 data/notes/ 下的文本笔记。只能写入笔记名，不能写入任意路径。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "笔记名，可省略 .txt 后缀。"},
+                        "content": {"type": "string", "description": "笔记内容。"},
+                    },
+                    "required": ["name", "content"],
+                },
+                handler=notes.write_note,
+            ),
+            Tool(
+                name="open_url",
+                description="打开 http 或 https 网页。该工具会离开聊天窗口，需要用户确认后才能执行。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "要打开的 http/https URL。"},
+                    },
+                    "required": ["url"],
+                },
+                handler=open_url,
+                requires_confirmation=True,
+            ),
+            Tool(
+                name="open_local_folder",
+                description="打开已存在的本地文件夹。该工具会访问桌面环境，需要用户确认后才能执行。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "要打开的本地文件夹路径。"},
+                    },
+                    "required": ["path"],
+                },
+                handler=open_local_folder,
+                requires_confirmation=True,
             ),
             Tool(
                 name="search_memory",

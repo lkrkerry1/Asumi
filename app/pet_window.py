@@ -24,6 +24,7 @@ from app.agent import (
     AgentResult,
     AgentRuntime,
     MemoryStore,
+    PendingToolAction,
     ReminderStore,
     create_builtin_tool_registry,
 )
@@ -108,6 +109,7 @@ class PetWindow(QWidget):
         self.current_segment_speech_done = False
         self.current_segment_tts_done = True
         self.reply_advance_scheduled = False
+        self.pending_tool_action: PendingToolAction | None = None
         self.speech_timer = QTimer(self)
         self.speech_timer.setInterval(SPEECH_TYPING_INTERVAL_MS)
         self.speech_timer.timeout.connect(self._show_next_speech_char)
@@ -168,10 +170,24 @@ class PetWindow(QWidget):
         self.send_button.setFixedHeight(34)
         self.send_button.clicked.connect(self.send_message)
 
+        self.confirm_action_button = QPushButton("执行", self.input_bar)
+        self.confirm_action_button.setObjectName("confirmActionButton")
+        self.confirm_action_button.setFixedHeight(34)
+        self.confirm_action_button.hide()
+        self.confirm_action_button.clicked.connect(self.confirm_pending_action)
+
+        self.cancel_action_button = QPushButton("取消", self.input_bar)
+        self.cancel_action_button.setObjectName("cancelActionButton")
+        self.cancel_action_button.setFixedHeight(34)
+        self.cancel_action_button.hide()
+        self.cancel_action_button.clicked.connect(self.cancel_pending_action)
+
         input_layout = QHBoxLayout()
         input_layout.setContentsMargins(0, 5, 0, 5)
         input_layout.setSpacing(8)
         input_layout.addWidget(self.input_edit, 1)
+        input_layout.addWidget(self.confirm_action_button)
+        input_layout.addWidget(self.cancel_action_button)
         input_layout.addWidget(self.send_button)
         self.input_bar.setLayout(input_layout)
 
@@ -222,6 +238,26 @@ class PetWindow(QWidget):
             }
             #sendButton:disabled {
                 background: rgba(126, 171, 193, 190);
+            }
+            #confirmActionButton {
+                background: rgba(93, 181, 130, 225);
+                border: none;
+                border-radius: 16px;
+                color: white;
+                font-size: 15px;
+                font-weight: 800;
+                min-width: 58px;
+                padding: 4px 12px;
+            }
+            #cancelActionButton {
+                background: rgba(180, 130, 146, 210);
+                border: none;
+                border-radius: 16px;
+                color: white;
+                font-size: 15px;
+                font-weight: 800;
+                min-width: 58px;
+                padding: 4px 12px;
             }
             """
         )
@@ -429,6 +465,7 @@ class PetWindow(QWidget):
         if not text or self.thread is not None:
             return
 
+        self._set_pending_tool_action(None)
         self.input_edit.clear()
         self.reply_sequence_id += 1
         self.pending_reply_segments = []
@@ -459,6 +496,66 @@ class PetWindow(QWidget):
         self.messages.append({"role": "assistant", "content": reply.text})
         self._record_history("assistant", reply.text, reply.translation)
         self._show_reply_segments(reply.segments)
+        self._apply_pending_action_from_result(result)
+
+    @Slot()
+    def confirm_pending_action(self) -> None:
+        if self.pending_tool_action is None or self.thread is not None:
+            return
+        action = self.pending_tool_action
+        self._set_pending_tool_action(None)
+        self._run_action_worker(confirmed_action=action)
+
+    @Slot()
+    def cancel_pending_action(self) -> None:
+        if self.pending_tool_action is None or self.thread is not None:
+            return
+        action = self.pending_tool_action
+        self._set_pending_tool_action(None)
+        self._run_action_worker(cancelled_action=action)
+
+    def _run_action_worker(
+        self,
+        confirmed_action: PendingToolAction | None = None,
+        cancelled_action: PendingToolAction | None = None,
+    ) -> None:
+        self._set_busy(True)
+        self.thread = QThread(self)
+        self.worker = ChatWorker(
+            self.agent_runtime,
+            confirmed_action=confirmed_action,
+            cancelled_action=cancelled_action,
+        )
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self._handle_action_reply)
+        self.worker.failed.connect(self._handle_error)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self._cleanup_worker)
+        self.thread.start()
+
+    @Slot(object)
+    def _handle_action_reply(self, result: AgentResult) -> None:
+        self._show_reply_segments(result.reply.segments)
+        self._apply_pending_action_from_result(result)
+
+    def _apply_pending_action_from_result(self, result: AgentResult) -> None:
+        for action in result.actions:
+            if action.type != "pending_action":
+                continue
+            try:
+                self._set_pending_tool_action(PendingToolAction.from_dict(action.payload))
+            except ValueError as exc:
+                print(f"[Tool] 待确认动作无效：{exc}")
+            return
+        self._set_pending_tool_action(None)
+
+    def _set_pending_tool_action(self, action: PendingToolAction | None) -> None:
+        self.pending_tool_action = action
+        has_action = action is not None
+        self.confirm_action_button.setVisible(has_action)
+        self.cancel_action_button.setVisible(has_action)
 
     @Slot(str)
     def _handle_error(self, message: str) -> None:
@@ -482,6 +579,8 @@ class PetWindow(QWidget):
     def _set_busy(self, busy: bool) -> None:
         self.input_edit.setEnabled(not busy)
         self.send_button.setEnabled(not busy)
+        self.confirm_action_button.setEnabled(not busy)
+        self.cancel_action_button.setEnabled(not busy)
         self.send_button.setText("等待" if busy else "发送")
 
     @Slot(str)

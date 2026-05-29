@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.agent.actions import AgentAction, AgentEvent, AgentResult, MemoryUpdate
+from app.agent.actions import AgentAction, AgentEvent, AgentResult, MemoryUpdate, PendingToolAction
 from app.agent.builtin_tools import create_builtin_tool_registry
 from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore, ScheduledReminder
@@ -14,6 +14,7 @@ __all__ = [
     "AgentRuntime",
     "MemoryStore",
     "MemoryUpdate",
+    "PendingToolAction",
     "ReminderStore",
     "ScheduledReminder",
     "Tool",

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from app.agent.actions import PendingToolAction
+
 
 ToolHandler = Callable[[dict[str, Any]], Any]
 
@@ -15,6 +17,7 @@ class Tool:
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
     handler: ToolHandler | None = None
+    requires_confirmation: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,9 +63,32 @@ class ToolRegistry:
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.parameters,
+                "requires_confirmation": tool.requires_confirmation,
             }
             for tool in self.all()
         ]
+
+    def prepare_or_execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        reason: str = "",
+    ) -> ToolExecutionResult | PendingToolAction:
+        tool = self.get(name)
+        if tool is None or not tool.requires_confirmation:
+            return self.execute(name, arguments)
+        if not isinstance(arguments, dict):
+            return ToolExecutionResult(
+                tool_name=name,
+                success=False,
+                content="",
+                error="工具参数必须是 JSON object。",
+            )
+        return PendingToolAction.create(
+            tool_name=name,
+            arguments=arguments,
+            reason=reason,
+        )
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolExecutionResult:
         tool = self.get(name)
