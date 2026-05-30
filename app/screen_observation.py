@@ -74,10 +74,14 @@ def build_screen_observation_user_message(
 
 
 def capture_screen_observation(excluded_widget: QWidget | None = None) -> ScreenObservation:
-    """截取光标所在屏幕；可临时隐藏桌宠窗口，避免它挡住画面。"""
+    """截取光标所在屏幕。
+
+    不临时隐藏桌宠窗口，避免截图时立绘闪烁，以及事件循环重入打断 follow-up 请求调度。
+    """
     from PySide6.QtGui import QCursor
     from PySide6.QtWidgets import QApplication
 
+    _ = excluded_widget
     app = QApplication.instance()
     if app is None:
         raise RuntimeError("屏幕观察需要先创建 QApplication。")
@@ -86,18 +90,7 @@ def capture_screen_observation(excluded_widget: QWidget | None = None) -> Screen
     if screen is None:
         raise RuntimeError("无法找到可截图的屏幕。")
 
-    should_restore = bool(excluded_widget is not None and excluded_widget.isVisible())
-    if should_restore and excluded_widget is not None:
-        excluded_widget.hide()
-        QApplication.processEvents()
-
-    try:
-        pixmap = screen.grabWindow(0)
-    finally:
-        if should_restore and excluded_widget is not None:
-            excluded_widget.show()
-            excluded_widget.raise_()
-            QApplication.processEvents()
+    pixmap = screen.grabWindow(0)
 
     if pixmap.isNull():
         raise RuntimeError("屏幕截图为空，可能被系统权限或显示环境阻止。")

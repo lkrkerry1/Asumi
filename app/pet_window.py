@@ -153,6 +153,7 @@ class PetWindow(QWidget):
         self.reply_advance_scheduled = False
         self.pending_tool_action: PendingToolAction | None = None
         self.pending_screen_observation_messages: list[dict[str, Any]] | None = None
+        self.screen_observation_followup_in_progress = False
         self.active_reminder_id: str | None = None
         self.active_reminder_text = ""
         self.interaction_sequence = 0
@@ -864,9 +865,11 @@ class PetWindow(QWidget):
             return True
 
         text = str(self.messages[-1].get("content", ""))
+        self.screen_observation_followup_in_progress = True
         try:
             observation = capture_screen_observation(self)
         except RuntimeError as exc:
+            self.screen_observation_followup_in_progress = False
             self._log_interaction_stage("screen_observation_failed", {"error": str(exc)})
             debug_log("PetWindow", "屏幕观察失败", {"error": str(exc)})
             self._consume_agent_result(_build_screen_observation_failed_result(str(exc)))
@@ -877,6 +880,7 @@ class PetWindow(QWidget):
         self.pending_screen_observation_messages = trim_messages_for_model(
             [*self.messages[:-1], observed_message]
         )
+        self.screen_observation_followup_in_progress = False
         debug_log(
             "PetWindow",
             "屏幕观察 follow-up 已排队",
@@ -1084,6 +1088,7 @@ class PetWindow(QWidget):
             "cleanup_worker_enter",
             {
                 "has_pending_screen_observation": self.pending_screen_observation_messages is not None,
+                "screen_observation_followup_in_progress": self.screen_observation_followup_in_progress,
             },
         )
         if self.worker is not None:
@@ -1092,6 +1097,10 @@ class PetWindow(QWidget):
             self.worker_thread.deleteLater()
         self.worker = None
         self.worker_thread = None
+        if self.screen_observation_followup_in_progress:
+            self._log_interaction_stage("screen_observation_cleanup_deferred")
+            QTimer.singleShot(0, self._cleanup_worker)
+            return
         if self.pending_screen_observation_messages is not None:
             request_messages = self.pending_screen_observation_messages
             self.pending_screen_observation_messages = None
