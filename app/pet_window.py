@@ -88,6 +88,7 @@ from app.history_window import HistoryWindow
 from app.portrait_utils import should_crossfade_portrait
 from app.proactive_care import (
     PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER,
+    PROACTIVE_TIMER_DUE_GRACE_SECONDS,
     PROACTIVE_TIMER_POLL_INTERVAL_MS,
     ProactiveCareSettings,
 )
@@ -1276,14 +1277,18 @@ class PetWindow(QWidget):
         return True
 
     def _should_capture_proactive_screen_context(self, now: float) -> bool:
+        check_interval_seconds = self.proactive_care_settings.check_interval_minutes * 60
         seconds_since_pet_interaction = now - self.last_user_activity_at
-        if seconds_since_pet_interaction < self.proactive_care_settings.check_interval_minutes * 60:
+        if (
+            seconds_since_pet_interaction + PROACTIVE_TIMER_DUE_GRACE_SECONDS
+            < check_interval_seconds
+        ):
             return False
         if self.last_proactive_screen_context_at is None:
             return True
         return (
-            now - self.last_proactive_screen_context_at
-            >= self.proactive_care_settings.check_interval_minutes * 60
+            now - self.last_proactive_screen_context_at + PROACTIVE_TIMER_DUE_GRACE_SECONDS
+            >= check_interval_seconds
         )
 
     def _capture_proactive_screen_context(self, now: float) -> None:

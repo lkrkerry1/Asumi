@@ -181,6 +181,22 @@ def test_proactive_care_batches_screenshots_until_cooldown(monkeypatch) -> None:
     assert window.proactive_screen_contexts == []
 
 
+def test_proactive_care_capture_interval_allows_timer_jitter() -> None:
+    window = _build_minimal_proactive_window(
+        screen_context_enabled=True,
+        check_interval_minutes=1,
+        cooldown_minutes=10,
+    )
+    window.last_user_activity_at = 0.0
+
+    assert not window._should_capture_proactive_screen_context(58.9)
+    assert window._should_capture_proactive_screen_context(59.2)
+
+    window.last_proactive_screen_context_at = 60.0
+    assert not window._should_capture_proactive_screen_context(118.9)
+    assert window._should_capture_proactive_screen_context(119.2)
+
+
 def test_proactive_care_keeps_recent_screenshot_batch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.pet_window as pet_window_module
 

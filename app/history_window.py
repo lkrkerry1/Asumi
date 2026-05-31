@@ -285,6 +285,10 @@ class HistoryWindow(QDialog):
             item = self.history_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # deleteLater 会等事件循环空闲后才真正销毁；
+                # 先隐藏并脱离父控件，避免刷新后旧内容短暂叠在空状态上。
+                widget.hide()
+                widget.setParent(None)
                 widget.deleteLater()
 
     def _add_empty_state(self) -> None:
