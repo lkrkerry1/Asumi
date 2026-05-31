@@ -3,7 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import QObject, Signal, Slot
 
 from app.agent.memory_curator import MemoryCurator
-from app.chat_history import ChatHistoryEntry
+from app.storage.chat_history import ChatHistoryEntry
 
 
 class MemoryCurationWorker(QObject):

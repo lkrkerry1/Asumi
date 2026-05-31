@@ -2,19 +2,16 @@ from __future__ import annotations
 
 import http.client
 import json
-import os
 import ssl
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-from app.chat_reply import ChatReply, parse_chat_reply
+from app.llm.chat_reply import ChatReply, parse_chat_reply
 from app.debug_log import debug_log, summarize_messages
-from app.env_config import load_env_file, save_env_values
-from app.prompt_templates import build_segmented_reply_instruction
+from app.llm.prompt_templates import build_segmented_reply_instruction
 
 
 MAX_API_RETRY_ATTEMPTS = 3
@@ -47,61 +44,6 @@ class ApiSettings:
     api_key: str
     model: str
     timeout_seconds: int = 60
-
-    @classmethod
-    def load(cls, env_path: Path) -> "ApiSettings":
-        values = load_env_file(env_path)
-
-        base_url = (
-            os.getenv("BASE_URL")
-            or os.getenv("OPENAI_BASE_URL")
-            or values.get("BASE_URL")
-            or values.get("OPENAI_BASE_URL")
-            or "https://api.openai.com/v1"
-        )
-        api_key = (
-            os.getenv("API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-            or values.get("API_KEY")
-            or values.get("OPENAI_API_KEY")
-            or ""
-        )
-        model = (
-            os.getenv("MODEL")
-            or os.getenv("OPENAI_MODEL")
-            or values.get("MODEL")
-            or values.get("OPENAI_MODEL")
-            or "gpt-4.1-mini"
-        )
-        timeout_text = (
-            os.getenv("API_TIMEOUT_SECONDS")
-            or values.get("API_TIMEOUT_SECONDS")
-            or "60"
-        )
-
-        try:
-            timeout_seconds = int(timeout_text)
-        except ValueError:
-            timeout_seconds = 60
-
-        return cls(
-            base_url=base_url.strip().rstrip("/"),
-            api_key=api_key.strip(),
-            model=model.strip(),
-            timeout_seconds=timeout_seconds,
-        )
-
-    def save(self, env_path: Path) -> None:
-        """将聊天 API 配置写入 .env，并保留其他配置项。"""
-        save_env_values(
-            env_path,
-            {
-                "BASE_URL": self.base_url.strip().rstrip("/"),
-                "API_KEY": self.api_key.strip(),
-                "MODEL": self.model.strip(),
-                "API_TIMEOUT_SECONDS": str(self.timeout_seconds),
-            },
-        )
 
 
 class OpenAICompatibleClient:
@@ -171,7 +113,7 @@ class OpenAICompatibleClient:
         **chat_params: Any,
     ) -> str:
         """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。"""
-        self._ensure_chat_config("缺少 API_KEY。请在 .env 中配置 API_KEY、BASE_URL、MODEL。")
+        self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
 
         payload = _build_chat_completion_payload(
             model=self.settings.model,

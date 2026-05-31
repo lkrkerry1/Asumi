@@ -28,8 +28,9 @@ from PySide6.QtWidgets import (
 
 from app.agent.memory import MEMORY_CATEGORIES, MemoryStore
 from app.agent.mcp import MCPRuntimeSettings
-from app.api_client import ApiSettings, OpenAICompatibleClient
-from app.character_loader import CharacterProfile, CharacterRegistry
+from app.config.settings_service import DebugLogSettings
+from app.llm.api_client import ApiSettings, OpenAICompatibleClient
+from app.config.character_loader import CharacterProfile, CharacterRegistry
 from app.proactive_care import (
     PROACTIVE_MAX_COOLDOWN_MINUTES,
     PROACTIVE_MAX_CHECK_INTERVAL_MINUTES,
@@ -39,7 +40,7 @@ from app.proactive_care import (
     PROACTIVE_MIN_SCREEN_CONTEXT_BATCH_LIMIT,
     ProactiveCareSettings,
 )
-from app.tts import GPTSoVITSTTSSettings, TTSConfigError
+from app.voice.tts import GPTSoVITSTTSSettings, TTSConfigError
 
 
 class ApiConnectionTestWorker(QObject):
@@ -73,6 +74,7 @@ class SettingsDialog(QDialog):
         current_character: CharacterProfile | None = None,
         proactive_care_settings: ProactiveCareSettings | None = None,
         mcp_settings: MCPRuntimeSettings | None = None,
+        debug_log_settings: DebugLogSettings | None = None,
         memory_store: MemoryStore | None = None,
         parent=None,  # type: ignore[no-untyped-def]
     ) -> None:
@@ -88,6 +90,7 @@ class SettingsDialog(QDialog):
         self.result_character_id: str | None = None
         self.result_proactive_care_settings: ProactiveCareSettings | None = None
         self.result_mcp_settings: MCPRuntimeSettings | None = None
+        self.result_debug_log_settings: DebugLogSettings | None = None
         self._api_test_thread: QThread | None = None
         self._api_test_worker: ApiConnectionTestWorker | None = None
 
@@ -106,6 +109,7 @@ class SettingsDialog(QDialog):
             "隐私",
         )
         tabs.addTab(self._build_mcp_tab(mcp_settings or MCPRuntimeSettings()), "工具")
+        tabs.addTab(self._build_system_tab(debug_log_settings or DebugLogSettings()), "系统")
         if memory_store is not None:
             tabs.addTab(self._build_memory_tab(memory_store), "记忆")
 
@@ -359,6 +363,23 @@ class SettingsDialog(QDialog):
         tab.setLayout(form_layout)
         return tab
 
+    def _build_system_tab(self, debug_settings: DebugLogSettings) -> QWidget:
+        tab = QWidget(self)
+        self.debug_log_enabled_check = QCheckBox("输出终端调试日志", tab)
+        self.debug_log_enabled_check.setChecked(debug_settings.enabled)
+        self.debug_body_enabled_check = QCheckBox("输出完整请求/回复正文", tab)
+        self.debug_body_enabled_check.setChecked(debug_settings.body_enabled)
+        self.debug_log_enabled_check.toggled.connect(self.debug_body_enabled_check.setEnabled)
+        self.debug_body_enabled_check.setEnabled(self.debug_log_enabled_check.isChecked())
+
+        form_layout = QFormLayout()
+        form_layout.setContentsMargins(16, 18, 16, 16)
+        form_layout.setSpacing(12)
+        form_layout.addRow("", self.debug_log_enabled_check)
+        form_layout.addRow("", self.debug_body_enabled_check)
+        tab.setLayout(form_layout)
+        return tab
+
     @Slot(bool)
     def _sync_proactive_interval_controls(self, enabled: bool) -> None:
         """主动屏幕获取关闭时，不允许调整主动关怀时间参数。"""
@@ -589,6 +610,13 @@ class SettingsDialog(QDialog):
         )
         self.result_mcp_settings = MCPRuntimeSettings(
             windows_enabled=self.windows_mcp_enabled_check.isChecked(),
+        )
+        self.result_debug_log_settings = DebugLogSettings(
+            enabled=self.debug_log_enabled_check.isChecked(),
+            body_enabled=(
+                self.debug_log_enabled_check.isChecked()
+                and self.debug_body_enabled_check.isChecked()
+            ),
         )
         super().accept()
 

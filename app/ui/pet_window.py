@@ -50,20 +50,19 @@ from app.agent.memory_curator import (
 )
 from app.agent.memory_curation_worker import MemoryCurationWorker
 from app.agent.screen_tools import SCREEN_OBSERVATION_REQUEST_ACTION
-from app.app_context import AppContext
-from app.character_loader import (
+from app.core.app_context import AppContext
+from app.config.character_loader import (
     DEFAULT_CHARACTER_ID,
     CharacterConfigError,
     CharacterProfile,
     load_character_system_prompt,
 )
-from app.chat_history import ChatHistoryEntry, ChatHistoryStore
-from app.chat_reply import ChatReply, ChatSegment
-from app.context_trimming import trim_messages_for_model
+from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
+from app.llm.chat_reply import ChatReply, ChatSegment
+from app.llm.context_trimming import trim_messages_for_model
 from app.chat_worker import ChatWorker, EventWorker
 from app.debug_log import debug_log, summarize_messages
-from app.env_config import load_env_file, save_env_values
-from app.history_window import HistoryWindow
+from app.ui.history_window import HistoryWindow
 from app.proactive_care import (
     PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER,
     PROACTIVE_TIMER_DUE_GRACE_SECONDS,
@@ -78,15 +77,15 @@ from app.screen_observation import (
     build_screen_observation_user_message,
     capture_screen_observation,
 )
-from app.settings_dialog import SettingsDialog
-from app.tts import (
+from app.ui.settings_dialog import SettingsDialog
+from app.voice.tts import (
     GPTSoVITSTTSProvider,
     GPTSoVITSTTSSettings,
     NullTTSProvider,
     TTSConfigError,
     TTSProvider,
 )
-from app.visual_observation import (
+from app.storage.visual_observation import (
     VISUAL_OBSERVATION_RECENT_MINUTES,
     VisualObservationJob,
     VisualObservationStore,
@@ -109,11 +108,8 @@ from app.voice import VoicePlaybackController
 
 
 REMINDER_CHECK_INTERVAL_MS = 30_000
-SUBTITLE_LANGUAGE_KEY = "SUBTITLE_LANGUAGE"
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
-SCREEN_OBSERVATION_ENABLED_KEY = "SCREEN_OBSERVATION_ENABLED"
-AUTONOMOUS_SCREEN_OBSERVATION_ENABLED_KEY = "AUTONOMOUS_SCREEN_OBSERVATION_ENABLED"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
 REPLY_HISTORY_PANEL_WIDTH = 34
 REPLY_HISTORY_PANEL_HEIGHT = 70
@@ -130,7 +126,7 @@ class PetWindow(QWidget):
         super().__init__()
         self.context = context
         self.base_dir = context.base_dir
-        self.env_path = context.env_path
+        self.settings_service = context.settings_service
         self.character_registry = context.character_registry
         self.character_profile = context.character_profile
         self.api_client = context.api_client
@@ -145,6 +141,7 @@ class PetWindow(QWidget):
         self.history_store = context.history_store
         self.visual_observation_store = context.visual_observation_store
         self.mcp_settings = context.mcp_settings
+        self.debug_log_settings = context.debug_log_settings
         self.memory_curation_settings = context.memory_curation_settings
         self.memory_curation_state = context.memory_curation_state
         self.memory_curator = context.memory_curator
@@ -1871,9 +1868,7 @@ class PetWindow(QWidget):
     @Slot()
     def show_settings(self) -> None:
         try:
-            tts_settings = GPTSoVITSTTSSettings.load(
-                self.env_path,
-                self.base_dir,
+            tts_settings = self.settings_service.load_tts_settings(
                 validate_enabled=False,
                 character_profile=self.character_profile,
             )
@@ -1889,6 +1884,7 @@ class PetWindow(QWidget):
             self.character_profile,
             self.proactive_care_settings,
             self.mcp_settings,
+            self.debug_log_settings,
             self.memory_store,
             self,
         )
@@ -1899,6 +1895,7 @@ class PetWindow(QWidget):
             or dialog.result_character_id is None
             or dialog.result_proactive_care_settings is None
             or dialog.result_mcp_settings is None
+            or dialog.result_debug_log_settings is None
         ):
             return
 
@@ -1913,11 +1910,17 @@ class PetWindow(QWidget):
             return
 
         try:
-            dialog.result_api_settings.save(self.env_path)
-            dialog.result_tts_settings.save(self.env_path, self.base_dir)
-            self.character_registry.save_current_id(self.env_path, selected_profile.id)
-            dialog.result_proactive_care_settings.save(self.env_path)
-            dialog.result_mcp_settings.save(self.env_path)
+            self.settings_service.save_api_settings(dialog.result_api_settings)
+            self.settings_service.save_tts_settings(dialog.result_tts_settings)
+            self.settings_service.save_current_character_id(
+                self.character_registry,
+                selected_profile.id,
+            )
+            self.settings_service.save_proactive_care_settings(
+                dialog.result_proactive_care_settings
+            )
+            self.settings_service.save_mcp_runtime_settings(dialog.result_mcp_settings)
+            self.settings_service.save_debug_log_settings(dialog.result_debug_log_settings)
         except OSError as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存设置：{exc}")
             return
@@ -1926,6 +1929,7 @@ class PetWindow(QWidget):
         self.proactive_care_settings = dialog.result_proactive_care_settings
         mcp_restart_required = dialog.result_mcp_settings != self.mcp_settings
         self.mcp_settings = dialog.result_mcp_settings
+        self.debug_log_settings = dialog.result_debug_log_settings
         self._sync_proactive_care_timer()
         self.retired_tts_providers.append(self.tts_provider)
         self.tts_provider = new_tts_provider
@@ -1947,7 +1951,10 @@ class PetWindow(QWidget):
         previous_language = self.subtitle_language
         self.subtitle_language = next_language
         try:
-            save_env_values(self.env_path, {SUBTITLE_LANGUAGE_KEY: next_language})
+            self._save_system_config_values(
+                "ui",
+                {"subtitle_language": next_language},
+            )
         except OSError as exc:
             self.subtitle_language = previous_language
             self._apply_speech_font()
@@ -1979,12 +1986,10 @@ class PetWindow(QWidget):
             self.autonomous_screen_observation_enabled
         )
         try:
-            save_env_values(
-                self.env_path,
+            self._save_system_config_values(
+                "screen_observation",
                 {
-                    AUTONOMOUS_SCREEN_OBSERVATION_ENABLED_KEY: _format_bool(
-                        self.autonomous_screen_observation_enabled
-                    )
+                    "autonomous_enabled": self.autonomous_screen_observation_enabled,
                 },
             )
         except OSError as exc:
@@ -2130,38 +2135,38 @@ class PetWindow(QWidget):
         self.subtitle_controller.show_segments(segments)
 
     def _load_subtitle_language(self) -> str:
-        try:
-            values = load_env_file(self.env_path)
-        except OSError:
-            return SUBTITLE_LANGUAGE_JA
-
-        language = values.get(SUBTITLE_LANGUAGE_KEY, SUBTITLE_LANGUAGE_JA).strip().lower()
+        system_values = self._load_system_config_values("ui")
+        language = str(system_values.get("subtitle_language", "")).strip().lower()
         if language == SUBTITLE_LANGUAGE_ZH:
             return SUBTITLE_LANGUAGE_ZH
         return SUBTITLE_LANGUAGE_JA
 
     def _load_screen_observation_enabled(self) -> bool:
-        try:
-            values = load_env_file(self.env_path)
-        except OSError:
-            debug_log("PetWindow", "屏幕观察配置读取失败，使用默认值", {"default": True})
-            return True
-
-        enabled = _parse_bool(values.get(SCREEN_OBSERVATION_ENABLED_KEY), default=True)
-        debug_log("PetWindow", "屏幕观察配置已加载", {"enabled": enabled})
-        return enabled
+        system_values = self._load_system_config_values("screen_observation")
+        if "enabled" in system_values:
+            enabled = _parse_bool(system_values.get("enabled"), default=True)
+            debug_log("PetWindow", "屏幕观察 YAML 配置已加载", {"enabled": enabled})
+            return enabled
+        return True
 
     def _load_autonomous_screen_observation_enabled(self) -> bool:
-        try:
-            values = load_env_file(self.env_path)
-        except OSError:
-            debug_log("PetWindow", "自主屏幕观察配置读取失败，使用默认值", {"default": False})
-            return False
+        system_values = self._load_system_config_values("screen_observation")
+        if "autonomous_enabled" in system_values:
+            enabled = _parse_bool(system_values.get("autonomous_enabled"), default=False)
+            enabled = enabled and self.screen_observation_enabled
+            debug_log("PetWindow", "自主屏幕观察 YAML 配置已加载", {"enabled": enabled})
+            return enabled
+        return False
 
-        enabled = _parse_bool(values.get(AUTONOMOUS_SCREEN_OBSERVATION_ENABLED_KEY), default=False)
-        enabled = enabled and self.screen_observation_enabled
-        debug_log("PetWindow", "自主屏幕观察配置已加载", {"enabled": enabled})
-        return enabled
+    def _load_system_config_values(self, section: str) -> dict[str, Any]:
+        return self.settings_service.load_system_values(section)
+
+    def _save_system_config_values(
+        self,
+        section: str,
+        values: dict[str, Any],
+    ) -> None:
+        self.settings_service.save_system_values(section, values)
 
     def _apply_character(self, profile: CharacterProfile) -> None:
         previous_character_id = self.character_profile.id
@@ -2314,19 +2319,17 @@ def _reply_history_segments_from_entries(entries: list[ChatHistoryEntry]) -> lis
     return segments
 
 
-def _parse_bool(value: str | None, default: bool = False) -> bool:
+def _parse_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
-    normalized = value.strip().lower()
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
     if normalized in {"1", "true", "yes", "on", "enabled"}:
         return True
     if normalized in {"0", "false", "no", "off", "disabled"}:
         return False
     return default
-
-
-def _format_bool(value: bool) -> str:
-    return "true" if value else "false"
 
 
 def _configure_reply_history_panel(panel: QFrame) -> None:

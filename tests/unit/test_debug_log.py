@@ -4,9 +4,7 @@ from app.debug_log import debug_body_enabled, debug_enabled, debug_log, sanitize
 
 
 def test_debug_log_disabled_by_default(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.delenv("SAKURA_DEBUG", raising=False)
-    monkeypatch.delenv("SAKURA_DEBUG_BODY", raising=False)
-    monkeypatch.setattr("app.debug_log._load_env_values", lambda: {})
+    monkeypatch.setattr("app.debug_log._load_debug_values", lambda: {})
 
     debug_log("Test", "不会输出", {"content": "正文"})
 
@@ -14,9 +12,7 @@ def test_debug_log_disabled_by_default(monkeypatch, capsys) -> None:  # type: ig
 
 
 def test_debug_log_outputs_summary_when_enabled(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("SAKURA_DEBUG", "true")
-    monkeypatch.delenv("SAKURA_DEBUG_BODY", raising=False)
-    monkeypatch.setattr("app.debug_log._load_env_values", lambda: {})
+    monkeypatch.setattr("app.debug_log._load_debug_values", lambda: {"enabled": True})
 
     debug_log("API", "请求开始", {"model": "demo", "content": "你好"})
 
@@ -27,8 +23,10 @@ def test_debug_log_outputs_summary_when_enabled(monkeypatch, capsys) -> None:  #
 
 
 def test_debug_body_disabled_keeps_only_body_summary(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("SAKURA_DEBUG", "true")
-    monkeypatch.setenv("SAKURA_DEBUG_BODY", "false")
+    monkeypatch.setattr(
+        "app.debug_log._load_debug_values",
+        lambda: {"enabled": True, "body_enabled": False},
+    )
 
     content = "开头" + "中间" * 120 + "隐藏末尾"
     data = sanitize_debug_data({"content": content})
@@ -38,8 +36,10 @@ def test_debug_body_disabled_keeps_only_body_summary(monkeypatch) -> None:  # ty
 
 
 def test_debug_body_enabled_allows_full_short_body(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("SAKURA_DEBUG", "true")
-    monkeypatch.setenv("SAKURA_DEBUG_BODY", "true")
+    monkeypatch.setattr(
+        "app.debug_log._load_debug_values",
+        lambda: {"enabled": True, "body_enabled": True},
+    )
 
     assert debug_enabled()
     assert debug_body_enabled()

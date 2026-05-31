@@ -5,9 +5,9 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
-from app.bootstrap import build_app_context
-from app.character_loader import CharacterConfigError
-from app.pet_window import PetWindow
+from app.core.bootstrap import build_app_context
+from app.config.character_loader import CharacterConfigError
+from app.ui.pet_window import PetWindow
 
 
 BASE_DIR = Path(__file__).resolve().parent

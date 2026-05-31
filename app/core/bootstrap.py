@@ -3,28 +3,29 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.agent import AgentRuntime, MemoryStore, ReminderStore, create_builtin_tool_registry
-from app.agent.mcp import MCPRuntimeSettings, register_mcp_tools_from_config
-from app.agent.memory_curator import MemoryCurator, MemoryCurationSettings, MemoryCurationState
-from app.api_client import ApiSettings, OpenAICompatibleClient
-from app.app_context import AppContext, CoreServices, FeatureServices, StorageServices
-from app.character_loader import (
+from app.agent.mcp import register_mcp_tools_from_config
+from app.agent.memory_curator import MemoryCurator, MemoryCurationState
+from app.config.settings_service import AppSettingsService
+from app.llm.api_client import OpenAICompatibleClient
+from app.core.app_context import AppContext, CoreServices, FeatureServices, StorageServices
+from app.core.extensions import ExtensionRegistry
+from app.config.character_loader import (
     DEFAULT_CHARACTER_ID,
     CharacterProfile,
     CharacterRegistry,
     load_character_system_prompt,
 )
-from app.chat_history import ChatHistoryStore
+from app.storage.chat_history import ChatHistoryStore
 from app.debug_log import debug_log
-from app.proactive_care import ProactiveCareSettings
-from app.tts import create_tts_provider
-from app.visual_observation import VisualObservationStore
+from app.voice.tts import GPTSoVITSTTSProvider, NullTTSProvider, TTSConfigError
+from app.storage.visual_observation import VisualObservationStore
 
 
 def build_app_context(base_dir: Path) -> AppContext:
     """加载启动配置并创建主窗口所需的核心依赖。"""
 
-    env_path = base_dir / ".env"
-    settings = ApiSettings.load(env_path)
+    settings_service = AppSettingsService(base_dir=base_dir)
+    settings = settings_service.load_api_settings()
     api_client = OpenAICompatibleClient(settings)
     debug_log(
         "Startup",
@@ -38,7 +39,9 @@ def build_app_context(base_dir: Path) -> AppContext:
     )
 
     character_registry = CharacterRegistry(base_dir)
-    character_profile = character_registry.current(env_path)
+    character_profile = character_registry.get(
+        settings_service.load_current_character_id(character_registry)
+    )
     system_prompt = load_character_system_prompt(character_profile)
     debug_log(
         "Startup",
@@ -50,7 +53,19 @@ def build_app_context(base_dir: Path) -> AppContext:
         },
     )
 
-    tts_provider = create_tts_provider(base_dir, character_profile)
+    try:
+        tts_settings = settings_service.load_tts_settings(
+            character_profile=character_profile,
+        )
+        tts_provider = (
+            GPTSoVITSTTSProvider(tts_settings)
+            if tts_settings.enabled
+            else NullTTSProvider()
+        )
+    except TTSConfigError as exc:
+        print(f"[TTS] 配置无效，已禁用 TTS：{exc}")
+        debug_log("TTS", "配置无效，已禁用 TTS", {"error": str(exc)})
+        tts_provider = NullTTSProvider()
     debug_log(
         "Startup",
         "TTS Provider 已创建",
@@ -64,9 +79,13 @@ def build_app_context(base_dir: Path) -> AppContext:
         memory_store,
         reminder_store,
     )
+    extension_registry = ExtensionRegistry()
+    extension_registry.apply_tools(tool_registry)
+    mcp_settings = settings_service.load_mcp_runtime_settings()
     mcp_tool_provider = register_mcp_tools_from_config(
         base_dir,
         tool_registry,
+        runtime_settings=mcp_settings,
     )
     agent_runtime = AgentRuntime(
         api_client=api_client,
@@ -78,13 +97,13 @@ def build_app_context(base_dir: Path) -> AppContext:
     )
     history_store = _create_history_store(base_dir, character_profile)
     visual_observation_store = _create_visual_observation_store(base_dir, character_profile)
-    mcp_settings = MCPRuntimeSettings.load(env_path)
-    memory_curation_settings = MemoryCurationSettings.load(env_path)
+    debug_log_settings = settings_service.load_debug_log_settings()
+    memory_curation_settings = settings_service.load_memory_curation_settings()
     memory_curation_state = MemoryCurationState(
         base_dir / "data" / "memory_curation_state.json"
     )
     memory_curator = MemoryCurator(api_client, memory_store)
-    proactive_care_settings = ProactiveCareSettings.load(env_path)
+    proactive_care_settings = settings_service.load_proactive_care_settings()
 
     debug_log(
         "Startup",
@@ -99,7 +118,7 @@ def build_app_context(base_dir: Path) -> AppContext:
 
     return AppContext(
         base_dir=base_dir,
-        env_path=env_path,
+        settings_service=settings_service,
         settings=settings,
         character_registry=character_registry,
         character_profile=character_profile,
@@ -117,8 +136,11 @@ def build_app_context(base_dir: Path) -> AppContext:
             visual_observation_store=visual_observation_store,
         ),
         features=FeatureServices(
+            settings_service=settings_service,
+            extension_registry=extension_registry,
             mcp_tool_provider=mcp_tool_provider,
             mcp_settings=mcp_settings,
+            debug_log_settings=debug_log_settings,
             memory_curation_settings=memory_curation_settings,
             memory_curation_state=memory_curation_state,
             memory_curator=memory_curator,

@@ -6,14 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from app.agent.memory import MemoryStore
-from app.api_client import ChatMessage, OpenAICompatibleClient
-from app.chat_history import ChatHistoryEntry
-from app.env_config import load_env_file
+from app.llm.api_client import ChatMessage, OpenAICompatibleClient
+from app.storage.chat_history import ChatHistoryEntry
 
 
-AUTO_MEMORY_ENABLED_KEY = "AUTO_MEMORY_ENABLED"
-AUTO_MEMORY_TRIGGER_TURNS_KEY = "AUTO_MEMORY_TRIGGER_TURNS"
-AUTO_MEMORY_BACKFILL_LIMIT_KEY = "AUTO_MEMORY_BACKFILL_LIMIT"
 DEFAULT_AUTO_MEMORY_TRIGGER_TURNS = 8
 DEFAULT_AUTO_MEMORY_BACKFILL_LIMIT = 200
 
@@ -23,24 +19,6 @@ class MemoryCurationSettings:
     enabled: bool = True
     trigger_turns: int = DEFAULT_AUTO_MEMORY_TRIGGER_TURNS
     backfill_limit: int = DEFAULT_AUTO_MEMORY_BACKFILL_LIMIT
-
-    @classmethod
-    def load(cls, env_path: Path) -> "MemoryCurationSettings":
-        try:
-            values = load_env_file(env_path)
-        except OSError:
-            return cls()
-        return cls(
-            enabled=_parse_bool(values.get(AUTO_MEMORY_ENABLED_KEY), default=True),
-            trigger_turns=_positive_int(
-                values.get(AUTO_MEMORY_TRIGGER_TURNS_KEY),
-                default=DEFAULT_AUTO_MEMORY_TRIGGER_TURNS,
-            ),
-            backfill_limit=_positive_int(
-                values.get(AUTO_MEMORY_BACKFILL_LIMIT_KEY),
-                default=DEFAULT_AUTO_MEMORY_BACKFILL_LIMIT,
-            ),
-        )
 
 
 @dataclass(frozen=True)
@@ -248,21 +226,6 @@ def _normalize_state(raw_data: Any) -> dict[str, Any]:
         "pending_turns": max(0, _int_value(data.get("pending_turns"), default=0)),
         "backfill_completed": bool(data.get("backfill_completed", False)),
     }
-
-
-def _parse_bool(value: str | None, *, default: bool) -> bool:
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on", "enabled"}:
-        return True
-    if normalized in {"0", "false", "no", "off", "disabled"}:
-        return False
-    return default
-
-
-def _positive_int(value: Any, *, default: int) -> int:
-    return max(1, _int_value(value, default=default))
 
 
 def _int_value(value: Any, *, default: int) -> int:

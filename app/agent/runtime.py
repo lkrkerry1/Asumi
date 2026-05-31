@@ -23,16 +23,16 @@ from app.agent.tool_policy import (
     WINDOWS_SNAPSHOT_TOOL_NAME,
 )
 from app.agent.tool_registry import ToolExecutionResult, ToolRegistry
-from app.api_client import (
+from app.llm.api_client import (
     ApiRequestError,
     ChatMessage,
     OpenAICompatibleClient,
     is_vision_unsupported_error,
     messages_contain_image,
 )
-from app.chat_reply import ChatReply, parse_chat_reply
+from app.llm.chat_reply import ChatReply, parse_chat_reply
 from app.debug_log import debug_log, summarize_messages
-from app.prompt_templates import (
+from app.llm.prompt_templates import (
     build_agent_reply_protocol,
     build_context_acquisition_strategy,
     build_event_reply_protocol,

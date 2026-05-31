@@ -24,13 +24,11 @@ from app.agent.screen_tools import (
     create_screen_observation_tool,
 )
 from app.agent.tool_registry import Tool, ToolExecutionResult, ToolRegistry
-from app.api_client import ApiRequestError, is_vision_unsupported_error, messages_contain_image
-from app.context_trimming import MAX_MODEL_CONTEXT_MESSAGES, trim_messages_for_model
+from app.config.settings_service import AppSettingsService
+from app.config.yaml_config import load_yaml_mapping
+from app.llm.api_client import ApiRequestError, is_vision_unsupported_error, messages_contain_image
+from app.llm.context_trimming import MAX_MODEL_CONTEXT_MESSAGES, trim_messages_for_model
 from app.proactive_care import (
-    PROACTIVE_CHECK_INTERVAL_MINUTES_KEY,
-    PROACTIVE_COOLDOWN_MINUTES_KEY,
-    PROACTIVE_SCREEN_CONTEXT_BATCH_LIMIT_KEY,
-    PROACTIVE_SCREEN_CONTEXT_ENABLED_KEY,
     ProactiveCareSettings,
 )
 from app.screen_observation import (
@@ -91,7 +89,8 @@ def test_due_reminders_and_mark_completed() -> None:
 
 
 def test_proactive_care_settings_default_to_disabled() -> None:
-    settings = ProactiveCareSettings.load(_runtime_root_path("proactive_defaults") / ".env")
+    service = AppSettingsService(_runtime_root_path("proactive_defaults"))
+    settings = service.load_proactive_care_settings()
 
     assert not settings.enabled
     assert not settings.screen_context_enabled
@@ -101,22 +100,19 @@ def test_proactive_care_settings_default_to_disabled() -> None:
 
 
 def test_proactive_care_settings_clamp_intervals() -> None:
-    env_path = _runtime_root_path("proactive_interval") / ".env"
-    env_path.parent.mkdir(parents=True)
-    env_path.write_text(
-        "\n".join(
-            [
-                "PROACTIVE_CARE_ENABLED=true",
-                f"{PROACTIVE_SCREEN_CONTEXT_ENABLED_KEY}=true",
-                f"{PROACTIVE_CHECK_INTERVAL_MINUTES_KEY}=999",
-                f"{PROACTIVE_COOLDOWN_MINUTES_KEY}=999",
-                f"{PROACTIVE_SCREEN_CONTEXT_BATCH_LIMIT_KEY}=999",
-            ]
-        ),
-        encoding="utf-8",
+    service = AppSettingsService(_runtime_root_path("proactive_interval"))
+    service.save_system_values(
+        "proactive_care",
+        {
+            "enabled": True,
+            "screen_context_enabled": True,
+            "check_interval_minutes": 999,
+            "cooldown_minutes": 999,
+            "screen_context_batch_limit": 999,
+        },
     )
 
-    settings = ProactiveCareSettings.load(env_path)
+    settings = service.load_proactive_care_settings().normalized()
 
     assert settings.enabled
     assert settings.screen_context_enabled
@@ -126,20 +122,17 @@ def test_proactive_care_settings_clamp_intervals() -> None:
 
 
 def test_proactive_care_settings_min_intervals_are_one_minute() -> None:
-    env_path = _runtime_root_path("proactive_min_interval") / ".env"
-    env_path.parent.mkdir(parents=True)
-    env_path.write_text(
-        "\n".join(
-            [
-                f"{PROACTIVE_CHECK_INTERVAL_MINUTES_KEY}=0",
-                f"{PROACTIVE_COOLDOWN_MINUTES_KEY}=0",
-                f"{PROACTIVE_SCREEN_CONTEXT_BATCH_LIMIT_KEY}=0",
-            ]
-        ),
-        encoding="utf-8",
+    service = AppSettingsService(_runtime_root_path("proactive_min_interval"))
+    service.save_system_values(
+        "proactive_care",
+        {
+            "check_interval_minutes": 0,
+            "cooldown_minutes": 0,
+            "screen_context_batch_limit": 0,
+        },
     )
 
-    settings = ProactiveCareSettings.load(env_path)
+    settings = service.load_proactive_care_settings().normalized()
 
     assert settings.check_interval_minutes == 1
     assert settings.cooldown_minutes == 1
@@ -147,63 +140,59 @@ def test_proactive_care_settings_min_intervals_are_one_minute() -> None:
 
 
 def test_proactive_care_settings_invalid_cooldown_uses_default() -> None:
-    env_path = _runtime_root_path("proactive_invalid_cooldown") / ".env"
-    env_path.parent.mkdir(parents=True)
-    env_path.write_text(
-        f"{PROACTIVE_COOLDOWN_MINUTES_KEY}=soon",
-        encoding="utf-8",
-    )
+    service = AppSettingsService(_runtime_root_path("proactive_invalid_cooldown"))
+    service.save_system_values("proactive_care", {"cooldown_minutes": "soon"})
 
-    settings = ProactiveCareSettings.load(env_path)
+    settings = service.load_proactive_care_settings()
 
     assert settings.cooldown_minutes == 10
 
 
 def test_proactive_care_settings_invalid_batch_limit_uses_default() -> None:
-    env_path = _runtime_root_path("proactive_invalid_batch_limit") / ".env"
-    env_path.parent.mkdir(parents=True)
-    env_path.write_text(
-        f"{PROACTIVE_SCREEN_CONTEXT_BATCH_LIMIT_KEY}=many",
-        encoding="utf-8",
-    )
+    service = AppSettingsService(_runtime_root_path("proactive_invalid_batch_limit"))
+    service.save_system_values("proactive_care", {"screen_context_batch_limit": "many"})
 
-    settings = ProactiveCareSettings.load(env_path)
+    settings = service.load_proactive_care_settings()
 
     assert settings.screen_context_batch_limit == 6
 
 
-def test_proactive_care_settings_save_writes_cooldown() -> None:
-    env_path = _runtime_root_path("proactive_save_cooldown") / ".env"
+def test_proactive_care_settings_save_writes_yaml() -> None:
+    service = AppSettingsService(_runtime_root_path("proactive_save_cooldown"))
 
-    ProactiveCareSettings(
-        enabled=True,
-        screen_context_enabled=True,
-        check_interval_minutes=3,
-        cooldown_minutes=7,
-        screen_context_batch_limit=4,
-    ).save(env_path)
+    service.save_proactive_care_settings(
+        ProactiveCareSettings(
+            enabled=True,
+            screen_context_enabled=True,
+            check_interval_minutes=3,
+            cooldown_minutes=7,
+            screen_context_batch_limit=4,
+        )
+    )
 
-    text = env_path.read_text(encoding="utf-8")
-    assert "PROACTIVE_CARE_ENABLED=true" in text
-    assert f"{PROACTIVE_SCREEN_CONTEXT_ENABLED_KEY}=true" in text
-    assert f"{PROACTIVE_CHECK_INTERVAL_MINUTES_KEY}=3" in text
-    assert f"{PROACTIVE_COOLDOWN_MINUTES_KEY}=7" in text
-    assert f"{PROACTIVE_SCREEN_CONTEXT_BATCH_LIMIT_KEY}=4" in text
+    config = load_yaml_mapping(service.system_config_path)
+    assert config["proactive_care"]["enabled"] is True
+    assert config["proactive_care"]["screen_context_enabled"] is True
+    assert config["proactive_care"]["check_interval_minutes"] == 3
+    assert config["proactive_care"]["cooldown_minutes"] == 7
+    assert config["proactive_care"]["screen_context_batch_limit"] == 4
 
 
-def test_proactive_care_settings_save_syncs_legacy_enabled_key() -> None:
-    env_path = _runtime_root_path("proactive_save_sync_enabled") / ".env"
+def test_proactive_care_settings_save_normalizes_enabled_flag() -> None:
+    service = AppSettingsService(_runtime_root_path("proactive_save_sync_enabled"))
 
-    ProactiveCareSettings(
-        enabled=True,
-        screen_context_enabled=False,
-        check_interval_minutes=3,
-        cooldown_minutes=7,
-    ).save(env_path)
+    service.save_proactive_care_settings(
+        ProactiveCareSettings(
+            enabled=True,
+            screen_context_enabled=False,
+            check_interval_minutes=3,
+            cooldown_minutes=7,
+        )
+    )
 
-    text = env_path.read_text(encoding="utf-8")
-    assert "PROACTIVE_CARE_ENABLED=false" in text
-    assert f"{PROACTIVE_SCREEN_CONTEXT_ENABLED_KEY}=false" in text
+    config = load_yaml_mapping(service.system_config_path)
+    assert config["proactive_care"]["enabled"] is False
+    assert config["proactive_care"]["screen_context_enabled"] is False
 
 
 def test_proactive_care_screen_context_flag_controls_active_care() -> None:
@@ -649,16 +638,15 @@ servers:
     assert config.servers[0].enabled
 
 
-def test_mcp_runtime_settings_save_and_load_windows_enabled() -> None:
-    env_path = _runtime_root_path("mcp_runtime_save") / ".env"
+def test_settings_service_saves_and_loads_mcp_runtime_settings() -> None:
+    service = AppSettingsService(_runtime_root_path("mcp_runtime_save"))
 
-    MCPRuntimeSettings(windows_enabled=True).save(env_path)
+    service.save_mcp_runtime_settings(MCPRuntimeSettings(windows_enabled=True))
 
-    assert "WINDOWS_MCP_ENABLED=true" in env_path.read_text(encoding="utf-8")
-    assert MCPRuntimeSettings.load(env_path).windows_enabled
+    assert service.load_mcp_runtime_settings().windows_enabled
 
 
-def test_register_mcp_tools_uses_env_windows_mcp_override() -> None:
+def test_register_mcp_tools_uses_runtime_windows_mcp_override() -> None:
     root = _runtime_root_path("mcp_register_windows_override")
     config_dir = root / "data" / "config"
     config_dir.mkdir(parents=True)
@@ -674,13 +662,13 @@ servers:
 """.strip(),
         encoding="utf-8",
     )
-    (root / ".env").write_text("WINDOWS_MCP_ENABLED=true\n", encoding="utf-8")
     registry = ToolRegistry()
 
     provider = register_mcp_tools_from_config(
         root,
         registry,
         bridge_factory=_FakeMCPBridge,
+        runtime_settings=MCPRuntimeSettings(windows_enabled=True),
     )
 
     assert provider is not None
@@ -774,7 +762,7 @@ def test_mcp_high_risk_still_requires_confirmation_with_free_access() -> None:
 
 
 def test_builtin_registry_excludes_internal_browser_tools() -> None:
-    registry = create_builtin_tool_registry(Path(__file__).resolve().parents[1])
+    registry = create_builtin_tool_registry(Path(__file__).resolve().parents[2])
 
     names = {tool["name"] for tool in registry.describe_tools()}
 
@@ -790,7 +778,7 @@ def test_builtin_registry_excludes_internal_browser_tools() -> None:
 
 
 def test_open_url_stays_confirmation_required() -> None:
-    registry = create_builtin_tool_registry(Path(__file__).resolve().parents[1])
+    registry = create_builtin_tool_registry(Path(__file__).resolve().parents[2])
     registry.set_free_access_enabled(False)
 
     result = registry.prepare_or_execute("open_url", {"url": "https://example.com"})
@@ -896,7 +884,7 @@ def test_agent_runtime_can_continue_tool_loop_after_tool_results() -> None:
 
         def chat(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             self.final_chat_called = True
-            from app.chat_reply import parse_chat_reply
+            from app.llm.chat_reply import parse_chat_reply
 
             return parse_chat_reply(
                 '{"segments":[{"ja":"fallback","zh":"fallback","tone":"中性"}]}'
@@ -955,7 +943,7 @@ def test_agent_runtime_stops_tool_loop_at_turn_limit() -> None:
 
         def chat(self, _system_prompt, messages, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             self.chat_messages = messages
-            from app.chat_reply import parse_chat_reply
+            from app.llm.chat_reply import parse_chat_reply
 
             return parse_chat_reply(
                 '{"segments":[{"ja":"上限で止めたよ。","zh":"已经按上限停止了。","tone":"中性"}]}'
@@ -1127,7 +1115,7 @@ def test_browser_navigate_auto_snapshots_and_fast_forwards_lookup_reply() -> Non
         def chat(self, _system_prompt, messages, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             self.chat_called = True
             self.chat_messages = messages
-            from app.chat_reply import parse_chat_reply
+            from app.llm.chat_reply import parse_chat_reply
 
             return parse_chat_reply(
                 '{"segments":[{"ja":"確認できたよ。","zh":"已经确认页面内容了。","tone":"中性"}]}'
@@ -1298,7 +1286,7 @@ def test_browser_interaction_request_auto_snapshots_without_fast_forward() -> No
 
         def chat(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             self.chat_called = True
-            from app.chat_reply import parse_chat_reply
+            from app.llm.chat_reply import parse_chat_reply
 
             return parse_chat_reply(
                 '{"segments":[{"ja":"fallback","zh":"fallback","tone":"中性"}]}'
@@ -1358,7 +1346,7 @@ def test_browser_lookup_does_not_fast_forward_when_auto_snapshot_has_no_content(
 
         def chat(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             self.chat_called = True
-            from app.chat_reply import parse_chat_reply
+            from app.llm.chat_reply import parse_chat_reply
 
             return parse_chat_reply(
                 '{"segments":[{"ja":"fallback","zh":"fallback","tone":"中性"}]}'
@@ -1415,7 +1403,7 @@ def test_browser_lookup_does_not_fast_forward_on_search_results_page() -> None:
 
         def chat(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             self.chat_called = True
-            from app.chat_reply import parse_chat_reply
+            from app.llm.chat_reply import parse_chat_reply
 
             return parse_chat_reply(
                 '{"segments":[{"ja":"fallback","zh":"fallback","tone":"中性"}]}'
@@ -1970,7 +1958,7 @@ def test_hidden_screen_observation_call_returns_failure_without_action() -> None
             )
 
         def chat(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
-            from app.chat_reply import parse_chat_reply
+            from app.llm.chat_reply import parse_chat_reply
 
             return parse_chat_reply(
                 '{"segments":[{"ja":"今は見えないよ。","zh":"现在看不到哦。","tone":"中性"}]}'
@@ -2372,7 +2360,7 @@ def _runtime_json_path(name: str) -> Path:
 
 
 def _runtime_root_path(name: str) -> Path:
-    return Path(__file__).resolve().parents[1] / "__pycache__" / "test_runtime" / name / uuid.uuid4().hex
+    return Path(__file__).resolve().parents[2] / "__pycache__" / "test_runtime" / name / uuid.uuid4().hex
 
 
 def _write_mcp_config(root: Path, server_body: str) -> Path:

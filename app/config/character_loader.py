@@ -5,11 +5,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.env_config import load_env_file, save_env_values
-from app.prompt_templates import with_desktop_pet_context
+from app.llm.prompt_templates import with_desktop_pet_context
 
 
-CURRENT_CHARACTER_KEY = "CURRENT_CHARACTER_ID"
 DEFAULT_CHARACTER_ID = "sakura"
 DEFAULT_TONES = ["开心", "中性", "温柔", "甜蜜", "害羞"]
 FALLBACK_SYSTEM_PROMPT = """你是夜乃桜，一个冷静、克制、可靠的桌宠陪伴人格。
@@ -74,24 +72,6 @@ class CharacterRegistry:
         if profile is None:
             raise CharacterConfigError(f"未找到角色包：{character_id}")
         return profile
-
-    def current_id(self, env_path: Path) -> str:
-        values = load_env_file(env_path)
-        character_id = values.get(CURRENT_CHARACTER_KEY, DEFAULT_CHARACTER_ID).strip()
-        if character_id in self.profiles:
-            return character_id
-        if DEFAULT_CHARACTER_ID in self.profiles:
-            return DEFAULT_CHARACTER_ID
-        if self.profiles:
-            return next(iter(self.profiles))
-        raise CharacterConfigError("未找到任何角色包。")
-
-    def current(self, env_path: Path) -> CharacterProfile:
-        return self.get(self.current_id(env_path))
-
-    def save_current_id(self, env_path: Path, character_id: str) -> None:
-        self.get(character_id)
-        save_env_values(env_path, {CURRENT_CHARACTER_KEY: character_id})
 
     def _load_profiles(self) -> dict[str, CharacterProfile]:
         if not self.characters_dir.exists():

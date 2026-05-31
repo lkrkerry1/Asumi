@@ -6,11 +6,11 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal, Slot
 
 from app.agent import AgentEvent, AgentProgress, AgentResult, AgentRuntime, PendingToolAction
-from app.debug_log import debug_log, summarize_messages
-from app.visual_observation import (
+from app.core.chat_pipeline import ChatPipeline
+from app.debug_log import debug_log
+from app.storage.visual_observation import (
     VisualObservationJob,
     VisualObservationStore,
-    summarize_visual_observation,
 )
 
 
@@ -35,32 +35,26 @@ class ChatWorker(QObject):
         self.cancelled_action = cancelled_action
         self.visual_observation_store = visual_observation_store
         self.visual_observation_jobs = visual_observation_jobs or []
+        self.pipeline = ChatPipeline(
+            agent_runtime,
+            visual_observation_store=visual_observation_store,
+        )
 
     @Slot()
     def run(self) -> None:
         started_at = time.perf_counter()
         try:
             if self.confirmed_action is not None:
-                debug_log("ChatWorker", "开始处理已确认动作", self.confirmed_action.to_dict())
-                result: AgentResult = self.agent_runtime.handle_confirmed_action(
+                result: AgentResult = self.pipeline.run_confirmed_action(
                     self.confirmed_action,
                     progress_callback=self._emit_progress,
                 )
             elif self.cancelled_action is not None:
-                debug_log("ChatWorker", "开始处理已取消动作", self.cancelled_action.to_dict())
-                result = self.agent_runtime.handle_cancelled_action(self.cancelled_action)
+                result = self.pipeline.run_cancelled_action(self.cancelled_action)
             else:
-                self._record_visual_observations()
-                debug_log(
-                    "ChatWorker",
-                    "开始处理用户消息",
-                    {
-                        "message_count": len(self.messages),
-                        "messages": summarize_messages(self.messages),
-                    },
-                )
-                result = self.agent_runtime.handle_user_message(
+                result = self.pipeline.run_user_message(
                     self.messages,
+                    visual_observation_jobs=self.visual_observation_jobs,
                     progress_callback=self._emit_progress,
                 )
         except Exception as exc:  # UI 边界统一转成可读错误。
@@ -97,24 +91,6 @@ class ChatWorker(QObject):
         )
         self.progress.emit(progress)
 
-    def _record_visual_observations(self) -> None:
-        if self.visual_observation_store is None or not self.visual_observation_jobs:
-            return
-        for job in self.visual_observation_jobs:
-            record = summarize_visual_observation(self.agent_runtime.api_client, job)
-            self.visual_observation_store.append(record)
-            debug_log(
-                "ChatWorker",
-                "视觉观察记录已保存",
-                {
-                    "visual_id": record.id,
-                    "source": record.source,
-                    "summary": record.summary,
-                    "visible_text_count": len(record.visible_texts),
-                    "sensitive_redacted": record.sensitive_redacted,
-                },
-            )
-
 
 class EventWorker(QObject):
     finished = Signal(object)
@@ -133,17 +109,13 @@ class EventWorker(QObject):
     def run(self) -> None:
         started_at = time.perf_counter()
         try:
-            self._record_visual_observations()
-            debug_log(
-                "EventWorker",
-                "开始处理主动事件",
-                {
-                    "type": self.agent_event.type,
-                    "payload": self.agent_event.payload,
-                },
+            pipeline = ChatPipeline(
+                self.agent_runtime,
+                visual_observation_store=self.visual_observation_store,
             )
-            result = self.agent_runtime.handle_event(
+            result = pipeline.run_event(
                 self.agent_event,
+                visual_observation_jobs=self.visual_observation_jobs,
                 progress_callback=self._emit_progress,
             )
         except Exception as exc:  # 主动事件同样在 UI 边界转成可读错误。
@@ -178,21 +150,3 @@ class EventWorker(QObject):
             },
         )
         self.progress.emit(progress)
-
-    def _record_visual_observations(self) -> None:
-        if self.visual_observation_store is None or not self.visual_observation_jobs:
-            return
-        for job in self.visual_observation_jobs:
-            record = summarize_visual_observation(self.agent_runtime.api_client, job)
-            self.visual_observation_store.append(record)
-            debug_log(
-                "EventWorker",
-                "视觉观察记录已保存",
-                {
-                    "visual_id": record.id,
-                    "source": record.source,
-                    "summary": record.summary,
-                    "visible_text_count": len(record.visible_texts),
-                    "sensitive_redacted": record.sensitive_redacted,
-                },
-            )

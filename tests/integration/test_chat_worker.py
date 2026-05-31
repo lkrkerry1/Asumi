@@ -47,7 +47,7 @@ def test_chat_worker_forwards_progress_signal() -> None:
     QApplication = qtwidgets.QApplication
 
     from app.agent import AgentProgress, AgentResult
-    from app.chat_reply import parse_chat_reply
+    from app.llm.chat_reply import parse_chat_reply
     from app.chat_worker import ChatWorker
 
     class Runtime:
@@ -90,10 +90,10 @@ def test_chat_worker_records_visual_observation_before_reply() -> None:
     QApplication = qtwidgets.QApplication
 
     from app.agent import AgentResult
-    from app.chat_reply import parse_chat_reply
+    from app.llm.chat_reply import parse_chat_reply
     from app.chat_worker import ChatWorker
     from app.screen_observation import ScreenObservation
-    from app.visual_observation import VisualObservationJob, VisualObservationStore
+    from app.storage.visual_observation import VisualObservationJob, VisualObservationStore
 
     class Client:
         def complete_raw(self, _system_prompt, _messages, **_kwargs):  # type: ignore[no-untyped-def]
@@ -166,7 +166,7 @@ def test_event_worker_forwards_progress_signal() -> None:
     QApplication = qtwidgets.QApplication
 
     from app.agent import AgentEvent, AgentProgress, AgentResult
-    from app.chat_reply import parse_chat_reply
+    from app.llm.chat_reply import parse_chat_reply
     from app.chat_worker import EventWorker
 
     class Runtime:

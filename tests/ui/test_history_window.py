@@ -65,8 +65,13 @@ if importlib.util.find_spec("PySide6") is None:
     sys.modules["PySide6.QtCore"] = qtcore_module
     sys.modules["PySide6.QtWidgets"] = qtwidgets_module
 
-from app.chat_history import ChatHistoryEntry
-from app.history_window import _entry_view_model
+from app.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
+from app.screen_observation import (
+    MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER,
+    SCREEN_OBSERVATION_HISTORY_MARKER,
+)
+from app.storage.chat_history import ChatHistoryEntry
+from app.ui.history_window import _entry_view_model
 
 if _STUBBED_PYSIDE:
     sys.modules.pop("PySide6.QtWidgets", None)
@@ -106,6 +111,36 @@ def test_entry_view_model_keeps_plain_text_content() -> None:
     view = _entry_view_model(_entry("user", "<script>x</script> & one\ntwo"), "ja", "桜")
 
     assert view.content == "<script>x</script> & one\ntwo"
+
+
+def test_entry_view_model_humanizes_screen_observation_markers() -> None:
+    manual_view = _entry_view_model(
+        _entry(
+            "user",
+            f"你了解这个游戏吗\n{MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER[:-1]}，视觉记录 visual_id=vis_test]",
+        ),
+        "ja",
+        "桜",
+    )
+    autonomous_view = _entry_view_model(
+        _entry(
+            "system",
+            f"{SCREEN_OBSERVATION_HISTORY_MARKER[:-1]}，视觉记录 visual_id=vis_auto]",
+        ),
+        "ja",
+        "桜",
+    )
+    proactive_view = _entry_view_model(
+        _entry("system", PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER),
+        "ja",
+        "桜",
+    )
+
+    assert manual_view.content == "你了解这个游戏吗\n（已附上你框选的画面）"
+    assert autonomous_view.content == "（已看过当前屏幕）"
+    assert proactive_view.content == "刚才留意了一下屏幕状态。"
+    assert "visual_id" not in manual_view.content
+    assert "visual_id" not in autonomous_view.content
 
 
 def test_entry_view_model_uses_translation_only_for_chinese_assistant_subtitles() -> None:

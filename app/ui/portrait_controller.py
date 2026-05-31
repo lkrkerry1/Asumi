@@ -16,8 +16,8 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QLabel, QMessageBox, QWidget
 
-from app.character_loader import CharacterProfile
-from app.chat_reply import ChatSegment
+from app.config.character_loader import CharacterProfile
+from app.llm.chat_reply import ChatSegment
 from app.portrait_utils import should_crossfade_portrait
 
 

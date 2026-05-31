@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import socket
 import tempfile
@@ -16,10 +15,9 @@ from urllib.parse import urlencode, urlparse, urlunparse
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 
-from app.character_loader import CharacterProfile
-from app.chat_reply import DEFAULT_TONE
+from app.config.character_loader import CharacterProfile
+from app.llm.chat_reply import DEFAULT_TONE
 from app.debug_log import debug_log
-from app.env_config import load_env_file, save_env_values
 
 
 TTSCallback = Callable[[], None]
@@ -158,94 +156,6 @@ class GPTSoVITSTTSSettings:
     tone_references: dict[str, list[ToneReference]] = field(default_factory=dict)
 
     @classmethod
-    def load(
-        cls,
-        env_path: Path,
-        base_dir: Path,
-        validate_enabled: bool = True,
-        character_profile: CharacterProfile | None = None,
-    ) -> "GPTSoVITSTTSSettings":
-        values = load_env_file(env_path)
-        enabled = _is_enabled(_get_env_value(values, "TTS_ENABLED", "false"))
-
-        timeout_text = _get_env_value(values, "GPT_SOVITS_TIMEOUT_SECONDS", "60")
-        try:
-            timeout_seconds = int(timeout_text)
-        except ValueError:
-            timeout_seconds = 60
-
-        if character_profile is not None:
-            ref_lang_default = (
-                character_profile.voice.ref_lang
-                if character_profile.voice is not None
-                else "ja"
-            )
-            default_text_lang = character_profile.voice.text_lang if character_profile.voice is not None else "ja"
-            return cls.from_character_profile(
-                character_profile=character_profile,
-                enabled=enabled,
-                api_url=_get_env_value(
-                    values,
-                    "GPT_SOVITS_API_URL",
-                    "http://127.0.0.1:9880/tts",
-                ).strip(),
-                ref_lang=_get_env_value(
-                    values,
-                    "GPT_SOVITS_REF_LANG",
-                    ref_lang_default,
-                ).strip(),
-                text_lang=_get_env_value(
-                    values,
-                    "GPT_SOVITS_TEXT_LANG",
-                    default_text_lang,
-                ).strip(),
-                timeout_seconds=timeout_seconds,
-                validate_enabled=validate_enabled,
-            )
-
-        ref_audio_text = _get_env_value(
-            values,
-            "GPT_SOVITS_REF_AUDIO_PATH",
-            str(base_dir / "ref" / "VO01_2210.ogg"),
-        )
-        ref_text_path_text = _get_env_value(
-            values,
-            "GPT_SOVITS_REF_TEXT_PATH",
-            str(base_dir / "ref" / "text.txt"),
-        )
-        ref_text = _get_env_value(values, "GPT_SOVITS_REF_TEXT", "")
-        tone_ref_path_text = _get_env_value(
-            values,
-            "GPT_SOVITS_TONE_REF_PATH",
-            str(base_dir / "ref" / "ref.txt"),
-        )
-
-        ref_audio_path = _resolve_path(ref_audio_text, base_dir)
-        ref_text_path = _resolve_path(ref_text_path_text, base_dir)
-        tone_ref_path = _resolve_path(tone_ref_path_text, base_dir)
-        if not ref_text and ref_text_path.exists():
-            ref_text = ref_text_path.read_text(encoding="utf-8").strip()
-
-        settings = cls(
-            enabled=enabled,
-            api_url=_get_env_value(
-                values,
-                "GPT_SOVITS_API_URL",
-                "http://127.0.0.1:9880/tts",
-            ).strip(),
-            ref_audio_path=ref_audio_path,
-            ref_text_path=ref_text_path,
-            ref_text=ref_text.strip(),
-            ref_lang=_get_env_value(values, "GPT_SOVITS_REF_LANG", "ja").strip(),
-            text_lang=_get_env_value(values, "GPT_SOVITS_TEXT_LANG", "ja").strip(),
-            timeout_seconds=timeout_seconds,
-            tone_references=_load_tone_references(tone_ref_path, base_dir),
-        )
-        if settings.enabled and validate_enabled:
-            settings.validate()
-        return settings
-
-    @classmethod
     def from_character_profile(
         cls,
         character_profile: CharacterProfile,
@@ -319,21 +229,6 @@ class GPTSoVITSTTSSettings:
             raise TTSConfigError("缺少 GPT_SOVITS_REF_LANG。")
         if not self.text_lang:
             raise TTSConfigError("缺少 GPT_SOVITS_TEXT_LANG。")
-
-    def save(self, env_path: Path, base_dir: Path) -> None:
-        """将 GPT-SoVITS 基础配置写入 .env。"""
-        _ = base_dir
-        save_env_values(
-            env_path,
-            {
-                "TTS_ENABLED": "true" if self.enabled else "false",
-                "GPT_SOVITS_API_URL": self.api_url.strip(),
-                "GPT_SOVITS_REF_LANG": self.ref_lang.strip(),
-                "GPT_SOVITS_TEXT_LANG": self.text_lang.strip(),
-                "GPT_SOVITS_TIMEOUT_SECONDS": str(self.timeout_seconds),
-            },
-        )
-
 
 class GPTSoVITSTTSProvider(QObject):
     _audio_ready = Signal(str, object, object)
@@ -982,41 +877,6 @@ class GPTSoVITSTTSProvider(QObject):
                 self._schedule_audio_cleanup(audio_path, attempt + 1)
                 return
             self._log_error(f"临时音频清理失败：{exc}")
-
-
-def create_tts_provider(base_dir: Path, character_profile: CharacterProfile | None = None) -> TTSProvider:
-    """按当前 .env 创建 TTS provider，配置无效时自动降级为静音实现。"""
-    try:
-        settings = GPTSoVITSTTSSettings.load(
-            base_dir / ".env",
-            base_dir,
-            character_profile=character_profile,
-        )
-        if settings.enabled:
-            debug_log(
-                "TTS",
-                "创建 GPT-SoVITS Provider",
-                {
-                    "api_url": settings.api_url,
-                    "timeout_seconds": settings.timeout_seconds,
-                    "ref_audio_path": settings.ref_audio_path,
-                    "tone_reference_groups": len(settings.tone_references),
-                },
-            )
-            return GPTSoVITSTTSProvider(settings)
-    except TTSConfigError as exc:
-        print(f"[TTS] 配置无效，已禁用 TTS：{exc}")
-        debug_log("TTS", "配置无效，已禁用 TTS", {"error": str(exc)})
-    debug_log("TTS", "创建静音 Provider")
-    return NullTTSProvider()
-
-
-def _get_env_value(values: dict[str, str], key: str, default: str) -> str:
-    return os.getenv(key) or values.get(key) or default
-
-
-def _is_enabled(value: str) -> bool:
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _resolve_path(path_text: str, base_dir: Path) -> Path:

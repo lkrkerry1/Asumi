@@ -8,13 +8,13 @@ import uuid
 import pytest
 
 from app.agent.mcp import MCPRuntimeSettings
-from app.api_client import ApiSettings
-from app.chat_reply import ChatSegment
+from app.llm.api_client import ApiSettings
+from app.llm.chat_reply import ChatSegment
 from app.portrait_utils import portrait_kind_key, should_crossfade_portrait
 from app.proactive_care import ProactiveCareSettings
 from app.screen_observation import ScreenObservation
-from app.tts import GPTSoVITSTTSSettings
-from app.visual_observation import VisualObservationRecord, VisualObservationStore
+from app.voice.tts import GPTSoVITSTTSSettings
+from app.storage.visual_observation import VisualObservationRecord, VisualObservationStore
 
 
 def test_portrait_kind_key_uses_filename_suffix_group() -> None:
@@ -54,7 +54,7 @@ def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
     if not hasattr(qtwidgets, "QApplication") or not hasattr(qtwidgets, "QWidget"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
-    from app.pet_window import PetWindow, SUBTITLE_LANGUAGE_ZH
+    from app.ui.pet_window import PetWindow, SUBTITLE_LANGUAGE_ZH
 
     QApplication = qtwidgets.QApplication
     QWidget = qtwidgets.QWidget
@@ -91,7 +91,7 @@ def test_reply_history_controls_use_capsule_sizing() -> None:
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QToolButton")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
-    from app.pet_window import (
+    from app.ui.pet_window import (
         REPLY_HISTORY_BUTTON_SIZE,
         REPLY_HISTORY_NEXT_SYMBOL,
         REPLY_HISTORY_PANEL_HEIGHT,
@@ -144,7 +144,7 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
-    from app.settings_dialog import SettingsDialog
+    from app.ui.settings_dialog import SettingsDialog
 
     QApplication = qtwidgets.QApplication
     app = QApplication.instance() or QApplication([])
@@ -190,7 +190,7 @@ def test_settings_dialog_exposes_windows_mcp_restart_setting() -> None:
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
-    from app.settings_dialog import SettingsDialog
+    from app.ui.settings_dialog import SettingsDialog
 
     QApplication = qtwidgets.QApplication
     app = QApplication.instance() or QApplication([])
@@ -220,7 +220,7 @@ def test_settings_dialog_exposes_windows_mcp_restart_setting() -> None:
 
 
 def test_proactive_care_batches_screenshots_until_cooldown(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.pet_window as pet_window_module
+    import app.ui.pet_window as pet_window_module
 
     current_time = {"value": 0.0}
     captures: list[str] = []
@@ -291,7 +291,7 @@ def test_proactive_care_capture_interval_allows_timer_jitter() -> None:
 
 
 def test_proactive_care_keeps_recent_screenshot_batch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.pet_window as pet_window_module
+    import app.ui.pet_window as pet_window_module
 
     captures = []
     window = _build_minimal_proactive_window(
@@ -329,7 +329,7 @@ def test_proactive_care_keeps_recent_screenshot_batch(monkeypatch) -> None:  # t
 
 
 def test_proactive_care_uses_configured_screenshot_batch_limit(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.pet_window as pet_window_module
+    import app.ui.pet_window as pet_window_module
 
     captures = []
     window = _build_minimal_proactive_window(
@@ -365,7 +365,7 @@ def test_proactive_care_uses_configured_screenshot_batch_limit(monkeypatch) -> N
 
 
 def test_proactive_care_disabled_does_not_capture_or_send(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.pet_window as pet_window_module
+    import app.ui.pet_window as pet_window_module
 
     current_time = {"value": 600.0}
     events = []
@@ -389,7 +389,7 @@ def test_proactive_care_disabled_does_not_capture_or_send(monkeypatch) -> None: 
 
 
 def test_user_activity_keeps_pending_proactive_screenshot_batch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.pet_window as pet_window_module
+    import app.ui.pet_window as pet_window_module
 
     window = _build_minimal_proactive_window(
         screen_context_enabled=True,
@@ -412,7 +412,7 @@ def test_user_activity_keeps_pending_proactive_screenshot_batch(monkeypatch) -> 
 
 
 def test_send_message_clears_pending_proactive_screenshot_batch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.pet_window as pet_window_module
+    import app.ui.pet_window as pet_window_module
 
     window = _build_minimal_manual_screenshot_window("发送这条")
     minimal_window, requests, _history = window
@@ -541,7 +541,7 @@ def test_manual_screenshot_text_input_records_marker_without_image_data() -> Non
 
 
 def test_visual_context_is_injected_for_screenshot_followup() -> None:
-    from app.pet_window import _add_visual_context_to_messages
+    from app.ui.pet_window import _add_visual_context_to_messages
 
     path = Path("data") / f"test_visual_context_{uuid.uuid4().hex}.jsonl"
     try:
@@ -580,7 +580,7 @@ def test_visual_context_is_injected_for_screenshot_followup() -> None:
 
 
 def test_set_busy_disables_manual_screenshot_button() -> None:
-    from app.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow
 
     class MinimalBusyWindow:
         _set_busy = PetWindow._set_busy
@@ -602,8 +602,8 @@ def test_set_busy_disables_manual_screenshot_button() -> None:
 
 def test_progress_reply_displays_and_records_assistant_message() -> None:
     from app.agent import AgentProgress
-    from app.chat_reply import parse_chat_reply
-    from app.pet_window import PetWindow
+    from app.llm.chat_reply import parse_chat_reply
+    from app.ui.pet_window import PetWindow
 
     class MinimalProgressWindow:
         _handle_progress_reply = PetWindow._handle_progress_reply
@@ -634,8 +634,8 @@ def test_progress_reply_displays_and_records_assistant_message() -> None:
 
 def test_progress_reply_records_segments_as_separate_history_entries() -> None:
     from app.agent import AgentProgress
-    from app.chat_reply import parse_chat_reply
-    from app.pet_window import PetWindow
+    from app.llm.chat_reply import parse_chat_reply
+    from app.ui.pet_window import PetWindow
 
     class MinimalProgressWindow:
         _handle_progress_reply = PetWindow._handle_progress_reply
@@ -669,8 +669,8 @@ def test_progress_reply_records_segments_as_separate_history_entries() -> None:
 
 
 def test_assistant_reply_history_records_tone_and_portrait() -> None:
-    from app.chat_reply import ChatReply
-    from app.pet_window import PetWindow
+    from app.llm.chat_reply import ChatReply
+    from app.ui.pet_window import PetWindow
 
     class MinimalHistoryWindow:
         _record_assistant_reply_history = PetWindow._record_assistant_reply_history
@@ -696,10 +696,10 @@ def test_assistant_reply_history_records_tone_and_portrait() -> None:
 
 
 def test_chat_history_store_round_trips_tone_and_portrait() -> None:
-    from app.chat_history import ChatHistoryStore
+    from app.storage.chat_history import ChatHistoryStore
 
     history_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[2]
         / "__pycache__"
         / "test_runtime"
         / "chat_history_segments"
@@ -719,10 +719,10 @@ def test_chat_history_store_round_trips_tone_and_portrait() -> None:
 
 
 def test_chat_history_store_loads_legacy_entries_without_tone_or_portrait() -> None:
-    from app.chat_history import ChatHistoryStore
+    from app.storage.chat_history import ChatHistoryStore
 
     history_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[2]
         / "__pycache__"
         / "test_runtime"
         / "chat_history_legacy"
@@ -746,8 +746,8 @@ def test_chat_history_store_loads_legacy_entries_without_tone_or_portrait() -> N
 
 
 def test_reply_history_segments_load_from_persisted_history_entries() -> None:
-    from app.chat_history import ChatHistoryEntry
-    from app.pet_window import _reply_history_segments_from_entries
+    from app.storage.chat_history import ChatHistoryEntry
+    from app.ui.pet_window import _reply_history_segments_from_entries
 
     segments = _reply_history_segments_from_entries(
         [
@@ -776,8 +776,8 @@ def test_reply_history_segments_load_from_persisted_history_entries() -> None:
 
 
 def test_reply_history_reload_uses_history_store_entries() -> None:
-    from app.chat_history import ChatHistoryEntry
-    from app.pet_window import PetWindow
+    from app.storage.chat_history import ChatHistoryEntry
+    from app.ui.pet_window import PetWindow
 
     class FakeHistoryStore:
         def load(self):  # type: ignore[no-untyped-def]
@@ -819,7 +819,7 @@ def test_reply_history_reload_uses_history_store_entries() -> None:
 
 
 def test_reply_history_buttons_review_segments_without_tts_or_history() -> None:
-    from app.pet_window import PetWindow, SUBTITLE_LANGUAGE_ZH
+    from app.ui.pet_window import PetWindow, SUBTITLE_LANGUAGE_ZH
 
     class DummyPortraitController:
         def __init__(self) -> None:
@@ -877,7 +877,7 @@ def test_reply_history_buttons_review_segments_without_tts_or_history() -> None:
 
 
 def test_reply_history_buttons_disable_while_busy_or_playing() -> None:
-    from app.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow
 
     class MinimalReplyHistoryWindow:
         _normalized_reply_history_index = PetWindow._normalized_reply_history_index
@@ -909,16 +909,16 @@ def test_reply_history_buttons_disable_while_busy_or_playing() -> None:
 
 
 def test_reply_history_review_text_refreshes_when_subtitle_language_changes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.pet_window as pet_window_module
-    from app.pet_window import PetWindow, SUBTITLE_LANGUAGE_ZH
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow, SUBTITLE_LANGUAGE_ZH
 
     class MinimalReplyHistoryWindow:
         _toggle_chinese_subtitles = PetWindow._toggle_chinese_subtitles
+        _save_system_config_values = PetWindow._save_system_config_values
         _refresh_reply_history_review_text = PetWindow._refresh_reply_history_review_text
         _normalized_reply_history_index = PetWindow._normalized_reply_history_index
 
     window = MinimalReplyHistoryWindow()
-    window.env_path = Path(".env")
     window.subtitle_language = "ja"
     window.subtitle_controller = _DummySubtitleController()
     window.history_window = None
@@ -926,7 +926,13 @@ def test_reply_history_review_text_refreshes_when_subtitle_language_changes(monk
     window.reply_history_index = 0
     window.reply_history_segments = [ChatSegment("原文", "中性", "译文")]
     window._apply_speech_font = lambda: None
-    monkeypatch.setattr(pet_window_module, "save_env_values", lambda *_args, **_kwargs: None)
+
+    class SettingsServiceStub:
+        def save_system_values(self, section, values):  # type: ignore[no-untyped-def]
+            assert section == "ui"
+            assert values == {"subtitle_language": SUBTITLE_LANGUAGE_ZH}
+
+    window.settings_service = SettingsServiceStub()
 
     window._toggle_chinese_subtitles(True)
 
@@ -938,9 +944,9 @@ def test_reply_history_review_text_refreshes_when_subtitle_language_changes(monk
 
 def test_screen_observation_followup_uses_last_user_message_after_progress(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from app.agent import AgentAction, AgentResult
-    from app.chat_reply import parse_chat_reply
-    import app.pet_window as pet_window_module
-    from app.pet_window import PetWindow
+    from app.llm.chat_reply import parse_chat_reply
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
 
     class MinimalScreenFollowupWindow:
         _queue_screen_observation_followup = PetWindow._queue_screen_observation_followup
@@ -986,9 +992,9 @@ def test_screen_observation_followup_uses_last_user_message_after_progress(monke
 
 def test_screen_observation_followup_keeps_large_image_after_progress(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from app.agent import AgentAction, AgentResult
-    from app.chat_reply import parse_chat_reply
-    import app.pet_window as pet_window_module
-    from app.pet_window import PetWindow
+    from app.llm.chat_reply import parse_chat_reply
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
 
     class MinimalScreenFollowupWindow:
         _queue_screen_observation_followup = PetWindow._queue_screen_observation_followup
@@ -1030,7 +1036,7 @@ def test_screen_observation_followup_keeps_large_image_after_progress(monkeypatc
 
 
 def _build_minimal_manual_screenshot_window(text: str):
-    from app.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow
 
     class MinimalManualScreenshotWindow:
         send_message = PetWindow.send_message
@@ -1079,7 +1085,7 @@ def _build_minimal_proactive_window(
     events=None,  # type: ignore[no-untyped-def]
     history=None,  # type: ignore[no-untyped-def]
 ):
-    from app.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow
 
     class MinimalProactiveWindow:
         _can_run_proactive_care = PetWindow._can_run_proactive_care

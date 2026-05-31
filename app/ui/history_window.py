@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Callable
 
@@ -16,7 +17,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.chat_history import ChatHistoryEntry, ChatHistoryStore
+from app.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
+from app.screen_observation import (
+    MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER,
+    SCREEN_OBSERVATION_HISTORY_MARKER,
+)
+from app.storage.chat_history import ChatHistoryEntry, ChatHistoryStore
+
+
+_VISUAL_ID_SUFFIX_RE = re.compile(r"，视觉记录\s+visual_id=[^\]\s]+")
+_HISTORY_MARKER_DISPLAY_TEXT = {
+    MANUAL_SCREEN_OBSERVATION_HISTORY_MARKER: "（已附上你框选的画面）",
+    SCREEN_OBSERVATION_HISTORY_MARKER: "（已看过当前屏幕）",
+    PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER: "刚才留意了一下屏幕状态。",
+}
 
 
 @dataclass(frozen=True)
@@ -386,7 +400,7 @@ def _entry_view_model(
         align=align,
         bubble_object_name=bubble_object_name,
         meta_text=f"{role_name} · {time_text}",
-        content=entry.display_content(subtitle_language),
+        content=_humanize_history_content(entry.display_content(subtitle_language)),
     )
 
 
@@ -414,6 +428,23 @@ def _content_object_name(bubble_object_name: str) -> str:
     if bubble_object_name == "systemBubble":
         return "systemText"
     return "entryText"
+
+
+def _humanize_history_content(content: str) -> str:
+    """把内部屏幕记录标记转换成适合历史窗口展示的提示。"""
+
+    lines = content.splitlines()
+    if not lines:
+        return content
+    return "\n".join(_humanize_history_line(line) for line in lines)
+
+
+def _humanize_history_line(line: str) -> str:
+    stripped = line.strip()
+    normalized = _VISUAL_ID_SUFFIX_RE.sub("", stripped)
+    if normalized in _HISTORY_MARKER_DISPLAY_TEXT:
+        return _HISTORY_MARKER_DISPLAY_TEXT[normalized]
+    return line
 
 
 def _format_time(created_at: str) -> str:

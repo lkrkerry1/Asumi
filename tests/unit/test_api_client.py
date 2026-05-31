@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.api_client import (
+from app.llm.api_client import (
     ApiSettings,
     OpenAICompatibleClient,
     _build_segmented_reply_instruction,
     _build_chat_completion_payload,
     _filter_supported_chat_params,
 )
-from app.chat_reply import parse_chat_reply
+from app.llm.chat_reply import parse_chat_reply
 
 
 def test_chat_param_filter_keeps_supported_values() -> None:

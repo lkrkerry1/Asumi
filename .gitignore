@@ -26,5 +26,8 @@ data/memory_curation_state.json
 data/reminders.json
 data/visual_observations/
 data/notes/
+data/config/api.yaml
+data/config/characters.yaml
+data/config/system_config.yaml
 task.md
 log.txt

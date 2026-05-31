@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from app.config.yaml_config import load_yaml_mapping
 
 
 DEBUG_KEY = "SAKURA_DEBUG"
@@ -184,28 +185,21 @@ def _looks_like_image_data_url(text: str) -> bool:
 
 
 def _read_bool(key: str, default: bool) -> bool:
-    value = os.getenv(key)
-    if value is None:
-        value = _load_env_values().get(key)
+    debug_values = _load_debug_values()
+    alias = "enabled" if key == DEBUG_KEY else "body_enabled"
+    value = debug_values.get(alias, debug_values.get(key))
     if value is None:
         return default
-    return value.strip().lower() in _TRUE_VALUES
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in _TRUE_VALUES
 
 
-def _load_env_values() -> dict[str, str]:
-    env_path = Path(__file__).resolve().parents[1] / ".env"
-    if not env_path.exists():
-        return {}
-
-    values: dict[str, str] = {}
+def _load_debug_values() -> dict[str, Any]:
+    config_path = Path(__file__).resolve().parents[1] / "data" / "config" / "system_config.yaml"
     try:
-        lines = env_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        system_config = load_yaml_mapping(config_path)
+    except (OSError, ValueError):
         return {}
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
-    return values
+    debug_config = system_config.get("debug")
+    return dict(debug_config) if isinstance(debug_config, dict) else {}

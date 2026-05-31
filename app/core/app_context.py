@@ -6,12 +6,14 @@ from pathlib import Path
 from app.agent import AgentRuntime, MemoryStore, ReminderStore, ToolRegistry
 from app.agent.mcp import MCPRuntimeSettings, MCPToolProvider
 from app.agent.memory_curator import MemoryCurator, MemoryCurationSettings, MemoryCurationState
-from app.api_client import ApiSettings, OpenAICompatibleClient
-from app.character_loader import CharacterProfile, CharacterRegistry
-from app.chat_history import ChatHistoryStore
+from app.config.settings_service import AppSettingsService, DebugLogSettings
+from app.llm.api_client import ApiSettings, OpenAICompatibleClient
+from app.config.character_loader import CharacterProfile, CharacterRegistry
+from app.storage.chat_history import ChatHistoryStore
+from app.core.extensions import ExtensionRegistry
 from app.proactive_care import ProactiveCareSettings
-from app.tts import TTSProvider
-from app.visual_observation import VisualObservationStore
+from app.voice.tts import TTSProvider
+from app.storage.visual_observation import VisualObservationStore
 
 
 @dataclass(frozen=True)
@@ -37,8 +39,11 @@ class StorageServices:
 class FeatureServices:
     """可选功能和后台维护服务。"""
 
+    settings_service: AppSettingsService
+    extension_registry: ExtensionRegistry
     mcp_tool_provider: MCPToolProvider | None
     mcp_settings: MCPRuntimeSettings
+    debug_log_settings: DebugLogSettings
     memory_curation_settings: MemoryCurationSettings
     memory_curation_state: MemoryCurationState
     memory_curator: MemoryCurator
@@ -50,7 +55,7 @@ class AppContext:
     """应用启动阶段组装出的核心依赖。"""
 
     base_dir: Path
-    env_path: Path
+    settings_service: AppSettingsService
     settings: ApiSettings
     character_registry: CharacterRegistry
     character_profile: CharacterProfile
@@ -89,12 +94,20 @@ class AppContext:
         return self.storage.visual_observation_store
 
     @property
+    def extension_registry(self) -> ExtensionRegistry:
+        return self.features.extension_registry
+
+    @property
     def mcp_tool_provider(self) -> MCPToolProvider | None:
         return self.features.mcp_tool_provider
 
     @property
     def mcp_settings(self) -> MCPRuntimeSettings:
         return self.features.mcp_settings
+
+    @property
+    def debug_log_settings(self) -> DebugLogSettings:
+        return self.features.debug_log_settings
 
     @property
     def memory_curation_settings(self) -> MemoryCurationSettings:

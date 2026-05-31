@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 import uuid
 
-from app.chat_reply import ChatReply
+from app.llm.chat_reply import ChatReply
 
 
 @dataclass(frozen=True)

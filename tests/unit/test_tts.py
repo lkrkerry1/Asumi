@@ -69,7 +69,7 @@ if importlib.util.find_spec("PySide6") is None:
     sys.modules["PySide6.QtCore"] = qtcore_module
     sys.modules["PySide6.QtMultimedia"] = qtmultimedia_module
 
-from app.tts import GPTSoVITSTTSProvider, GPTSoVITSTTSSettings, _load_tone_references, _resolve_request_text_lang
+from app.voice.tts import GPTSoVITSTTSProvider, GPTSoVITSTTSSettings, _load_tone_references, _resolve_request_text_lang
 from app.voice import VoicePlaybackController
 
 
@@ -118,7 +118,7 @@ def test_tts_service_probe_reports_unavailable_service(monkeypatch) -> None:  # 
     def fake_create_connection(*_args: object, **_kwargs: object) -> object:
         raise OSError("connection refused")
 
-    monkeypatch.setattr("app.tts.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("app.voice.tts.socket.create_connection", fake_create_connection)
 
     assert not GPTSoVITSTTSProvider._ensure_service_available(provider, messages.append)
     assert "服务不可用" in messages[0]
@@ -146,8 +146,8 @@ def test_tts_service_probe_uses_tcp_connection_without_get(monkeypatch) -> None:
     def fail_urlopen(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("服务探测不应请求 /tts")
 
-    monkeypatch.setattr("app.tts.socket.create_connection", fake_create_connection)
-    monkeypatch.setattr("app.tts.urllib.request.urlopen", fail_urlopen)
+    monkeypatch.setattr("app.voice.tts.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("app.voice.tts.urllib.request.urlopen", fail_urlopen)
 
     assert GPTSoVITSTTSProvider._ensure_service_available(provider, messages.append)
     assert messages == []
@@ -162,7 +162,7 @@ def test_tts_weight_switch_error_includes_endpoint_and_path(monkeypatch) -> None
     def fake_urlopen(*_args: object, **_kwargs: object) -> object:
         raise urllib.error.URLError("bad weights")
 
-    monkeypatch.setattr("app.tts.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("app.voice.tts.urllib.request.urlopen", fake_urlopen)
 
     ok = GPTSoVITSTTSProvider._request_weight_switch(
         provider,
@@ -178,7 +178,7 @@ def test_tts_weight_switch_error_includes_endpoint_and_path(monkeypatch) -> None
 
 
 def test_voice_playback_controller_falls_back_to_subtitle_callbacks_on_tts_error() -> None:
-    from app.chat_reply import ChatSegment
+    from app.llm.chat_reply import ChatSegment
 
     class FailingTTS:
         def speak(self, *_args: object, **_kwargs: object) -> None:
@@ -198,7 +198,7 @@ def test_voice_playback_controller_falls_back_to_subtitle_callbacks_on_tts_error
 
 
 def test_voice_playback_controller_ignores_prepare_error() -> None:
-    from app.chat_reply import ChatSegment
+    from app.llm.chat_reply import ChatSegment
 
     class FailingPrepareTTS:
         def prepare(self, *_args: object, **_kwargs: object) -> object:

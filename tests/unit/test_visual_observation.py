@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 
 from app.screen_observation import ScreenObservation
-from app.visual_observation import (
+from app.storage.visual_observation import (
     VisualObservationJob,
     VisualObservationRecord,
     VisualObservationStore,

@@ -13,7 +13,7 @@ from app.agent.memory_curator import (
     MemoryCurator,
     _entries_for_model,
 )
-from app.chat_history import ChatHistoryEntry
+from app.storage.chat_history import ChatHistoryEntry
 
 
 def test_memory_curator_merges_duplicate_created_memories() -> None:
@@ -115,7 +115,7 @@ def _entry(role: str, content: str) -> ChatHistoryEntry:
 
 def _runtime_json_path(name: str) -> Path:
     return (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[2]
         / "__pycache__"
         / "test_runtime"
         / name

@@ -135,10 +135,11 @@ def register_mcp_tools_from_config(
     base_dir: Path,
     registry: ToolRegistry,
     bridge_factory: BridgeFactory | None = None,
+    runtime_settings: MCPRuntimeSettings | None = None,
 ) -> MCPToolProvider | None:
     try:
         config = load_mcp_config(base_dir / "data" / "config" / "mcp.yaml")
-        mcp_settings = MCPRuntimeSettings.load(base_dir / ".env")
+        mcp_settings = runtime_settings or MCPRuntimeSettings()
     except Exception as exc:
         print(f"[MCP] 配置读取失败，已跳过 MCP：{exc}")
         debug_log("MCP", "配置读取失败，已跳过 MCP", {"error": str(exc)})

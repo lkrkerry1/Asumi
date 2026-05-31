@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from app.chat_reply import ChatSegment
+from app.llm.chat_reply import ChatSegment
 from app.debug_log import debug_log
-from app.tts import TTSPreparedAudio, TTSProvider
+from app.voice.tts import TTSPreparedAudio, TTSProvider
 
 
 LogStageCallback = Callable[[str, dict[str, Any] | None], None]
