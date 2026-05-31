@@ -13,18 +13,34 @@ from PySide6.QtCore import (
     QPoint,
     QPropertyAnimation,
     QRect,
+    QRectF,
     Signal,
     Qt,
     QThread,
     QTimer,
     Slot,
 )
-from PySide6.QtGui import QAction, QCursor, QFont, QFontDatabase, QIcon, QKeyEvent, QMouseEvent, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QCursor,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QKeyEvent,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFrame,
+    QGraphicsBlurEffect,
     QGraphicsOpacityEffect,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -124,6 +140,47 @@ class MemoryCurationWorker(QObject):
             self.failed.emit(str(exc))
             return
         self.finished.emit(result)
+
+
+class FrostedGlassFrame(QFrame):
+    """绘制带高斯模糊取样的半透明文本框遮罩。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._source_widgets: tuple[QWidget, ...] = ()
+        self._blur_radius = 18.0
+        self._corner_radius = 19.0
+        self._tint = QColor(255, 255, 255, 92)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+    def set_source_widgets(self, widgets: tuple[QWidget, ...]) -> None:
+        self._source_widgets = widgets
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        del event
+        source = QPixmap(self.size())
+        source.fill(Qt.GlobalColor.transparent)
+
+        source_painter = QPainter(source)
+        for widget in self._source_widgets:
+            if widget.isVisible():
+                widget_origin = self.mapFromGlobal(widget.mapToGlobal(QPoint(0, 0)))
+                widget.render(source_painter, widget_origin)
+        source_painter.end()
+
+        blurred = _blur_pixmap(source, self._blur_radius)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, self._corner_radius, self._corner_radius)
+
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, blurred)
+        painter.fillPath(path, self._tint)
+        painter.end()
 
 
 class PetWindow(QWidget):
@@ -307,35 +364,38 @@ class PetWindow(QWidget):
         bubble_layout.addWidget(self.speech_label, 1)
         self.bubble.setLayout(bubble_layout)
 
+        self.input_backdrop = FrostedGlassFrame(self)
+        self.input_backdrop.set_source_widgets((self.label, self.portrait_transition_label))
+
         self.input_bar = QFrame(self)
         self.input_bar.setObjectName("inputBar")
 
         self.input_edit = QLineEdit(self.input_bar)
         self.input_edit.setObjectName("petInput")
-        self.input_edit.setPlaceholderText(f"{character_profile.display_name}に話しかける...")
-        self.input_edit.setFixedHeight(34)
+        self.input_edit.setPlaceholderText(f"和{character_profile.display_name}说点什么...")
+        self.input_edit.setFixedHeight(38)
         self.input_edit.installEventFilter(self)
         self.input_edit.returnPressed.connect(self._handle_return_pressed)
 
         self.send_button = QPushButton("发送", self.input_bar)
         self.send_button.setObjectName("sendButton")
-        self.send_button.setFixedHeight(34)
+        self.send_button.setFixedHeight(38)
         self.send_button.clicked.connect(self._handle_send_button_clicked)
 
         self.confirm_action_button = QPushButton("执行", self.input_bar)
         self.confirm_action_button.setObjectName("confirmActionButton")
-        self.confirm_action_button.setFixedHeight(34)
+        self.confirm_action_button.setFixedHeight(38)
         self.confirm_action_button.hide()
         self.confirm_action_button.clicked.connect(self.confirm_pending_action)
 
         self.cancel_action_button = QPushButton("取消", self.input_bar)
         self.cancel_action_button.setObjectName("cancelActionButton")
-        self.cancel_action_button.setFixedHeight(34)
+        self.cancel_action_button.setFixedHeight(38)
         self.cancel_action_button.hide()
         self.cancel_action_button.clicked.connect(self.cancel_pending_action)
 
         input_layout = QHBoxLayout()
-        input_layout.setContentsMargins(0, 5, 0, 5)
+        input_layout.setContentsMargins(10, 7, 10, 7)
         input_layout.setSpacing(8)
         input_layout.addWidget(self.input_edit, 1)
         input_layout.addWidget(self.confirm_action_button)
@@ -365,15 +425,21 @@ class PetWindow(QWidget):
                 border: none;
             }
             #petInput {
+                background: rgba(255, 255, 255, 96);
+                border: 1px solid rgba(255, 255, 255, 218);
+                border-radius: 19px;
+                color: #2f2630;
+                font-size: 15px;
+                font-weight: 700;
+                padding: 3px 16px;
+                selection-background-color: rgba(74, 170, 214, 185);
+            }
+            #petInput:focus {
                 background: rgba(255, 255, 255, 132);
-                border: 1px solid rgba(255, 255, 255, 1);
-                border-radius: 17px;
-                color: #4b3440;
-                font-size: 13px;
-                padding: 2px 14px;
+                border: 1px solid rgba(74, 170, 214, 230);
             }
             #petInput:disabled {
-                color: rgba(75, 52, 64, 130);
+                color: rgba(47, 38, 48, 150);
             }
             #sendButton {
                 background: rgba(74, 170, 214, 225);
@@ -437,8 +503,10 @@ class PetWindow(QWidget):
         self._layout_stage()
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[no-untyped-def]
-        if watched is self.input_edit and event.type() == QEvent.Type.KeyPress:
-            self._log_input_key_event(event)
+        if watched is self.input_edit:
+            if event.type() == QEvent.Type.KeyPress:
+                self._log_input_key_event(event)
+            return super().eventFilter(watched, event)
         if isinstance(event, QMouseEvent):
             if event.type() == QEvent.Type.MouseButtonPress:
                 return self._handle_mouse_press(event)
@@ -564,6 +632,7 @@ class PetWindow(QWidget):
         self.portrait_transition_label.show()
         self.portrait_transition_label.raise_()
         self.bubble.raise_()
+        self.input_backdrop.raise_()
         self.input_bar.raise_()
 
         self.portrait_transition_id += 1
@@ -617,9 +686,9 @@ class PetWindow(QWidget):
         self._layout_stage()
 
     def _apply_fonts(self) -> None:
-        text_font = _rounded_japanese_font(11, QFont.Weight.Normal)
+        text_font = _rounded_chinese_font(13, QFont.Weight.Bold)
         name_font = _rounded_japanese_font(10, QFont.Weight.Bold)
-        button_font = _rounded_japanese_font(11, QFont.Weight.ExtraBold)
+        button_font = _rounded_chinese_font(11, QFont.Weight.ExtraBold)
 
         self.name_label.setFont(name_font)
         self._apply_speech_font()
@@ -647,7 +716,7 @@ class PetWindow(QWidget):
 
         bubble_width = min(640, width - 96)
         bubble_height = 128
-        input_height = 44
+        input_height = 52
         input_gap = 10
         bubble_x = (width - bubble_width) // 2
         bubble_y = height - bubble_height - input_height - input_gap - 84
@@ -656,7 +725,15 @@ class PetWindow(QWidget):
 
         input_y = bubble_y + bubble_height + input_gap
         self.input_bar.setGeometry(QRect(bubble_x, input_y, bubble_width, input_height))
+        self._update_input_backdrop_geometry()
         self.input_bar.raise_()
+
+    def _update_input_backdrop_geometry(self) -> None:
+        self.input_bar.layout().activate()
+        input_top_left = self.input_edit.mapTo(self, QPoint(0, 0))
+        self.input_backdrop.setGeometry(QRect(input_top_left, self.input_edit.size()))
+        self.input_backdrop.raise_()
+        self.input_backdrop.update()
 
     def _create_tray_icon(self) -> None:
         icon = QIcon(self.pixmap) if not self.pixmap.isNull() else QIcon()
@@ -1158,6 +1235,7 @@ class PetWindow(QWidget):
         has_action = action is not None
         self.confirm_action_button.setVisible(has_action)
         self.cancel_action_button.setVisible(has_action)
+        self._update_input_backdrop_geometry()
 
     @Slot()
     def _check_proactive_care(self) -> None:
@@ -2166,7 +2244,7 @@ class PetWindow(QWidget):
         self.agent_runtime.update_character(self.system_prompt, profile.reply_tones, profile.portrait_choices)
         self.setWindowTitle(profile.display_name)
         self.name_label.setText(profile.display_name)
-        self.input_edit.setPlaceholderText(f"{profile.display_name}に話しかける...")
+        self.input_edit.setPlaceholderText(f"和{profile.display_name}说点什么...")
         self.pixmap = self._load_portrait()
         self._apply_portrait()
         if hasattr(self, "tray_icon"):
@@ -2252,6 +2330,27 @@ def _parse_bool(value: str | None, default: bool = False) -> bool:
 
 def _format_bool(value: bool) -> str:
     return "true" if value else "false"
+
+
+def _blur_pixmap(pixmap: QPixmap, radius: float) -> QPixmap:
+    if pixmap.isNull() or radius <= 0:
+        return pixmap
+
+    scene = QGraphicsScene()
+    item = QGraphicsPixmapItem(pixmap)
+    effect = QGraphicsBlurEffect()
+    effect.setBlurRadius(radius)
+    effect.setBlurHints(QGraphicsBlurEffect.BlurHint.QualityHint)
+    item.setGraphicsEffect(effect)
+    scene.addItem(item)
+    scene.setSceneRect(QRectF(pixmap.rect()))
+
+    result = QPixmap(pixmap.size())
+    result.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(result)
+    scene.render(painter, QRectF(result.rect()), QRectF(pixmap.rect()))
+    painter.end()
+    return result
 
 
 def _rounded_japanese_font(point_size: int, weight: QFont.Weight) -> QFont:
