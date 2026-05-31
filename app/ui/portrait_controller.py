@@ -3,7 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, QObject, QParallelAnimationGroup, QPropertyAnimation, Qt
+from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QObject,
+    QParallelAnimationGroup,
+    QPauseAnimation,
+    QPropertyAnimation,
+    QSequentialAnimationGroup,
+    Qt,
+)
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QLabel, QMessageBox, QWidget
 
@@ -12,7 +21,9 @@ from app.chat_reply import ChatSegment
 from app.portrait_utils import should_crossfade_portrait
 
 
-PORTRAIT_TRANSITION_MS = 1400
+PORTRAIT_TRANSITION_MS = 300
+# 两张立绘同时叠加淡入淡出的比例：1.0 为完全同步交叉，0.0 为先淡出再淡入。
+PORTRAIT_CROSSFADE_OVERLAP = 0.8
 
 
 class PortraitController(QObject):
@@ -48,7 +59,7 @@ class PortraitController(QObject):
         self.current_path = profile.default_portrait_path
         self.pixmap_cache: dict[Path, QPixmap] = {}
         self.pixmap = self.load_portrait()
-        self.transition_animation: QParallelAnimationGroup | None = None
+        self.transition_animation: QAbstractAnimation | None = None
         self.transition_id = 0
 
     def apply_current(self) -> None:
@@ -133,22 +144,32 @@ class PortraitController(QObject):
 
         self.transition_id += 1
         transition_id = self.transition_id
+        overlap = max(0.0, min(1.0, PORTRAIT_CROSSFADE_OVERLAP))
+        fade_duration = max(1, round(PORTRAIT_TRANSITION_MS / (2.0 - overlap)))
+        overlap_duration = round(fade_duration * overlap)
+        fade_in_delay = max(0, fade_duration - overlap_duration)
+
         animation = QParallelAnimationGroup(self)
 
         fade_out = QPropertyAnimation(self.main_opacity_effect, b"opacity")
-        fade_out.setDuration(PORTRAIT_TRANSITION_MS)
+        fade_out.setDuration(fade_duration)
         fade_out.setStartValue(1.0)
         fade_out.setEndValue(0.0)
         fade_out.setEasingCurve(QEasingCurve.Type.InOutQuad)
 
         fade_in = QPropertyAnimation(self.transition_opacity_effect, b"opacity")
-        fade_in.setDuration(PORTRAIT_TRANSITION_MS)
+        fade_in.setDuration(fade_duration)
         fade_in.setStartValue(0.0)
         fade_in.setEndValue(1.0)
         fade_in.setEasingCurve(QEasingCurve.Type.InOutQuad)
 
+        fade_in_sequence = QSequentialAnimationGroup()
+        if fade_in_delay > 0:
+            fade_in_sequence.addAnimation(QPauseAnimation(fade_in_delay))
+        fade_in_sequence.addAnimation(fade_in)
+
         animation.addAnimation(fade_out)
-        animation.addAnimation(fade_in)
+        animation.addAnimation(fade_in_sequence)
         animation.finished.connect(lambda: self._finish_transition(transition_id))
         self.transition_animation = animation
         animation.start()
