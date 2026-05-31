@@ -41,6 +41,7 @@ from app.proactive_care import (
     ProactiveCareSettings,
 )
 from app.voice.tts import GPTSoVITSTTSSettings, TTSConfigError
+from sdk.types import ToolsTabContribution
 
 
 class ApiConnectionTestWorker(QObject):
@@ -76,6 +77,7 @@ class SettingsDialog(QDialog):
         mcp_settings: MCPRuntimeSettings | None = None,
         debug_log_settings: DebugLogSettings | None = None,
         memory_store: MemoryStore | None = None,
+        tools_tab_contributions: list[ToolsTabContribution] | None = None,
         parent=None,  # type: ignore[no-untyped-def]
     ) -> None:
         super().__init__(parent)
@@ -108,7 +110,13 @@ class SettingsDialog(QDialog):
             ),
             "隐私",
         )
-        tabs.addTab(self._build_mcp_tab(mcp_settings or MCPRuntimeSettings()), "工具")
+        tabs.addTab(
+            self._build_mcp_tab(
+                mcp_settings or MCPRuntimeSettings(),
+                tools_tab_contributions or [],
+            ),
+            "工具",
+        )
         tabs.addTab(self._build_system_tab(debug_log_settings or DebugLogSettings()), "系统")
         if memory_store is not None:
             tabs.addTab(self._build_memory_tab(memory_store), "记忆")
@@ -343,7 +351,11 @@ class SettingsDialog(QDialog):
         tab.setLayout(form_layout)
         return tab
 
-    def _build_mcp_tab(self, settings: MCPRuntimeSettings) -> QWidget:
+    def _build_mcp_tab(
+        self,
+        settings: MCPRuntimeSettings,
+        tools_tab_contributions: list[ToolsTabContribution],
+    ) -> QWidget:
         tab = QWidget(self)
         self.windows_mcp_enabled_check = QCheckBox("启用 Windows MCP 桌面控制（高级）", tab)
         self.windows_mcp_enabled_check.setChecked(settings.windows_enabled)
@@ -360,6 +372,13 @@ class SettingsDialog(QDialog):
         form_layout.setSpacing(12)
         form_layout.addRow("", self.windows_mcp_enabled_check)
         form_layout.addRow("生效方式", restart_hint)
+        for contribution in sorted(tools_tab_contributions, key=lambda item: item.order):
+            try:
+                widget = contribution.build(None)
+            except Exception as exc:
+                widget = QLabel(f"{contribution.title} 设置加载失败：{exc}", tab)
+                widget.setWordWrap(True)
+            form_layout.addRow(contribution.title, widget)
         tab.setLayout(form_layout)
         return tab
 

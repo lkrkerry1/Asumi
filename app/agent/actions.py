@@ -42,6 +42,7 @@ class PendingToolAction:
     arguments: dict[str, Any]
     reason: str
     created_at: str
+    tool_call_id: str = ""
     continuation_messages: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -50,6 +51,7 @@ class PendingToolAction:
         tool_name: str,
         arguments: dict[str, Any],
         reason: str = "",
+        tool_call_id: str = "",
     ) -> "PendingToolAction":
         return cls(
             id=uuid.uuid4().hex[:8],
@@ -57,6 +59,7 @@ class PendingToolAction:
             arguments=dict(arguments),
             reason=reason,
             created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            tool_call_id=tool_call_id.strip(),
         )
 
     @classmethod
@@ -66,6 +69,7 @@ class PendingToolAction:
         arguments = data.get("arguments", {})
         reason = data.get("reason", "")
         created_at = data.get("created_at")
+        tool_call_id = data.get("tool_call_id", "")
         if not isinstance(action_id, str) or not action_id.strip():
             raise ValueError("待确认动作缺少 id。")
         if not isinstance(tool_name, str) or not tool_name.strip():
@@ -76,6 +80,8 @@ class PendingToolAction:
             reason = ""
         if not isinstance(created_at, str) or not created_at.strip():
             created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        if not isinstance(tool_call_id, str):
+            tool_call_id = ""
         continuation_messages = data.get("continuation_messages", [])
         if not isinstance(continuation_messages, list):
             continuation_messages = []
@@ -85,6 +91,7 @@ class PendingToolAction:
             arguments=dict(arguments),
             reason=reason.strip(),
             created_at=created_at.strip(),
+            tool_call_id=tool_call_id.strip(),
             continuation_messages=[
                 dict(message)
                 for message in continuation_messages
@@ -103,6 +110,7 @@ class PendingToolAction:
             arguments=dict(self.arguments),
             reason=self.reason,
             created_at=self.created_at,
+            tool_call_id=self.tool_call_id,
             continuation_messages=[dict(message) for message in continuation_messages],
         )
 
@@ -113,6 +121,7 @@ class PendingToolAction:
             "arguments": self.arguments,
             "reason": self.reason,
             "created_at": self.created_at,
+            "tool_call_id": self.tool_call_id,
         }
         if include_context and self.continuation_messages:
             data["continuation_messages"] = self.continuation_messages

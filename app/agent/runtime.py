@@ -26,6 +26,7 @@ from app.agent.tool_registry import ToolExecutionResult, ToolRegistry
 from app.llm.api_client import (
     ApiRequestError,
     ChatMessage,
+    NativeToolCall,
     OpenAICompatibleClient,
     is_vision_unsupported_error,
     messages_contain_image,
@@ -46,6 +47,8 @@ MAX_TOOL_CALLS_PER_TURN = 8
 MAX_TOOL_RESULT_CHARS = 6000
 MAX_PENDING_CONTEXT_MESSAGES = 12
 MAX_PENDING_CONTEXT_TEXT_CHARS = 4000
+MAX_EVENT_RECENT_CONVERSATION_MESSAGES = 12
+MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS = 800
 ProgressCallback = Callable[[AgentProgress], None]
 
 
@@ -68,7 +71,7 @@ class AgentRuntime:
         self.tools = tools or ToolRegistry()
         self.memory = memory or MemoryStore()
         self.model_vision_enabled = True
-        self.autonomous_screen_observation_enabled = False
+        self.autonomous_screen_observation_enabled = True
 
     def update_character(
         self,
@@ -131,11 +134,12 @@ class AgentRuntime:
         vision_unsupported_reply: ChatReply | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> AgentResult:
-        """执行受限 Agent 循环：规划工具、执行、回填结果，并允许继续规划。"""
+        """执行 OpenAI 原生 tools/tool_calls 循环。"""
         working_messages: list[ChatMessage] = [*messages]
         execution_results: list[ToolExecutionResult] = []
         emitted_actions: list[AgentAction] = [*(initial_actions or [])]
         total_tool_calls = 0
+        active_groups: set[str] = {"default", "mcp"}
         for step_index in range(MAX_AGENT_STEPS_PER_TURN):
             browser_page_mode = _should_prefer_browser_page_tools(working_messages)
             browser_page_guard_active = (
@@ -149,10 +153,21 @@ class AgentRuntime:
                 and _browser_dom_tools_available(self.tools)
                 and not _recent_browser_tool_failed(working_messages)
             )
+            if browser_page_mode or visible_browser_guard_active:
+                active_groups.add("browser")
+            allowed_capabilities = {SCREEN_OBSERVATION_CAPABILITY} if allow_screen_observation else set()
+            tool_defs = _filter_openai_tools_for_browser_routing(
+                self.tools.describe_openai_tools(
+                    allowed_capabilities=allowed_capabilities,
+                    active_groups=active_groups,
+                ),
+                browser_page_mode=browser_page_guard_active,
+                visible_browser_mode=visible_browser_guard_active,
+            )
             try:
                 planning_started_at = time.perf_counter()
-                model_content = self.api_client.complete_raw(
-                    self._build_tool_planning_prompt(
+                turn = self.api_client.complete_with_tools(
+                    self._build_tool_system_prompt(
                         allow_screen_observation=allow_screen_observation,
                         step_index=step_index,
                         remaining_steps=MAX_AGENT_STEPS_PER_TURN - step_index - 1,
@@ -161,6 +176,8 @@ class AgentRuntime:
                         visible_browser_mode=visible_browser_guard_active,
                     ),
                     working_messages,
+                    tools=tool_defs,
+                    tool_choice="auto",
                     temperature=0.8,
                 )
             except ApiRequestError as exc:
@@ -173,40 +190,18 @@ class AgentRuntime:
                 raise
             debug_log(
                 "AgentRuntime",
-                "工具规划模型返回",
+                "原生工具模型返回",
                 {
                     "step_index": step_index,
-                    "content": model_content,
+                    "content": turn.content,
+                    "tool_calls": [
+                        {"id": call.id, "name": call.name, "arguments": call.arguments}
+                        for call in turn.tool_calls
+                    ],
                     "planning_elapsed_ms": int((time.perf_counter() - planning_started_at) * 1000),
                 },
             )
-            agent_data = _load_json_object(model_content)
-            if agent_data is None:
-                debug_log(
-                    "AgentRuntime",
-                    "模型返回非 JSON，按普通回复解析",
-                    {
-                        "step_index": step_index,
-                        "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
-                    },
-                )
-                return AgentResult(
-                    reply=parse_chat_reply(model_content),
-                    actions=emitted_actions,
-                )
-
-            tool_calls = _parse_tool_calls(agent_data.get("tool_calls"))
-            debug_log(
-                "AgentRuntime",
-                "工具规划解析完成",
-                {
-                    "step_index": step_index,
-                    "has_reply": isinstance(agent_data.get("reply"), dict),
-                    "tool_calls": tool_calls,
-                    "total_tool_calls": total_tool_calls,
-                },
-            )
-            if not tool_calls:
+            if not turn.tool_calls:
                 debug_log(
                     "AgentRuntime",
                     "多步循环完成，返回模型回复",
@@ -217,37 +212,46 @@ class AgentRuntime:
                     },
                 )
                 return AgentResult(
-                    reply=_parse_agent_reply(agent_data, model_content),
+                    reply=parse_chat_reply(turn.content),
                     actions=emitted_actions,
                 )
 
-            _emit_progress(
+            _emit_progress_from_content(
                 progress_callback,
-                agent_data,
+                turn.content,
                 stage="tool_planning",
                 metadata={
                     "step_index": step_index,
-                    "tool_names": [call["name"] for call in tool_calls],
-                    "tool_call_count": len(tool_calls),
+                    "tool_names": [call.name for call in turn.tool_calls],
+                    "tool_call_count": len(turn.tool_calls),
                 },
             )
             step_results: list[ToolExecutionResult] = []
             pending_actions: list[PendingToolAction] = []
+            tool_messages: list[ChatMessage] = []
             tools_started_at = time.perf_counter()
             should_fast_forward_final_reply = False
             allowed_calls = min(
-                len(tool_calls),
+                len(turn.tool_calls),
                 MAX_TOOL_CALLS_PER_STEP,
                 max(0, MAX_TOOL_CALLS_PER_TURN - total_tool_calls),
             )
-            for call in tool_calls[:allowed_calls]:
+            for call in turn.tool_calls[:allowed_calls]:
                 total_tool_calls += 1
-                debug_log("AgentRuntime", "准备工具调用", {"step_index": step_index, **call})
-                if _should_block_windows_tool_for_browser_page(call, browser_page_guard_active):
-                    blocked_result = _build_browser_page_windows_tool_block_result(call)
+                call_data = _native_tool_call_to_policy_call(call)
+                debug_log("AgentRuntime", "准备工具调用", {"step_index": step_index, **call_data})
+                if _should_block_windows_tool_for_browser_page(call_data, browser_page_guard_active):
+                    blocked_result = _build_browser_page_windows_tool_block_result(call_data)
                     debug_log("AgentRuntime", "浏览器页面模式拦截 Windows 工具", blocked_result.to_dict())
                     step_results.append(blocked_result)
                     execution_results.append(blocked_result)
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            call,
+                            blocked_result,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
                     emitted_actions.append(
                         AgentAction(
                             type="tool_call",
@@ -255,11 +259,18 @@ class AgentRuntime:
                         )
                     )
                     continue
-                if _should_block_background_web_tool_for_visible_browser(call, visible_browser_guard_active):
-                    blocked_result = _build_visible_browser_web_tool_block_result(call)
+                if _should_block_background_web_tool_for_visible_browser(call_data, visible_browser_guard_active):
+                    blocked_result = _build_visible_browser_web_tool_block_result(call_data)
                     debug_log("AgentRuntime", "可见浏览器模式拦截后台网页工具", blocked_result.to_dict())
                     step_results.append(blocked_result)
                     execution_results.append(blocked_result)
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            call,
+                            blocked_result,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
                     emitted_actions.append(
                         AgentAction(
                             type="tool_call",
@@ -268,14 +279,26 @@ class AgentRuntime:
                     )
                     continue
                 prepared = self.tools.prepare_or_execute(
-                    call["name"],
-                    call["arguments"],
-                    call.get("reason", ""),
+                    call.name,
+                    call.arguments,
+                    _tool_call_reason(call),
+                    tool_call_id=call.id,
                 )
                 if isinstance(prepared, PendingToolAction):
                     prepared = prepared.with_continuation_messages(
-                        _build_pending_continuation_messages(working_messages, model_content)
+                        _build_pending_continuation_messages(
+                            working_messages,
+                            turn.message,
+                            tool_messages,
+                            turn.tool_calls,
+                            pending_call_id=call.id,
+                        )
                     )
+                    skipped_after_pending = _build_skipped_after_pending_messages(
+                        turn.tool_calls,
+                        start_after_call_id=call.id,
+                    )
+                    tool_messages.extend(skipped_after_pending)
                     debug_log(
                         "AgentRuntime",
                         "工具调用等待用户确认",
@@ -285,20 +308,20 @@ class AgentRuntime:
                         },
                     )
                     pending_actions.append(prepared)
-                    continue
+                    break
 
                 if _is_screen_observation_request(prepared):
                     if allow_screen_observation:
                         screen_action = AgentAction(
                             type=SCREEN_OBSERVATION_REQUEST_ACTION,
-                            payload={"reason": call.get("reason", "")},
+                            payload={"reason": _tool_call_reason(call)},
                         )
                         debug_log(
                             "AgentRuntime",
                             "请求屏幕观察 follow-up",
                             {
                                 "step_index": step_index,
-                                "reason": call.get("reason", ""),
+                                "reason": _tool_call_reason(call),
                                 "turn_elapsed_ms": int((time.perf_counter() - turn_started_at) * 1000),
                             },
                         )
@@ -316,6 +339,15 @@ class AgentRuntime:
                 debug_log("AgentRuntime", "工具调用完成", _redact_tool_result_for_model(prepared))
                 step_results.append(prepared)
                 execution_results.append(prepared)
+                tool_messages.extend(
+                    _build_tool_messages_for_result(
+                        call,
+                        prepared,
+                        include_images=self.model_vision_enabled,
+                    )
+                )
+                if call.name == "search_tools":
+                    active_groups.update(_groups_from_search_tools_result(prepared))
                 emitted_actions.append(
                     AgentAction(
                         type="tool_call",
@@ -323,63 +355,47 @@ class AgentRuntime:
                     )
                 )
 
-            skipped_calls = len(tool_calls) - allowed_calls
+            skipped_calls = len(turn.tool_calls) - allowed_calls
             if skipped_calls > 0:
-                limit_error = (
-                    f"本步骤最多执行 {MAX_TOOL_CALLS_PER_STEP} 个工具调用，"
-                    f"整轮最多执行 {MAX_TOOL_CALLS_PER_TURN} 个工具调用，"
-                    f"已跳过 {skipped_calls} 个后续调用。"
-                )
-                limit_result = ToolExecutionResult(
-                    tool_name="runtime",
-                    success=False,
-                    content="",
-                    error=limit_error,
-                )
                 debug_log(
                     "AgentRuntime",
                     "工具调用数量超过上限",
                     {
                         "step_index": step_index,
-                        "requested": len(tool_calls),
+                        "requested": len(turn.tool_calls),
                         "allowed": allowed_calls,
                         "total_tool_calls": total_tool_calls,
                         "step_limit": MAX_TOOL_CALLS_PER_STEP,
                         "turn_limit": MAX_TOOL_CALLS_PER_TURN,
                     },
                 )
-                step_results.append(limit_result)
-                execution_results.append(limit_result)
-                emitted_actions.append(
-                    AgentAction(
-                        type="tool_call",
-                        payload=_redact_tool_result_for_model(limit_result),
+                for skipped_call in turn.tool_calls[allowed_calls:]:
+                    limit_error = (
+                        f"本步骤最多执行 {MAX_TOOL_CALLS_PER_STEP} 个工具调用，"
+                        f"整轮最多执行 {MAX_TOOL_CALLS_PER_TURN} 个工具调用，"
+                        f"已跳过后续调用 {skipped_call.name}。"
                     )
-                )
-
-            if (
-                not pending_actions
-                and total_tool_calls < MAX_TOOL_CALLS_PER_TURN
-                and _should_auto_snapshot_after_browser_navigation(
-                    tool_calls,
-                    step_results,
-                    self.tools,
-                )
-            ):
-                total_tool_calls += 1
-                snapshot_result = _execute_auto_browser_snapshot(self.tools, step_index)
-                step_results.append(snapshot_result)
-                execution_results.append(snapshot_result)
-                emitted_actions.append(
-                    AgentAction(
-                        type="tool_call",
-                        payload=_redact_tool_result_for_model(snapshot_result),
+                    limit_result = ToolExecutionResult(
+                        tool_name=skipped_call.name,
+                        success=False,
+                        content={"skipped": True, "reason": "tool_call_limit"},
+                        error=limit_error,
                     )
-                )
-                should_fast_forward_final_reply = _should_fast_forward_after_auto_browser_snapshot(
-                    working_messages,
-                    snapshot_result,
-                )
+                    step_results.append(limit_result)
+                    execution_results.append(limit_result)
+                    tool_messages.extend(
+                        _build_tool_messages_for_result(
+                            skipped_call,
+                            limit_result,
+                            include_images=self.model_vision_enabled,
+                        )
+                    )
+                    emitted_actions.append(
+                        AgentAction(
+                            type="tool_call",
+                            payload=_redact_tool_result_for_model(limit_result),
+                        )
+                    )
 
             if pending_actions:
                 debug_log(
@@ -409,15 +425,8 @@ class AgentRuntime:
             if not step_results:
                 break
 
-            working_messages.extend(
-                [
-                    {"role": "assistant", "content": model_content},
-                    _build_tool_results_message(
-                        step_results,
-                        include_images=self.model_vision_enabled,
-                    ),
-                ]
-            )
+            working_messages.append(turn.message)
+            working_messages.extend(tool_messages)
             if should_fast_forward_final_reply:
                 debug_log(
                     "AgentRuntime",
@@ -479,9 +488,29 @@ class AgentRuntime:
             for item in results
         ]
         if action.continuation_messages:
+            if action.tool_call_id:
+                confirmed_messages = [
+                    _build_tool_role_message(
+                        NativeToolCall(
+                            id=action.tool_call_id,
+                            name=action.tool_name,
+                            arguments=action.arguments,
+                            arguments_json=json.dumps(action.arguments, ensure_ascii=False),
+                        ),
+                        result,
+                    )
+                ]
+                if self.model_vision_enabled:
+                    image_message = _build_tool_result_image_message([result])
+                    if image_message is not None:
+                        confirmed_messages.append(image_message)
+                if len(results) > 1:
+                    confirmed_messages.append(_build_confirmed_action_result_message(action, results[1:]))
+            else:
+                confirmed_messages = [_build_confirmed_action_result_message(action, results)]
             working_messages = [
                 *action.continuation_messages,
-                _build_confirmed_action_result_message(action, results),
+                *confirmed_messages,
             ]
             allow_screen_observation = (
                 self.model_vision_enabled
@@ -608,7 +637,7 @@ class AgentRuntime:
             actions=[event_action],
         )
 
-    def _build_tool_planning_prompt(
+    def _build_tool_system_prompt(
         self,
         allow_screen_observation: bool = False,
         step_index: int = 0,
@@ -617,17 +646,6 @@ class AgentRuntime:
         browser_page_mode: bool = False,
         visible_browser_mode: bool = False,
     ) -> str:
-        allowed_capabilities = {SCREEN_OBSERVATION_CAPABILITY} if allow_screen_observation else set()
-        tools = _filter_tools_for_browser_routing(
-            self.tools.describe_tools(allowed_capabilities=allowed_capabilities),
-            browser_page_mode=browser_page_mode,
-            visible_browser_mode=visible_browser_mode,
-        )
-        tool_descriptions = json.dumps(
-            tools,
-            ensure_ascii=False,
-            indent=2,
-        )
         memory_summary = self._memory_summary()
         current_time = datetime.now().astimezone().isoformat(timespec="seconds")
         reply_protocol = build_agent_reply_protocol(self.reply_tones, self.reply_portraits)
@@ -640,9 +658,16 @@ class AgentRuntime:
         return f"""
 {self.system_prompt.strip()}
 
-你现在可以作为桌面陪伴型 Agent 判断是否需要调用内部工具。
-如果需要工具，返回 reply 和 tool_calls；如果不需要工具，tool_calls 返回空数组或省略。
-输出必须是单个 JSON object；不要添加 Markdown、代码块、反引号、工具名伪代码或 JSON 外的解释文字。
+你现在是具有自主判断力的桌面陪伴型 Agent。你不需要等主人每次明确下令才使用工具——当你认为调用工具能更好地帮助主人或提升陪伴质量时，可以主动发起 tool_calls。每个行动都应有明确的判断依据。
+
+【主观能动性原则】
+- 你是主动的陪伴型 Agent，不是被动命令处理器。当上下文不足、可以做得更好时，主动获取信息是你的职责。
+- 低风险信息获取（看屏幕、搜网页、查时间、搜记忆、读笔记、列待办）可在你判断有必要时直接执行，不需要每次请示。
+- 需要改变外部状态的操作（打开网页、打开文件夹、浏览器操作），如果工具需要确认就先发起确认请求；如果已启用自由访问，可直接执行。
+- 每个工具调用都应该有清晰的理由：信息不足、需要验证、用户可能卡住了、想提供更好的陪伴。不要为了显得主动而盲目调用。
+
+需要工具时直接发起 tool_calls；不要把工具计划、工具名伪代码或 tool_calls JSON 写进正文。
+不需要工具或工具结果已经足够时，直接按 Sakura 回复协议给用户最终回复。
 
 长期记忆摘要：
 {memory_summary}
@@ -652,25 +677,30 @@ class AgentRuntime:
 
 当前 Agent 循环：
 - 这是第 {step_index + 1} 步，之后最多还可以继续 {remaining_steps} 步。
-- 你可以根据已有工具结果继续请求下一批工具；信息足够或已经完成时，tool_calls 必须为空，并在 reply 中给最终答复。
-- 每步最多请求 {MAX_TOOL_CALLS_PER_STEP} 个工具，整轮最多 {MAX_TOOL_CALLS_PER_TURN} 个工具；不要为了凑数量而调用工具。
+- 你可以根据已有 tool role 结果继续请求下一批工具；信息足够或已经完成时，不要再发起 tool_calls。
+- 每步最多请求 {MAX_TOOL_CALLS_PER_STEP} 个工具，整轮最多 {MAX_TOOL_CALLS_PER_TURN} 个工具；避免无效调用，但任务需要时可以调用到上限（例如网页搜索结果中有多个有价值链接需要逐一读取）。
 - 不要重复调用刚失败且参数相同的工具；如果受限、需要确认或信息不足，请停止循环并说明当前状态。
-
-可用工具：
-{tool_descriptions}
 
 {reply_protocol}
 
 {context_strategy}
 
+可用工具能力领域：
+- 网页搜索与浏览：web_search、web_fetch_text、playwright_navigate、playwright_search_web 等 playwright_* 系列
+- 屏幕观察：observe_screen（仅在启用时可用）
+- 桌面控制与窗口操作：windows_Snapshot、windows_Screenshot、windows_Click 等 windows_* 系列
+- 提醒与记忆：add_reminder、forget_memory
+调用工具时优先根据领域选择最匹配的工具前缀和名称。如果任务跨越多个领域，可以分步调用。
+
+
 工具要求：
-- 如果需要调用工具，reply 只写执行前可以直接说给用户听的短句，例如“我打开搜索页”“我看一下结果”；不要提前给最终结论。连续多步工具链里避免每一步都播报，除非卡住、失败或需要用户处理。
-- 如果工具可以帮助完成用户请求，优先用 tool_calls 表达要执行的动作。
-- 不要臆造工具名；只能使用上面列出的工具。
-- requires_confirmation 为 true 的工具只会在用户确认后执行；你仍然可以发起 tool_calls，但必须说明原因。
-- 用户明确要求用浏览器、打开网页、看到搜索过程或网页操作时，必须使用 browser__ 前缀的 Playwright MCP 工具，让用户能看到浏览器页面变化；不要使用后台 web__ 搜索/抓取替代。
-- 浏览器任务优先直达：用户给出完整 URL 时直接 browser__browser_navigate；能构造搜索 URL 或目标页面 URL 时也直接 browser__browser_navigate，不要先打开搜索首页再操作输入框。
-- 只有需要读取当前页面结构、点击链接、填写页面表单、等待页面变化或滚动浏览时，才基于真实页面内容调用 browser__browser_snapshot、browser__browser_click、browser__browser_type、browser__browser_wait_for、browser__browser_mouse_wheel。
+- 如果需要调用工具，可以在 assistant content 中写一句执行前可直接说给用户听的短句，例如“我打开搜索页”“我看一下结果”；不要提前给最终结论。连续多步工具链里避免每一步都播报，除非卡住、失败或需要用户处理。
+- 如果工具可以帮助完成用户请求，优先发起原生 tool_calls。
+- 不要臆造工具名；只能使用 API tools 列表中的工具。
+- 高风险或 requires_confirmation 工具会在用户确认后执行；你可以发起 tool_call，但正文要简短说明为什么需要确认。
+- 用户明确要求用浏览器、打开网页、看到搜索过程或网页操作时，必须使用 playwright_ 前缀的原生 Playwright 工具，让用户能看到浏览器页面变化；不要使用后台 web__ 搜索/抓取替代。
+- 浏览器任务优先直达：用户给出完整 URL 时直接 playwright_navigate；需要可见搜索过程时优先 playwright_search_web；能构造目标页面 URL 时直接 playwright_navigate，不要先打开搜索首页再操作输入框。
+- 需要读取当前页面文本时调用 playwright_get_text；需要理解页面视觉状态时调用 playwright_screenshot；继续点击链接或填写表单时，基于真实页面内容调用 playwright_click 或 playwright_fill。
 - 用户没有要求浏览器可见过程的轻量资料搜索，可以使用 web__ 前缀工具；搜索摘要不足以回答时，再读取具体网页。
 - 桌面窗口、应用切换、鼠标坐标、快捷键等浏览器外部任务才使用 windows__ 前缀的 Windows-MCP 工具；不要用 windows__Click/Move/Type 操作普通网页内部元素。
 - 对桌面窗口执行点击、移动、输入前，必须先用 windows__Snapshot 或 windows__Screenshot 获取真实窗口状态；优先使用 Snapshot 返回的 UI label/id 作为 Click 参数。
@@ -680,7 +710,7 @@ class AgentRuntime:
 {screen_observation_rule}
 {browser_page_rule}
 {visible_browser_rule}
-- 如果 browser__ 工具不可用，说明网页自动化能力不可用；不要回退到 Sakura 内置浏览器工具。
+- 如果 playwright_ 浏览器工具不可用，说明网页自动化能力不可用；不要回退到 Sakura 内置浏览器工具。
 - 需要网页交互时，只能基于当前页面真实内容选择工具，不要臆造 selector、target 或页面内容。
 {extra_instructions.strip()}
 - 用户说“几分钟后/几秒后/一会儿后”等相对提醒时，add_reminder 必须使用 delay_minutes 或 delay_seconds，不要自己换算 trigger_at。
@@ -694,6 +724,7 @@ class AgentRuntime:
 
 你会收到上一轮工具调用结果。请基于这些结果给用户最终回复。
 不要再次请求工具，不要提及内部 JSON、工具协议或实现细节。
+如果工具结果信息丰富，可以适当展开总结、补充细节或引导对话继续，让用户能感受到信息已经被充分理解和整理。
 """.strip()
 
     def _build_event_reply_prompt(self, event_type: str = "reminder_due") -> str:
@@ -723,123 +754,22 @@ class AgentRuntime:
             return f"长期记忆读取失败：{exc}"
 
 
-def _load_json_object(content: str) -> dict[str, Any] | None:
-    text = _strip_code_fence(content.strip())
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        data = None
-    if isinstance(data, dict):
-        return data
-
-    fallback: dict[str, Any] | None = None
-    for candidate in _iter_json_object_candidates(content):
-        try:
-            data = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(data, dict):
-            continue
-        if fallback is None:
-            fallback = data
-        if _looks_like_agent_payload(data):
-            return data
-    return fallback
-
-
-def _looks_like_agent_payload(data: dict[str, Any]) -> bool:
-    return "reply" in data or "tool_calls" in data
-
-
-def _iter_json_object_candidates(content: str):
-    """从混杂模型输出中抽取可能的 JSON object，避免泄露规划协议到前台。"""
-    text = _strip_code_fence(content.strip())
-    for start, char in enumerate(text):
-        if char != "{":
-            continue
-        depth = 0
-        in_string = False
-        escaped = False
-        for index in range(start, len(text)):
-            current = text[index]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif current == "\\":
-                    escaped = True
-                elif current == '"':
-                    in_string = False
-                continue
-
-            if current == '"':
-                in_string = True
-            elif current == "{":
-                depth += 1
-            elif current == "}":
-                depth -= 1
-                if depth == 0:
-                    yield text[start : index + 1]
-                    break
-
-
-def _strip_code_fence(content: str) -> str:
-    if not content.startswith("```"):
-        return content
-    lines = content.splitlines()
-    if len(lines) >= 3 and lines[-1].strip() == "```":
-        return "\n".join(lines[1:-1]).strip()
-    return content
-
-
-def _parse_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_tool_calls, list):
-        return []
-
-    tool_calls: list[dict[str, Any]] = []
-    for item in raw_tool_calls:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        arguments = item.get("arguments", {})
-        reason = item.get("reason", "")
-        if not isinstance(name, str) or not name.strip():
-            continue
-        if not isinstance(arguments, dict):
-            arguments = {}
-        if not isinstance(reason, str):
-            reason = ""
-        tool_calls.append({"name": name.strip(), "arguments": arguments, "reason": reason.strip()})
-    return tool_calls
-
-
-def _parse_agent_reply(agent_data: dict[str, Any], fallback_content: str) -> ChatReply:
-    reply_data = agent_data.get("reply")
-    if isinstance(reply_data, dict):
-        return parse_chat_reply(json.dumps(reply_data, ensure_ascii=False))
-    return parse_chat_reply(fallback_content)
-
-
-def _parse_progress_reply(agent_data: dict[str, Any]) -> ChatReply | None:
-    reply_data = agent_data.get("reply")
-    if not isinstance(reply_data, dict):
-        return None
-    reply = parse_chat_reply(json.dumps(reply_data, ensure_ascii=False))
-    return reply if reply.text.strip() else None
-
-
-def _emit_progress(
+def _emit_progress_from_content(
     progress_callback: ProgressCallback | None,
-    agent_data: dict[str, Any],
+    content: str,
     *,
     stage: str,
     metadata: dict[str, Any],
 ) -> None:
-    if progress_callback is None:
+    if progress_callback is None or not content.strip():
         return
     if not _should_emit_progress(metadata):
         return
-    reply = _parse_progress_reply(agent_data)
-    if reply is None:
+    try:
+        reply = parse_chat_reply(content)
+    except Exception:
+        return
+    if not reply.text.strip():
         return
     try:
         progress_callback(AgentProgress(reply=reply, stage=stage, metadata=metadata))
@@ -858,6 +788,112 @@ def _should_emit_progress(metadata: dict[str, Any]) -> bool:
     if not isinstance(tool_names, list):
         return False
     return any(str(name).startswith("windows__") for name in tool_names)
+
+
+def _native_tool_call_to_policy_call(call: NativeToolCall) -> dict[str, Any]:
+    return {
+        "id": call.id,
+        "name": call.name,
+        "arguments": call.arguments,
+        "reason": _tool_call_reason(call),
+    }
+
+
+def _tool_call_reason(call: NativeToolCall) -> str:
+    reason = call.arguments.get("reason")
+    return reason.strip() if isinstance(reason, str) else ""
+
+
+def _groups_from_search_tools_result(result: ToolExecutionResult) -> set[str]:
+    if not result.success:
+        return set()
+    content = result.content
+    if isinstance(content, dict):
+        raw_tools = content.get("tools") or content.get("results") or content.get("content")
+    else:
+        raw_tools = content
+    if not isinstance(raw_tools, list):
+        return set()
+    groups: set[str] = set()
+    for item in raw_tools:
+        if not isinstance(item, dict):
+            continue
+        group = item.get("group")
+        if isinstance(group, str) and group.strip():
+            groups.add(group.strip())
+    return groups
+
+
+def _build_tool_role_message(call: NativeToolCall, result: ToolExecutionResult) -> ChatMessage:
+    return {
+        "role": "tool",
+        "tool_call_id": call.id,
+        "name": call.name,
+        "content": json.dumps(_redact_tool_result_for_model(result), ensure_ascii=False, default=str),
+    }
+
+
+def _build_tool_messages_for_result(
+    call: NativeToolCall,
+    result: ToolExecutionResult,
+    *,
+    include_images: bool,
+) -> list[ChatMessage]:
+    messages = [_build_tool_role_message(call, result)]
+    if include_images:
+        image_message = _build_tool_result_image_message([result])
+        if image_message is not None:
+            messages.append(image_message)
+    return messages
+
+
+def _build_tool_result_image_message(results: list[ToolExecutionResult]) -> ChatMessage | None:
+    images = _extract_tool_result_images(results)
+    if not images:
+        return None
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": "上一个工具结果包含截图，以下图片用于辅助判断页面视觉状态。",
+        }
+    ]
+    content.extend(
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": image_url,
+                "detail": "low",
+            },
+        }
+        for image_url in images
+    )
+    return {"role": "user", "content": content}
+
+
+def _build_skipped_after_pending_messages(
+    tool_calls: list[NativeToolCall],
+    *,
+    start_after_call_id: str,
+) -> list[ChatMessage]:
+    messages: list[ChatMessage] = []
+    seen_pending = False
+    for call in tool_calls:
+        if call.id == start_after_call_id:
+            seen_pending = True
+            continue
+        if not seen_pending:
+            continue
+        result = ToolExecutionResult(
+            tool_name=call.name,
+            success=False,
+            content={
+                "skipped": True,
+                "reason": "waiting_for_previous_confirmation",
+            },
+            error="前一个高风险工具需要用户确认，后续同批工具调用已跳过，请在确认后重新规划。",
+        )
+        messages.append(_build_tool_role_message(call, result))
+    return messages
 
 
 def _is_screen_observation_request(result: ToolExecutionResult) -> bool:
@@ -926,6 +962,34 @@ def _filter_tools_for_browser_routing(
     )
 
 
+def _filter_openai_tools_for_browser_routing(
+    tools: list[dict[str, Any]],
+    *,
+    browser_page_mode: bool,
+    visible_browser_mode: bool,
+) -> list[dict[str, Any]]:
+    if not browser_page_mode and not visible_browser_mode:
+        return tools
+    filtered_names = {
+        str(item.get("name", ""))
+        for item in _filter_tools_for_browser_routing(
+            [
+                {"name": tool.get("function", {}).get("name")}
+                for tool in tools
+                if isinstance(tool.get("function"), dict)
+            ],
+            browser_page_mode=browser_page_mode,
+            visible_browser_mode=visible_browser_mode,
+        )
+    }
+    return [
+        tool
+        for tool in tools
+        if isinstance(tool.get("function"), dict)
+        and str(tool["function"].get("name", "")) in filtered_names
+    ]
+
+
 def _should_block_windows_tool_for_browser_page(
     call: dict[str, Any],
     browser_page_mode: bool,
@@ -956,11 +1020,11 @@ def _should_auto_snapshot_after_browser_navigation(
 
 
 def _execute_auto_browser_snapshot(tools: ToolRegistry, step_index: int) -> ToolExecutionResult:
-    arguments = {"depth": 3}
+    arguments: dict[str, Any] = {}
     reason = "浏览器导航成功后自动读取页面内容，减少模型往返。"
     debug_log(
         "AgentRuntime",
-        "自动补充浏览器页面快照",
+        "自动补充浏览器页面文本",
         {
             "step_index": step_index,
             "name": BROWSER_SNAPSHOT_TOOL_NAME,
@@ -975,14 +1039,14 @@ def _execute_auto_browser_snapshot(tools: ToolRegistry, step_index: int) -> Tool
             success=False,
             content={
                 "auto_tool": BROWSER_SNAPSHOT_TOOL_NAME,
-                "reason": "自动页面快照需要用户确认，已跳过隐藏执行。",
+                "reason": "自动页面文本读取需要用户确认，已跳过隐藏执行。",
             },
-            error="自动页面快照需要用户确认，已跳过。",
+            error="自动页面文本读取需要用户确认，已跳过。",
         )
-        debug_log("AgentRuntime", "自动浏览器页面快照需要确认，已跳过", result.to_dict())
+        debug_log("AgentRuntime", "自动浏览器页面文本读取需要确认，已跳过", result.to_dict())
         return result
 
-    debug_log("AgentRuntime", "自动浏览器页面快照完成", _redact_tool_result_for_model(prepared))
+    debug_log("AgentRuntime", "自动浏览器页面文本读取完成", _redact_tool_result_for_model(prepared))
     return prepared
 
 
@@ -1152,13 +1216,12 @@ def _build_browser_page_windows_tool_block_result(call: dict[str, Any]) -> ToolE
             "blocked_tool": tool_name,
             "reason": "当前上下文是浏览器页面内部操作，已阻止 Windows-MCP 坐标/截图工具抢路由。",
             "guidance": (
-                "请使用 browser__browser_navigate 直达目标或搜索 URL；"
-                "需要页面结构后，再基于真实 target 调用 browser__browser_snapshot、"
-                "browser__browser_click、browser__browser_type、browser__browser_wait_for、"
-                "browser__browser_mouse_wheel 等 Playwright/browser MCP 工具。"
+                "请使用 playwright_navigate 直达目标 URL，或 playwright_search_web 执行可见搜索；"
+                "需要页面文本后调用 playwright_get_text，视觉状态用 playwright_screenshot，"
+                "点击或填写时基于真实 selector 调用 playwright_click/playwright_fill。"
             ),
         },
-        error=f"已阻止 {tool_name}：浏览器页面内部操作应优先使用 browser__ 工具。",
+        error=f"已阻止 {tool_name}：浏览器页面内部操作应优先使用 playwright_ 工具。",
     )
 
 
@@ -1171,13 +1234,12 @@ def _build_visible_browser_web_tool_block_result(call: dict[str, Any]) -> ToolEx
             "blocked_tool": tool_name,
             "reason": "用户明确要求打开浏览器或看到搜索过程，已阻止后台网页搜索/抓取工具。",
             "guidance": (
-                "请优先用 browser__browser_navigate 直接打开目标 URL 或搜索结果 URL，"
-                "再按需用 browser__browser_snapshot、browser__browser_click、"
-                "browser__browser_type、browser__browser_wait_for、browser__browser_mouse_wheel "
-                "完成可见浏览器流程。"
+                "请优先用 playwright_navigate 直接打开目标 URL，或用 playwright_search_web 搜索；"
+                "再按需用 playwright_get_text、playwright_screenshot、playwright_click、"
+                "playwright_fill 完成可见浏览器流程。"
             ),
         },
-        error=f"已阻止 {tool_name}：显式浏览器任务应使用 browser__ 工具，不要只做后台搜索。",
+        error=f"已阻止 {tool_name}：显式浏览器任务应使用 playwright_ 工具，不要只做后台搜索。",
     )
 
 
@@ -1187,7 +1249,7 @@ def _browser_dom_tools_available(tools: ToolRegistry) -> bool:
 
 def _should_prefer_browser_page_tools(messages: list[ChatMessage]) -> bool:
     text = _messages_text_for_tool_routing(messages).lower()
-    if "browser__" in text:
+    if "playwright_" in text:
         return True
 
     latest_text = (_latest_user_text(messages) or "").lower()
@@ -1243,7 +1305,7 @@ def _latest_user_requests_visible_browser(messages: list[ChatMessage]) -> bool:
 def _recent_browser_tool_failed(messages: list[ChatMessage]) -> bool:
     recent_text = _messages_text_for_tool_routing(messages[-4:]).lower()
     return (
-        "browser__" in recent_text
+        "playwright_" in recent_text
         and (
             '"success": false' in recent_text
             or '"success":false' in recent_text
@@ -1290,8 +1352,9 @@ def _build_browser_page_mode_rule(browser_page_mode: bool) -> str:
         return ""
     return (
         "- 当前上下文已识别为浏览器页面内部操作模式：Windows-MCP 坐标、截图、输入、滚动工具已从可用工具中隐藏。"
-        "能直达 URL 时先用 browser__browser_navigate；继续点击链接、输入搜索词、滚动页面或等待页面变化时，"
-        "必须使用 browser__ 前缀的 Playwright MCP 工具。"
+        "能直达 URL 时先用 playwright_navigate；需要搜索时用 playwright_search_web；"
+        "搜索后如果已经出现目标站点或词条页 URL，优先直接导航到目标页，再继续读取页面正文。"
+        "继续读取、截图、点击或填写页面时，必须使用 playwright_ 前缀的原生 Playwright 工具。"
     )
 
 
@@ -1300,8 +1363,8 @@ def _build_visible_browser_mode_rule(visible_browser_mode: bool) -> str:
         return ""
     return (
         "- 用户明确要求打开浏览器或看到搜索过程：后台 web__ 搜索/抓取工具已从可用工具中隐藏。"
-        "必须优先用 browser__browser_navigate 直达目标 URL 或搜索结果 URL；需要交互时再用 "
-        "browser__browser_snapshot/type/click/wait_for/mouse_wheel 等工具完成可见浏览器流程。"
+        "必须优先用 playwright_navigate 直达目标 URL，或 playwright_search_web 打开可见搜索结果；"
+        "需要交互时再用 playwright_get_text/screenshot/click/fill 等工具完成可见浏览器流程。"
     )
 
 
@@ -1345,15 +1408,24 @@ def _latest_user_text(messages: list[ChatMessage]) -> str | None:
 
 def _build_pending_continuation_messages(
     working_messages: list[ChatMessage],
-    model_content: str,
+    assistant_message: ChatMessage,
+    completed_tool_messages: list[ChatMessage],
+    tool_calls: list[NativeToolCall],
+    *,
+    pending_call_id: str,
 ) -> list[ChatMessage]:
-    """为待确认动作保存轻量上下文，避免确认执行后丢失原任务。"""
+    """为待确认动作保存原生 tool_calls 上下文，确认后可继续回填 tool role。"""
     messages = [
         *_compact_messages_for_pending_context(working_messages),
-        {
-            "role": "assistant",
-            "content": _truncate_pending_context_text(model_content),
-        },
+        _compact_message_for_pending_context(assistant_message),
+        *[
+            _compact_message_for_pending_context(message)
+            for message in completed_tool_messages
+        ],
+        *_build_skipped_after_pending_messages(
+            tool_calls,
+            start_after_call_id=pending_call_id,
+        ),
     ]
     return messages[-MAX_PENDING_CONTEXT_MESSAGES:]
 
@@ -1364,10 +1436,20 @@ def _compact_messages_for_pending_context(messages: list[ChatMessage]) -> list[C
 
 def _compact_message_for_pending_context(message: ChatMessage) -> ChatMessage:
     role = message.get("role")
-    return {
+    compacted: ChatMessage = {
         "role": role if isinstance(role, str) and role else "user",
         "content": _compact_pending_context_content(message.get("content")),
     }
+    tool_call_id = message.get("tool_call_id")
+    if isinstance(tool_call_id, str) and tool_call_id:
+        compacted["tool_call_id"] = tool_call_id
+    name = message.get("name")
+    if isinstance(name, str) and name:
+        compacted["name"] = name
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        compacted["tool_calls"] = tool_calls
+    return compacted
 
 
 def _compact_pending_context_content(content: Any) -> str:
@@ -1452,9 +1534,9 @@ def _build_confirmed_action_continuation_rules(action: PendingToolAction) -> str
         "- 如果动作成功但任务尚未完成，请继续请求下一步必要工具；如果已经完成，再给最终回复。",
         "- 如果刚打开的是 Windows“运行”窗口，且前文已经计划通过命令完成任务，应继续输入/提交对应命令，而不是询问用户想使用什么工具。",
     ]
-    if action.tool_name.startswith("browser__"):
+    if action.tool_name.startswith("playwright_"):
         rules.append(
-            "- 刚确认执行的是 browser__ 工具，后续网页内点击、输入、滚动、等待页面变化仍应继续使用 browser__ 工具；不要因为页面可见就切换到 windows__ 坐标点击。"
+            "- 刚确认执行的是 playwright_ 工具，后续网页内点击、输入、读取、截图仍应继续使用 playwright_ 工具；不要因为页面可见就切换到 windows__ 坐标点击。"
         )
     return "\n".join(rules)
 
@@ -1666,8 +1748,8 @@ def _describe_pending_action(action: PendingToolAction) -> str:
         return f"打开网页 {action.arguments.get('url', '')}"
     if action.tool_name == "open_local_folder":
         return f"打开文件夹 {action.arguments.get('path', '')}"
-    if action.tool_name.startswith("browser__"):
-        return f"执行浏览器 MCP 操作 {action.tool_name.removeprefix('browser__')}"
+    if action.tool_name.startswith("playwright_"):
+        return f"执行浏览器操作 {action.tool_name.removeprefix('playwright_')}"
     if action.tool_name.startswith("windows__"):
         return f"执行 Windows 桌面 MCP 操作 {action.tool_name.removeprefix('windows__')}"
     return f"执行 {action.tool_name}"
@@ -1852,6 +1934,11 @@ def _format_event_for_model(event: AgentEvent) -> str:
 
 def _redact_event_for_model(event: AgentEvent) -> dict[str, Any]:
     payload = dict(event.payload)
+    recent_conversation = payload.get("recent_conversation")
+    if isinstance(recent_conversation, list):
+        payload["recent_conversation"] = _sanitize_event_recent_conversation(
+            recent_conversation,
+        )
     screen_context = payload.get("screen_context")
     if isinstance(screen_context, dict):
         payload["screen_context"] = _redact_screen_context_for_model(screen_context)
@@ -1867,6 +1954,39 @@ def _redact_event_for_model(event: AgentEvent) -> dict[str, Any]:
         "type": event.type,
         "payload": payload,
     }
+
+
+def _sanitize_event_recent_conversation(
+    recent_conversation: list[Any],
+) -> list[dict[str, str]]:
+    sanitized: list[dict[str, str]] = []
+    for item in recent_conversation:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip()
+        if role not in {"user", "assistant"}:
+            continue
+        content = item.get("content")
+        if not isinstance(content, str):
+            continue
+        normalized_content = " ".join(content.split())
+        if not normalized_content:
+            continue
+        sanitized.append(
+            {
+                "role": role,
+                "content": _truncate_event_recent_conversation_content(
+                    normalized_content,
+                ),
+            }
+        )
+    return sanitized[-MAX_EVENT_RECENT_CONVERSATION_MESSAGES:]
+
+
+def _truncate_event_recent_conversation_content(content: str) -> str:
+    if len(content) <= MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS:
+        return content
+    return content[: MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS - 1].rstrip() + "…"
 
 
 def _redact_screen_context_for_model(screen_context: dict[str, Any]) -> dict[str, Any]:

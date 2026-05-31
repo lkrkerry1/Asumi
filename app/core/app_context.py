@@ -14,6 +14,7 @@ from app.core.extensions import ExtensionRegistry
 from app.proactive_care import ProactiveCareSettings
 from app.voice.tts import TTSProvider
 from app.storage.visual_observation import VisualObservationStore
+from app.core.plugin_manager import SakuraPluginManager
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class FeatureServices:
     settings_service: AppSettingsService
     extension_registry: ExtensionRegistry
     mcp_tool_provider: MCPToolProvider | None
+    plugin_manager: SakuraPluginManager
     mcp_settings: MCPRuntimeSettings
     debug_log_settings: DebugLogSettings
     memory_curation_settings: MemoryCurationSettings
@@ -100,6 +102,10 @@ class AppContext:
     @property
     def mcp_tool_provider(self) -> MCPToolProvider | None:
         return self.features.mcp_tool_provider
+
+    @property
+    def plugin_manager(self) -> SakuraPluginManager:
+        return self.features.plugin_manager
 
     @property
     def mcp_settings(self) -> MCPRuntimeSettings:

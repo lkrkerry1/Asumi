@@ -32,7 +32,7 @@ class ToolExecutionResult:
 
     tool_name: str
     success: bool
-    content: dict[str, Any] | str
+    content: Any
     error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,8 +74,12 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
-    def describe_tools(self, allowed_capabilities: set[str] | None = None) -> list[dict[str, Any]]:
-        """返回可暴露给模型的工具描述；可按能力开关隐藏敏感工具。"""
+    def describe_tools(
+        self,
+        allowed_capabilities: set[str] | None = None,
+        active_groups: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """返回可暴露给模型的工具描述；可按能力开关和工具组隐藏工具。"""
         return [
             {
                 "name": tool.name,
@@ -86,10 +90,86 @@ class ToolRegistry:
                 "risk": tool.risk,
             }
             for tool in self.all()
-            if allowed_capabilities is None
+            if self._tool_is_visible(
+                tool,
+                allowed_capabilities=allowed_capabilities,
+                active_groups=active_groups,
+            )
+        ]
+
+    def describe_openai_tools(
+        self,
+        allowed_capabilities: set[str] | None = None,
+        active_groups: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """返回 OpenAI Chat Completions 原生 function tools 定义。"""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": _normalize_parameters_schema(tool.parameters),
+                },
+            }
+            for tool in self.all()
+            if self._tool_is_visible(
+                tool,
+                allowed_capabilities=allowed_capabilities,
+                active_groups=active_groups,
+            )
+        ]
+
+    def search_tools(self, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+        keyword = str(arguments.get("keyword") or "").strip().lower()
+        results: list[dict[str, Any]] = []
+        for tool in self.all():
+            if tool.name in {"search_tools", "list_tool_groups"}:
+                continue
+            if keyword and not _tool_matches_keyword(tool, keyword):
+                continue
+            results.append(
+                {
+                    "name": tool.name,
+                    "group": tool.group,
+                    "description": tool.description,
+                    "risk": tool.risk,
+                    "requires_confirmation": tool.requires_confirmation,
+                }
+            )
+        return results
+
+    def list_tool_groups(self, _arguments: dict[str, Any]) -> list[dict[str, Any]]:
+        counts: dict[str, int] = {}
+        for tool in self.all():
+            counts[tool.group] = counts.get(tool.group, 0) + 1
+        return [
+            {"group": group, "tool_count": count}
+            for group, count in sorted(counts.items())
+        ]
+
+    def groups(self) -> set[str]:
+        return {tool.group for tool in self.all()}
+
+    def _tool_is_visible(
+        self,
+        tool: Tool,
+        *,
+        allowed_capabilities: set[str] | None,
+        active_groups: set[str] | None,
+    ) -> bool:
+        capability_visible = (
+            allowed_capabilities is None
             or tool.capability is None
             or tool.capability in allowed_capabilities
-        ]
+        )
+        if not capability_visible:
+            return False
+        if active_groups is None:
+            return True
+        if tool.capability is not None and allowed_capabilities and tool.capability in allowed_capabilities:
+            return True
+        return tool.group in active_groups
 
     def set_free_access_enabled(self, enabled: bool) -> None:
         """开启后普通确认工具直接执行，文件删除类高风险工具仍保留确认。"""
@@ -100,6 +180,7 @@ class ToolRegistry:
         name: str,
         arguments: dict[str, Any],
         reason: str = "",
+        tool_call_id: str = "",
     ) -> ToolExecutionResult | PendingToolAction:
         tool = self.get(name)
         debug_log(
@@ -132,6 +213,7 @@ class ToolRegistry:
             tool_name=name,
             arguments=arguments,
             reason=reason,
+            tool_call_id=tool_call_id,
         )
         debug_log("ToolRegistry", "工具等待用户确认", action.to_dict())
         return action
@@ -191,7 +273,7 @@ class ToolRegistry:
         result = ToolExecutionResult(
             tool_name=name,
             success=True,
-            content=content if isinstance(content, (dict, str)) else str(content),
+            content=content,
         )
         debug_log("ToolRegistry", "工具执行成功", _result_with_elapsed(result, started_at))
         return result
@@ -199,21 +281,131 @@ class ToolRegistry:
 
 def _can_execute_with_free_access(tool: Tool) -> bool:
     """识别完整访问权限下可直接执行的确认工具。"""
+    if _requires_confirmation_despite_free_access(tool):
+        return False
     if _is_browser_free_access_tool(tool.name):
         return True
-    return not _requires_confirmation_despite_free_access(tool)
+    return True
 
 
 def _is_browser_free_access_tool(name: str) -> bool:
-    """浏览器 MCP 的常规前台操作在完整访问权限下可直接执行。"""
+    """浏览器原生 Playwright 操作在完整访问权限下可直接执行。"""
     return name in {
-        "browser__browser_navigate",
-        "browser__browser_snapshot",
-        "browser__browser_click",
-        "browser__browser_type",
-        "browser__browser_wait_for",
-        "browser__browser_mouse_wheel",
+        "playwright_navigate",
+        "playwright_get_text",
+        "playwright_search_web",
+        "playwright_screenshot",
+        "playwright_click",
+        "playwright_fill",
+        "playwright_evaluate",
     }
+
+
+def _tool_matches_keyword(tool: Tool, keyword: str) -> bool:
+    haystack = "\n".join(
+        [
+            tool.name,
+            tool.group,
+            tool.description,
+        ]
+    ).lower()
+    return keyword in haystack
+
+
+def _normalize_parameters_schema(parameters: dict[str, Any]) -> dict[str, Any]:
+    if not parameters:
+        return {"type": "object", "properties": {}, "required": []}
+    if parameters.get("type") == "object":
+        schema = dict(parameters)
+        schema.setdefault("properties", {})
+        schema.setdefault("required", [])
+        normalized = _sanitize_openai_schema(schema)
+        return normalized if isinstance(normalized, dict) else {"type": "object", "properties": {}, "required": []}
+    return {
+        "type": "object",
+        "properties": _sanitize_schema_properties(dict(parameters)),
+        "required": [],
+    }
+
+
+def _sanitize_openai_schema(schema: Any) -> Any:
+    """把内部 JSON Schema 收窄成兼容常见 OpenAI-compatible 端点的 function schema。"""
+    if isinstance(schema, list):
+        return [_sanitize_openai_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    sanitized: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "properties" and isinstance(value, dict):
+            sanitized[key] = _sanitize_schema_properties(value)
+            continue
+        if key == "required" and isinstance(value, list):
+            sanitized[key] = [
+                item
+                for item in value
+                if isinstance(item, str)
+            ]
+            continue
+        if key == "type":
+            normalized_type = _sanitize_schema_type(value)
+            if normalized_type is None:
+                continue
+            sanitized[key] = normalized_type
+            if isinstance(value, list) and "null" in value:
+                sanitized["nullable"] = True
+            continue
+        sanitized[key] = _sanitize_openai_schema(value)
+
+    if "properties" in sanitized and isinstance(sanitized["properties"], dict):
+        required = sanitized.get("required")
+        if isinstance(required, list):
+            sanitized["required"] = [
+                item
+                for item in required
+                if item in sanitized["properties"]
+            ]
+    if "type" not in sanitized:
+        if "properties" in sanitized:
+            sanitized["type"] = "object"
+        elif "items" in sanitized:
+            sanitized["type"] = "array"
+        elif "enum" in sanitized:
+            sanitized["type"] = "string"
+    return sanitized
+
+
+def _sanitize_schema_properties(properties: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for name, property_schema in properties.items():
+        if _is_null_only_schema(property_schema):
+            continue
+        sanitized_property = _sanitize_openai_schema(property_schema)
+        if isinstance(sanitized_property, dict):
+            sanitized[str(name)] = sanitized_property
+    return sanitized
+
+
+def _sanitize_schema_type(value: Any) -> str | None:
+    if isinstance(value, str):
+        return None if value == "null" else value
+    if isinstance(value, list):
+        non_null_types = [
+            item
+            for item in value
+            if isinstance(item, str) and item != "null"
+        ]
+        if not non_null_types:
+            return None
+        return non_null_types[0]
+    return None
+
+
+def _is_null_only_schema(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    schema_type = schema.get("type")
+    return schema_type == "null" or schema_type == ["null"]
 
 
 def _requires_confirmation_despite_free_access(tool: Tool) -> bool:

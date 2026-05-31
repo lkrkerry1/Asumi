@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import threading
 import uuid
 
 import pytest
@@ -26,6 +28,7 @@ from app.agent.screen_tools import (
 from app.agent.tool_registry import Tool, ToolExecutionResult, ToolRegistry
 from app.config.settings_service import AppSettingsService
 from app.config.yaml_config import load_yaml_mapping
+from app.core.plugin_manager import SakuraPluginManager
 from app.llm.api_client import ApiRequestError, is_vision_unsupported_error, messages_contain_image
 from app.llm.context_trimming import MAX_MODEL_CONTEXT_MESSAGES, trim_messages_for_model
 from app.proactive_care import (
@@ -375,18 +378,18 @@ def test_tool_registry_free_access_keeps_high_risk_confirmation() -> None:
     assert result.tool_name == "run_external_action"
 
 
-def test_tool_registry_free_access_allows_browser_mcp_actions() -> None:
+def test_tool_registry_free_access_allows_playwright_actions() -> None:
     registry = ToolRegistry(
         [
             Tool(
-                name="browser__browser_navigate",
+                name="playwright_navigate",
                 description="打开可见浏览器页面",
                 handler=lambda arguments: {"url": arguments["url"]},
                 requires_confirmation=True,
-                risk="high",
+                risk="low",
             ),
             Tool(
-                name="browser__browser_evaluate",
+                name="playwright_evaluate",
                 description="执行页面脚本",
                 handler=lambda _arguments: {"done": True},
                 requires_confirmation=True,
@@ -397,15 +400,35 @@ def test_tool_registry_free_access_allows_browser_mcp_actions() -> None:
     registry.set_free_access_enabled(True)
 
     navigate_result = registry.prepare_or_execute(
-        "browser__browser_navigate",
+        "playwright_navigate",
         {"url": "https://example.com"},
     )
-    evaluate_result = registry.prepare_or_execute("browser__browser_evaluate", {})
+    evaluate_result = registry.prepare_or_execute("playwright_evaluate", {})
 
     assert not isinstance(navigate_result, PendingToolAction)
     assert navigate_result.success
     assert isinstance(evaluate_result, PendingToolAction)
-    assert evaluate_result.tool_name == "browser__browser_evaluate"
+    assert evaluate_result.tool_name == "playwright_evaluate"
+
+
+def test_tool_registry_playwright_evaluate_requires_confirmation_without_free_access() -> None:
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="playwright_evaluate",
+                description="执行页面脚本",
+                handler=lambda _arguments: {"done": True},
+                requires_confirmation=True,
+                risk="high",
+            ),
+        ]
+    )
+    registry.set_free_access_enabled(False)
+
+    result = registry.prepare_or_execute("playwright_evaluate", {"js_code": "document.title"})
+
+    assert isinstance(result, PendingToolAction)
+    assert result.tool_name == "playwright_evaluate"
 
 
 def test_tool_registry_describes_group_and_risk_metadata() -> None:
@@ -777,6 +800,116 @@ def test_builtin_registry_excludes_internal_browser_tools() -> None:
     assert "open_url" in names
 
 
+def test_playwright_plugin_registers_native_browser_tools() -> None:
+    registry = create_builtin_tool_registry(Path(__file__).resolve().parents[2])
+    manager = SakuraPluginManager(Path(__file__).resolve().parents[2])
+
+    manager.load_from_config(registry)
+    names = {tool.name for tool in registry.all()}
+
+    assert {
+        "playwright_navigate",
+        "playwright_get_text",
+        "playwright_search_web",
+        "playwright_screenshot",
+        "playwright_click",
+        "playwright_fill",
+        "playwright_evaluate",
+    }.issubset(names)
+    assert registry.get("playwright_evaluate").requires_confirmation  # type: ignore[union-attr]
+    manager.shutdown_all()
+
+
+def test_playwright_search_web_returns_structured_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    class TitleEl:
+        def inner_text(self) -> str:
+            return "萌娘百科 - 二阶堂真红"
+
+    class SnippetEl:
+        def inner_text(self) -> str:
+            return "二阶堂真红是《五彩斑斓的世界》系列角色。"
+
+    class DisplayUrlEl:
+        def inner_text(self) -> str:
+            return "zh.moegirl.org.cn"
+
+    class LinkEl:
+        def get_attribute(self, name: str) -> str | None:
+            return "https://zh.moegirl.org.cn/二阶堂真红" if name == "href" else None
+
+    class ResultEl:
+        def query_selector(self, selector: str):  # type: ignore[no-untyped-def]
+            if selector == ".result__title":
+                return TitleEl()
+            if selector == ".result__snippet":
+                return SnippetEl()
+            if selector == ".result__url":
+                return DisplayUrlEl()
+            if selector == ".result__a":
+                return LinkEl()
+            return None
+
+    class Page:
+        url = "https://html.duckduckgo.com/html/?q=%E4%BA%8C%E9%98%B6%E5%A0%82%E7%9C%9F%E7%BA%A2"
+
+        def goto(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return None
+
+        def query_selector_all(self, selector: str):  # type: ignore[no-untyped-def]
+            return [ResultEl()] if selector == ".result__body" else []
+
+    from plugins.playwright_browser import browser
+
+    monkeypatch.setattr(browser, "_page", None)
+    monkeypatch.setattr(browser, "_bg_executor", None)
+    monkeypatch.setattr(browser, "_browser_thread_id", None)
+    monkeypatch.setattr(browser, "_use_bg_thread", True)
+    monkeypatch.setattr(browser, "_ensure_browser", lambda: Page())
+
+    result = browser.search_web("二阶堂真红")
+
+    assert "萌娘百科 - 二阶堂真红" in result
+    assert "二阶堂真红是《五彩斑斓的世界》系列角色。" in result
+    assert "zh.moegirl.org.cn" in result
+    browser.shutdown_browser()
+
+
+def test_playwright_browser_operations_stay_on_single_worker_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    from plugins.playwright_browser import browser
+
+    class Page:
+        def __init__(self) -> None:
+            self.owner_thread_id = threading.get_ident()
+
+        def is_closed(self) -> bool:
+            return False
+
+        def inner_text(self, _selector: str) -> str:
+            assert threading.get_ident() == self.owner_thread_id
+            return "页面文本"
+
+    page_holder: dict[str, Page] = {}
+    observed_thread_ids: list[int] = []
+
+    def fake_ensure_browser() -> Page:
+        observed_thread_ids.append(threading.get_ident())
+        if "page" not in page_holder:
+            page_holder["page"] = Page()
+        return page_holder["page"]
+
+    monkeypatch.setattr(browser, "_ensure_browser", fake_ensure_browser)
+    monkeypatch.setattr(browser, "_bg_executor", None)
+    monkeypatch.setattr(browser, "_browser_thread_id", None)
+    monkeypatch.setattr(browser, "_use_bg_thread", True)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: browser.get_text(), range(2)))
+
+    assert results == ["页面文本", "页面文本"]
+    assert len(set(observed_thread_ids)) == 1
+    browser.shutdown_browser()
+
+
 def test_open_url_stays_confirmation_required() -> None:
     registry = create_builtin_tool_registry(Path(__file__).resolve().parents[2])
     registry.set_free_access_enabled(False)
@@ -789,7 +922,7 @@ def test_open_url_stays_confirmation_required() -> None:
 
 def test_browser_screenshot_fallback_is_attached_as_image_url() -> None:
     result = ToolExecutionResult(
-        tool_name="browser__browser_snapshot",
+        tool_name="playwright_screenshot",
         success=True,
         content={
             "url": "https://example.com",
@@ -817,7 +950,7 @@ def test_browser_screenshot_fallback_is_attached_as_image_url() -> None:
 
 def test_browser_screenshot_fallback_is_not_attached_without_vision() -> None:
     result = ToolExecutionResult(
-        tool_name="browser__browser_snapshot",
+        tool_name="playwright_screenshot",
         success=True,
         content={
             "url": "https://example.com",
@@ -836,7 +969,7 @@ def test_browser_screenshot_fallback_is_not_attached_without_vision() -> None:
 
 def test_tool_result_for_model_truncates_large_content() -> None:
     result = ToolExecutionResult(
-        tool_name="browser__browser_snapshot",
+        tool_name="playwright_get_text",
         success=True,
         content={
             "url": "https://example.com",
@@ -1023,9 +1156,9 @@ def test_browser_page_mode_hides_windows_mouse_tools_from_planner() -> None:
 
     registry = ToolRegistry(
         [
-            Tool(name="browser__browser_snapshot", description="浏览器页面快照", handler=lambda _arguments: {}),
-            Tool(name="browser__browser_click", description="浏览器点击", handler=lambda _arguments: {}),
-            Tool(name="browser__browser_type", description="浏览器输入", handler=lambda _arguments: {}),
+            Tool(name="playwright_get_text", description="读取浏览器文本", handler=lambda _arguments: {}),
+            Tool(name="playwright_click", description="浏览器点击", handler=lambda _arguments: {}),
+            Tool(name="playwright_fill", description="浏览器输入", handler=lambda _arguments: {}),
             Tool(name="windows__Snapshot", description="桌面快照", handler=lambda _arguments: {}),
             Tool(name="windows__Click", description="桌面点击", handler=lambda _arguments: {}),
         ]
@@ -1042,15 +1175,15 @@ def test_browser_page_mode_hides_windows_mouse_tools_from_planner() -> None:
             {"role": "user", "content": "打开浏览器搜一下二阶堂真红"},
             {
                 "role": "user",
-                "content": '工具执行结果如下：[{"tool_name":"browser__browser_type","success":true}]',
+                "content": '工具执行结果如下：[{"tool_name":"playwright_fill","success":true}]',
             },
             {"role": "user", "content": "帮我点进百科看看"},
         ]
     )
 
-    assert '"name": "browser__browser_snapshot"' in client.prompt
-    assert '"name": "browser__browser_click"' in client.prompt
-    assert '"name": "browser__browser_type"' in client.prompt
+    assert '"name": "playwright_get_text"' in client.prompt
+    assert '"name": "playwright_click"' in client.prompt
+    assert '"name": "playwright_fill"' in client.prompt
     assert '"name": "windows__Snapshot"' not in client.prompt
     assert '"name": "windows__Click"' not in client.prompt
 
@@ -1069,10 +1202,10 @@ def test_visible_browser_request_hides_background_web_tools_from_planner() -> No
 
     registry = ToolRegistry(
         [
-            Tool(name="browser__browser_navigate", description="打开浏览器页面", handler=lambda _arguments: {}),
-            Tool(name="browser__browser_snapshot", description="浏览器页面快照", handler=lambda _arguments: {}),
-            Tool(name="browser__browser_type", description="浏览器输入", handler=lambda _arguments: {}),
-            Tool(name="browser__browser_mouse_wheel", description="浏览器滚动", handler=lambda _arguments: {}),
+            Tool(name="playwright_navigate", description="打开浏览器页面", handler=lambda _arguments: {}),
+            Tool(name="playwright_get_text", description="读取浏览器文本", handler=lambda _arguments: {}),
+            Tool(name="playwright_fill", description="浏览器输入", handler=lambda _arguments: {}),
+            Tool(name="playwright_search_web", description="浏览器搜索", handler=lambda _arguments: {}),
             Tool(name="web__web_search", description="后台搜索", handler=lambda _arguments: {}),
             Tool(name="web__fetch_url", description="后台读取网页", handler=lambda _arguments: {}),
         ]
@@ -1086,13 +1219,13 @@ def test_visible_browser_request_hides_background_web_tools_from_planner() -> No
 
     runtime.handle_user_message([{"role": "user", "content": "打开浏览器搜索一下二阶堂真红,看看百科怎么描述的"}])
 
-    assert '"name": "browser__browser_navigate"' in client.prompt
-    assert '"name": "browser__browser_snapshot"' in client.prompt
-    assert '"name": "browser__browser_type"' in client.prompt
-    assert '"name": "browser__browser_mouse_wheel"' in client.prompt
+    assert '"name": "playwright_navigate"' in client.prompt
+    assert '"name": "playwright_get_text"' in client.prompt
+    assert '"name": "playwright_fill"' in client.prompt
+    assert '"name": "playwright_search_web"' in client.prompt
     assert '"name": "web__web_search"' not in client.prompt
     assert '"name": "web__fetch_url"' not in client.prompt
-    assert "能构造搜索 URL" in client.prompt
+    assert "playwright_search_web" in client.prompt
     assert "不要先打开搜索首页再操作输入框" in client.prompt
 
 
@@ -1107,7 +1240,7 @@ def test_browser_navigate_auto_snapshots_and_fast_forwards_lookup_reply() -> Non
             self.raw_calls += 1
             return (
                 '{"reply":{"segments":[{"ja":"開くね。","zh":"我打开看看。","tone":"中性"}]},'
-                '"tool_calls":[{"name":"browser__browser_navigate",'
+                '"tool_calls":[{"name":"playwright_navigate",'
                 '"arguments":{"url":"https://zh.moegirl.org.cn/二阶堂真红"},'
                 '"reason":"打开目标百科页面"}]}'
             )
@@ -1124,15 +1257,14 @@ def test_browser_navigate_auto_snapshots_and_fast_forwards_lookup_reply() -> Non
     registry = ToolRegistry(
         [
             Tool(
-                name="browser__browser_navigate",
+                name="playwright_navigate",
                 description="打开浏览器页面",
                 handler=lambda arguments: {"url": arguments["url"], "title": "二阶堂真红"},
             ),
             Tool(
-                name="browser__browser_snapshot",
-                description="浏览器页面快照",
+                name="playwright_get_text",
+                description="读取浏览器文本",
                 handler=lambda arguments: {
-                    "depth": arguments["depth"],
                     "text": "二阶堂真红是《五彩斑斓的世界》系列的女主角，页面包含角色信息。",
                 },
             ),
@@ -1151,8 +1283,8 @@ def test_browser_navigate_auto_snapshots_and_fast_forwards_lookup_reply() -> Non
 
     assert result.reply.translation == "已经确认页面内容了。"
     assert [action.payload["tool_name"] for action in result.actions] == [
-        "browser__browser_navigate",
-        "browser__browser_snapshot",
+        "playwright_navigate",
+        "playwright_get_text",
     ]
     assert client.raw_calls == 1
     assert client.chat_called
@@ -1170,8 +1302,8 @@ def test_browser_navigate_does_not_duplicate_planned_snapshot() -> None:
                 return (
                     '{"reply":{"segments":[{"ja":"確認するね。","zh":"我确认一下。","tone":"中性"}]},'
                     '"tool_calls":['
-                    '{"name":"browser__browser_navigate","arguments":{"url":"https://example.com"},"reason":"打开页面"},'
-                    '{"name":"browser__browser_snapshot","arguments":{"depth":2},"reason":"读取页面"}'
+                    '{"name":"playwright_navigate","arguments":{"url":"https://example.com"},"reason":"打开页面"},'
+                    '{"name":"playwright_get_text","arguments":{},"reason":"读取页面"}'
                     "]} "
                 )
             return (
@@ -1183,13 +1315,13 @@ def test_browser_navigate_does_not_duplicate_planned_snapshot() -> None:
     registry = ToolRegistry(
         [
             Tool(
-                name="browser__browser_navigate",
+                name="playwright_navigate",
                 description="打开浏览器页面",
                 handler=lambda _arguments: {"url": "https://example.com"},
             ),
             Tool(
-                name="browser__browser_snapshot",
-                description="浏览器页面快照",
+                name="playwright_get_text",
+                description="读取浏览器文本",
                 handler=lambda arguments: snapshot_calls.append(arguments) or {"text": "Example Page"},
             ),
         ]
@@ -1205,10 +1337,10 @@ def test_browser_navigate_does_not_duplicate_planned_snapshot() -> None:
 
     assert result.reply.translation == "读到了。"
     assert [action.payload["tool_name"] for action in result.actions] == [
-        "browser__browser_navigate",
-        "browser__browser_snapshot",
+        "playwright_navigate",
+        "playwright_get_text",
     ]
-    assert snapshot_calls == [{"depth": 2}]
+    assert snapshot_calls == [{}]
     assert client.raw_calls == 2
 
 
@@ -1222,7 +1354,7 @@ def test_browser_navigate_failure_does_not_auto_snapshot() -> None:
             if self.raw_calls == 1:
                 return (
                     '{"reply":{"segments":[{"ja":"開くね。","zh":"我打开。","tone":"中性"}]},'
-                    '"tool_calls":[{"name":"browser__browser_navigate",'
+                    '"tool_calls":[{"name":"playwright_navigate",'
                     '"arguments":{"url":"https://example.invalid"},"reason":"打开页面"}]}'
                 )
             return (
@@ -1240,11 +1372,11 @@ def test_browser_navigate_failure_does_not_auto_snapshot() -> None:
     registry = ToolRegistry(
         [
             Tool(
-                name="browser__browser_navigate",
+                name="playwright_navigate",
                 description="打开浏览器页面",
                 handler=lambda _arguments: (_ for _ in ()).throw(RuntimeError("导航失败")),
             ),
-            Tool(name="browser__browser_snapshot", description="浏览器页面快照", handler=snapshot),
+            Tool(name="playwright_get_text", description="读取浏览器文本", handler=snapshot),
         ]
     )
     client = BrowserFailureClient()
@@ -1257,7 +1389,7 @@ def test_browser_navigate_failure_does_not_auto_snapshot() -> None:
     result = runtime.handle_user_message([{"role": "user", "content": "打开浏览器查一下页面信息"}])
 
     assert result.reply.translation == "页面没打开。"
-    assert [action.payload["tool_name"] for action in result.actions] == ["browser__browser_navigate"]
+    assert [action.payload["tool_name"] for action in result.actions] == ["playwright_navigate"]
     assert not snapshot_called
     assert client.raw_calls == 2
 
@@ -1275,10 +1407,10 @@ def test_browser_interaction_request_auto_snapshots_without_fast_forward() -> No
             if self.raw_calls == 1:
                 return (
                     '{"reply":{"segments":[{"ja":"開くね。","zh":"我打开。","tone":"中性"}]},'
-                    '"tool_calls":[{"name":"browser__browser_navigate",'
+                    '"tool_calls":[{"name":"playwright_navigate",'
                     '"arguments":{"url":"https://example.com/login"},"reason":"打开登录页"}]}'
                 )
-            assert "browser__browser_snapshot" in str(messages)
+            assert "playwright_get_text" in str(messages)
             return (
                 '{"reply":{"segments":[{"ja":"次の操作を確認したよ。","zh":"我确认下一步操作了。","tone":"中性"}]},'
                 '"tool_calls":[]}'
@@ -1295,13 +1427,13 @@ def test_browser_interaction_request_auto_snapshots_without_fast_forward() -> No
     registry = ToolRegistry(
         [
             Tool(
-                name="browser__browser_navigate",
+                name="playwright_navigate",
                 description="打开浏览器页面",
                 handler=lambda arguments: {"url": arguments["url"]},
             ),
             Tool(
-                name="browser__browser_snapshot",
-                description="浏览器页面快照",
+                name="playwright_get_text",
+                description="读取浏览器文本",
                 handler=lambda _arguments: {"text": "Login Page 用户名 密码 登录按钮"},
             ),
         ]
@@ -1317,8 +1449,8 @@ def test_browser_interaction_request_auto_snapshots_without_fast_forward() -> No
 
     assert result.reply.translation == "我确认下一步操作了。"
     assert [action.payload["tool_name"] for action in result.actions] == [
-        "browser__browser_navigate",
-        "browser__browser_snapshot",
+        "playwright_navigate",
+        "playwright_get_text",
     ]
     assert client.raw_calls == 2
     assert not client.chat_called
@@ -1335,10 +1467,10 @@ def test_browser_lookup_does_not_fast_forward_when_auto_snapshot_has_no_content(
             if self.raw_calls == 1:
                 return (
                     '{"reply":{"segments":[{"ja":"開くね。","zh":"我打开。","tone":"中性"}]},'
-                    '"tool_calls":[{"name":"browser__browser_navigate",'
+                    '"tool_calls":[{"name":"playwright_navigate",'
                     '"arguments":{"url":"https://example.com"},"reason":"打开页面"}]}'
                 )
-            assert "browser__browser_snapshot" in str(messages)
+            assert "playwright_get_text" in str(messages)
             return (
                 '{"reply":{"segments":[{"ja":"もう少し確認するね。","zh":"我再确认一下。","tone":"中性"}]},'
                 '"tool_calls":[]}'
@@ -1355,13 +1487,13 @@ def test_browser_lookup_does_not_fast_forward_when_auto_snapshot_has_no_content(
     registry = ToolRegistry(
         [
             Tool(
-                name="browser__browser_navigate",
+                name="playwright_navigate",
                 description="打开浏览器页面",
                 handler=lambda arguments: {"url": arguments["url"]},
             ),
             Tool(
-                name="browser__browser_snapshot",
-                description="浏览器页面快照",
+                name="playwright_get_text",
+                description="读取浏览器文本",
                 handler=lambda _arguments: {"text": ""},
             ),
         ]
@@ -1391,7 +1523,7 @@ def test_browser_lookup_does_not_fast_forward_on_search_results_page() -> None:
             if self.raw_calls == 1:
                 return (
                     '{"reply":{"segments":[{"ja":"検索するね。","zh":"我搜索一下。","tone":"中性"}]},'
-                    '"tool_calls":[{"name":"browser__browser_navigate",'
+                    '"tool_calls":[{"name":"playwright_navigate",'
                     '"arguments":{"url":"https://www.google.com/search?q=二階堂真紅+百科"},'
                     '"reason":"打开搜索结果"}]}'
                 )
@@ -1412,13 +1544,13 @@ def test_browser_lookup_does_not_fast_forward_on_search_results_page() -> None:
     registry = ToolRegistry(
         [
             Tool(
-                name="browser__browser_navigate",
+                name="playwright_navigate",
                 description="打开浏览器页面",
                 handler=lambda arguments: {"url": arguments["url"]},
             ),
             Tool(
-                name="browser__browser_snapshot",
-                description="浏览器页面快照",
+                name="playwright_get_text",
+                description="读取浏览器文本",
                 handler=lambda _arguments: {
                     "text": (
                         "### Page\n"
@@ -1459,7 +1591,7 @@ def test_visible_browser_request_blocks_background_search_and_continues_planning
                     '"tool_calls":[{"name":"web__web_search","arguments":{"query":"二阶堂真红 百科"},"reason":"搜索百科"}]}'
                 )
             assert "用户明确要求打开浏览器" in str(messages)
-            assert "browser__browser_navigate" in str(messages)
+            assert "playwright_navigate" in str(messages)
             return (
                 '{"reply":{"segments":[{"ja":"ブラウザで開くね。","zh":"我改用浏览器打开。","tone":"中性"}]},'
                 '"tool_calls":[]}'
@@ -1473,9 +1605,9 @@ def test_visible_browser_request_blocks_background_search_and_continues_planning
 
     registry = ToolRegistry(
         [
-            Tool(name="browser__browser_navigate", description="打开浏览器页面", handler=lambda _arguments: {}),
-            Tool(name="browser__browser_snapshot", description="浏览器页面快照", handler=lambda _arguments: {}),
-            Tool(name="browser__browser_type", description="浏览器输入", handler=lambda _arguments: {}),
+            Tool(name="playwright_navigate", description="打开浏览器页面", handler=lambda _arguments: {}),
+            Tool(name="playwright_get_text", description="读取浏览器文本", handler=lambda _arguments: {}),
+            Tool(name="playwright_fill", description="浏览器输入", handler=lambda _arguments: {}),
             Tool(name="web__web_search", description="后台搜索", handler=web_search),
         ]
     )
@@ -1510,7 +1642,7 @@ def test_plain_lookup_still_exposes_background_web_tools() -> None:
 
     registry = ToolRegistry(
         [
-            Tool(name="browser__browser_navigate", description="打开浏览器页面", handler=lambda _arguments: {}),
+            Tool(name="playwright_navigate", description="打开浏览器页面", handler=lambda _arguments: {}),
             Tool(name="web__web_search", description="后台搜索", handler=lambda _arguments: {}),
             Tool(name="web__fetch_url", description="后台读取网页", handler=lambda _arguments: {}),
         ]
@@ -1543,7 +1675,7 @@ def test_browser_page_mode_blocks_windows_click_and_continues_planning() -> None
                     '"tool_calls":[{"name":"windows__Click","arguments":{"loc":[180,615]},"reason":"点击搜索结果链接"}]}'
                 )
             assert "浏览器页面内部操作" in str(messages)
-            assert "browser__browser_snapshot" in str(messages)
+            assert "playwright_get_text" in str(messages)
             return (
                 '{"reply":{"segments":[{"ja":"ブラウザの操作に戻したよ。","zh":"已经切回浏览器操作了。","tone":"中性"}]},'
                 '"tool_calls":[]}'
@@ -1557,8 +1689,8 @@ def test_browser_page_mode_blocks_windows_click_and_continues_planning() -> None
 
     registry = ToolRegistry(
         [
-            Tool(name="browser__browser_snapshot", description="浏览器页面快照", handler=lambda _arguments: {}),
-            Tool(name="browser__browser_click", description="浏览器点击", handler=lambda _arguments: {}),
+            Tool(name="playwright_get_text", description="读取浏览器文本", handler=lambda _arguments: {}),
+            Tool(name="playwright_click", description="浏览器点击", handler=lambda _arguments: {}),
             Tool(
                 name="windows__Click",
                 description="桌面点击",
@@ -1580,7 +1712,7 @@ def test_browser_page_mode_blocks_windows_click_and_continues_planning() -> None
             {"role": "user", "content": "打开浏览器搜一下二阶堂真红"},
             {
                 "role": "user",
-                "content": '工具执行结果如下：[{"tool_name":"browser__browser_type","success":true}]',
+                "content": '工具执行结果如下：[{"tool_name":"playwright_fill","success":true}]',
             },
             {"role": "user", "content": "帮我点进百科看看"},
         ]
@@ -1607,7 +1739,7 @@ def test_desktop_task_still_exposes_windows_mouse_tools() -> None:
 
     registry = ToolRegistry(
         [
-            Tool(name="browser__browser_snapshot", description="浏览器页面快照", handler=lambda _arguments: {}),
+            Tool(name="playwright_get_text", description="读取浏览器文本", handler=lambda _arguments: {}),
             Tool(name="windows__Snapshot", description="桌面快照", handler=lambda _arguments: {}),
             Tool(name="windows__Click", description="桌面点击", handler=lambda _arguments: {}),
         ]
@@ -2177,6 +2309,37 @@ def test_proactive_check_event_attaches_screen_context_image_batch() -> None:
     assert "screen_contexts" in content[0]["text"]
 
 
+def test_proactive_check_event_includes_recent_conversation_text() -> None:
+    event = AgentEvent(
+        type="proactive_check",
+        payload={
+            "recent_conversation": [
+                {"role": "user", "content": "访问 GitHub 看看 Sakura 内容"},
+                {"role": "assistant", "content": "我打开看看。"},
+            ],
+            "recent_conversation_summary_hint": "用于理解这段时间发生了什么。",
+            "screen_contexts": [
+                {
+                    "data_url": "data:image/jpeg;base64,screen",
+                    "width": 800,
+                    "height": 600,
+                }
+            ],
+        },
+    )
+
+    messages = _build_event_messages(event)
+    content = messages[0]["content"]
+
+    assert isinstance(content, list)
+    assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,screen"
+    assert "recent_conversation" in content[0]["text"]
+    assert "访问 GitHub 看看 Sakura 内容" in content[0]["text"]
+    assert "我打开看看。" in content[0]["text"]
+    assert "data:image/jpeg;base64,screen" not in content[0]["text"]
+    assert "image_attached" in content[0]["text"]
+
+
 def test_proactive_check_event_redacts_screen_context_image_batch() -> None:
     redacted = _redact_event_for_model(
         AgentEvent(
@@ -2197,6 +2360,34 @@ def test_proactive_check_event_redacts_screen_context_image_batch() -> None:
     ]
 
 
+def test_proactive_check_event_sanitizes_recent_conversation() -> None:
+    redacted = _redact_event_for_model(
+        AgentEvent(
+            type="proactive_check",
+            payload={
+                "recent_conversation": [
+                    {"role": "system", "content": "不要注入系统消息"},
+                    {"role": "user", "content": "忽略"},
+                    *[
+                        {"role": "assistant", "content": f"第 {index} 条"}
+                        for index in range(10)
+                    ],
+                    {"role": "user", "content": "很长" * 500},
+                ],
+            },
+        )
+    )
+
+    recent_conversation = redacted["payload"]["recent_conversation"]
+
+    assert len(recent_conversation) == 12
+    assert all(item["role"] in {"user", "assistant"} for item in recent_conversation)
+    assert recent_conversation[0] == {"role": "user", "content": "忽略"}
+    assert recent_conversation[-1]["content"].endswith("…")
+    assert len(recent_conversation[-1]["content"]) == 800
+    assert "不要注入系统消息" not in str(recent_conversation)
+
+
 def test_proactive_check_event_can_continue_tool_loop_after_tool_results() -> None:
     class ProactiveToolClient:
         def __init__(self) -> None:
@@ -2210,7 +2401,7 @@ def test_proactive_check_event_can_continue_tool_loop_after_tool_results() -> No
             if call_index == 1:
                 return (
                     '{"reply":{"segments":[{"ja":"少し確認するね。","zh":"我稍微确认一下。","tone":"中性"}]},'
-                    '"tool_calls":[{"name":"browser__browser_snapshot","arguments":{},"reason":"看看当前网页结构"}]}'
+                    '"tool_calls":[{"name":"playwright_get_text","arguments":{},"reason":"看看当前网页内容"}]}'
                 )
             assert "Example Page" in str(messages)
             return (
@@ -2221,8 +2412,8 @@ def test_proactive_check_event_can_continue_tool_loop_after_tool_results() -> No
     registry = ToolRegistry(
         [
             Tool(
-                name="browser__browser_snapshot",
-                description="读取当前网页结构",
+                name="playwright_get_text",
+                description="读取当前网页内容",
                 handler=lambda _arguments: {
                     "url": "https://example.com",
                     "title": "Example Page",
@@ -2250,7 +2441,7 @@ def test_proactive_check_event_can_continue_tool_loop_after_tool_results() -> No
 
     assert result.reply.translation == "页面像是已经打开了。你是卡在这里了吗？"
     assert [action.type for action in result.actions] == ["event", "tool_call"]
-    assert result.actions[1].payload["tool_name"] == "browser__browser_snapshot"
+    assert result.actions[1].payload["tool_name"] == "playwright_get_text"
     assert len(client.prompts) == 2
     assert "主动检查事件" in client.prompts[0]
     assert "不要为了显得主动而循环调用工具" in client.prompts[0]

@@ -16,15 +16,21 @@ WINDOWS_BROWSER_PAGE_CONFLICT_TOOL_NAMES = {
     "windows__Scroll",
     "windows__Move",
 }
-BROWSER_NAVIGATE_TOOL_NAME = "browser__browser_navigate"
-BROWSER_SNAPSHOT_TOOL_NAME = "browser__browser_snapshot"
+PLAYWRIGHT_NAVIGATE_TOOL_NAME = "playwright_navigate"
+PLAYWRIGHT_GET_TEXT_TOOL_NAME = "playwright_get_text"
+PLAYWRIGHT_BROWSER_TOOL_NAMES = {
+    PLAYWRIGHT_NAVIGATE_TOOL_NAME,
+    PLAYWRIGHT_GET_TEXT_TOOL_NAME,
+    "playwright_search_web",
+    "playwright_screenshot",
+    "playwright_click",
+    "playwright_fill",
+    "playwright_evaluate",
+}
+BROWSER_NAVIGATE_TOOL_NAME = PLAYWRIGHT_NAVIGATE_TOOL_NAME
+BROWSER_SNAPSHOT_TOOL_NAME = PLAYWRIGHT_GET_TEXT_TOOL_NAME
 BROWSER_DOM_TOOL_NAMES = {
-    BROWSER_NAVIGATE_TOOL_NAME,
-    BROWSER_SNAPSHOT_TOOL_NAME,
-    "browser__browser_click",
-    "browser__browser_type",
-    "browser__browser_wait_for",
-    "browser__browser_mouse_wheel",
+    *PLAYWRIGHT_BROWSER_TOOL_NAMES,
 }
 WEB_BACKGROUND_TOOL_NAMES = {
     "web__web_search",

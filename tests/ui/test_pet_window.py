@@ -274,6 +274,63 @@ def test_proactive_care_batches_screenshots_until_cooldown(monkeypatch) -> None:
     assert window.proactive_screen_contexts == []
 
 
+def test_proactive_care_event_includes_recent_conversation() -> None:
+    from app.proactive_care import PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER
+    from app.ui.pet_window import PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT
+
+    window = _build_minimal_proactive_window(
+        screen_context_enabled=True,
+        check_interval_minutes=1,
+        cooldown_minutes=2,
+    )
+    window.messages = [
+        {"role": "system", "content": PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER},
+        {"role": "user", "content": "访问 GitHub 看看 Sakura 内容"},
+        {"role": "assistant", "content": "我打开看看。"},
+        {"role": "assistant", "content": "稍微休息一下吧。"},
+    ]
+
+    event = window._build_proactive_care_event(300.0)
+
+    assert event.payload["recent_conversation"] == [
+        {"role": "user", "content": "访问 GitHub 看看 Sakura 内容"},
+        {"role": "assistant", "content": "我打开看看。"},
+        {"role": "assistant", "content": "稍微休息一下吧。"},
+    ]
+    assert event.payload["recent_conversation_summary_hint"] == (
+        PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT
+    )
+    assert PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER not in str(
+        event.payload["recent_conversation"]
+    )
+
+
+def test_proactive_recent_conversation_limits_count_and_content() -> None:
+    from app.ui.pet_window import PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT
+
+    window = _build_minimal_proactive_window(
+        screen_context_enabled=True,
+        check_interval_minutes=1,
+        cooldown_minutes=2,
+    )
+    window.messages = [
+        {"role": "user", "content": f"第 {index} 条"}
+        for index in range(13)
+    ]
+    window.messages.append({"role": "assistant", "content": "很长" * 500})
+
+    event = window._build_proactive_care_event(300.0)
+    recent_conversation = event.payload["recent_conversation"]
+
+    assert len(recent_conversation) == 12
+    assert recent_conversation[0] == {"role": "user", "content": "第 2 条"}
+    assert recent_conversation[-1]["role"] == "assistant"
+    assert len(recent_conversation[-1]["content"]) == (
+        PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT
+    )
+    assert recent_conversation[-1]["content"].endswith("…")
+
+
 def test_proactive_care_capture_interval_allows_timer_jitter() -> None:
     window = _build_minimal_proactive_window(
         screen_context_enabled=True,

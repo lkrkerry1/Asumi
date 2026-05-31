@@ -101,7 +101,8 @@ def _parse_segment(item: Any) -> ChatSegment | None:
 def _build_segment(text: str, tone: Any, translation: str, portrait: Any) -> ChatSegment:
     text = text.strip()
     translation = translation.strip()
-    if _looks_chinese(text) and _looks_japanese(translation):
+    # ja 不含日语假名且有内容，且 zh 有内容 → 自动交换（兜底处理 ja/zh 写反或 ja 错填中文的情况）
+    if text and not _looks_japanese(text) and translation:
         text, translation = translation, text
     return ChatSegment(text, _clean_tone(tone), translation, _clean_portrait(portrait))
 
@@ -149,3 +150,5 @@ def _strip_code_fence(content: str) -> str:
     if len(lines) >= 3 and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
         return "\n".join(lines[1:-1]).strip()
     return content
+
+

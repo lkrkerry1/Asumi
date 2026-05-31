@@ -74,6 +74,64 @@ def test_complete_raw_applies_param_filter(monkeypatch) -> None:  # type: ignore
     assert "unsupported_internal_flag" not in captured
 
 
+def test_complete_with_tools_sends_tools_and_parses_tool_calls(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, Any] = {}
+    client = OpenAICompatibleClient(
+        ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="key",
+            model="model",
+        )
+    )
+
+    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+        captured.update(payload)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "echo_tool",
+                                    "arguments": '{"value":"ok"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(client, "_post_chat_completions", fake_post)
+
+    turn = client.complete_with_tools(
+        "system",
+        [{"role": "user", "content": "hello"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo_tool",
+                    "description": "Echo",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    assert captured["tools"][0]["function"]["name"] == "echo_tool"
+    assert captured["tool_choice"] == "auto"
+    assert turn.tool_calls[0].id == "call_1"
+    assert turn.tool_calls[0].name == "echo_tool"
+    assert turn.tool_calls[0].arguments == {"value": "ok"}
+    assert turn.message["tool_calls"][0]["id"] == "call_1"
+
+
 def test_segmented_reply_instruction_requests_portrait_field() -> None:
     instruction = _build_segmented_reply_instruction(
         ["中性", "提醒"],

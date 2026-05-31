@@ -9,6 +9,7 @@ servers:
     risk: low
     requires_confirmation: false
   playwright:
+    enabled: false
     transport: stdio
     command: "{node}"
     args:

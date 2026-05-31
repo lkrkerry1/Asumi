@@ -19,6 +19,7 @@ from app.storage.chat_history import ChatHistoryStore
 from app.debug_log import debug_log
 from app.voice.tts import GPTSoVITSTTSProvider, NullTTSProvider, TTSConfigError
 from app.storage.visual_observation import VisualObservationStore
+from app.core.plugin_manager import SakuraPluginManager
 
 
 def build_app_context(base_dir: Path) -> AppContext:
@@ -81,6 +82,8 @@ def build_app_context(base_dir: Path) -> AppContext:
     )
     extension_registry = ExtensionRegistry()
     extension_registry.apply_tools(tool_registry)
+    plugin_manager = SakuraPluginManager(base_dir=base_dir)
+    plugin_manager.load_from_config(tool_registry)
     mcp_settings = settings_service.load_mcp_runtime_settings()
     mcp_tool_provider = register_mcp_tools_from_config(
         base_dir,
@@ -139,6 +142,7 @@ def build_app_context(base_dir: Path) -> AppContext:
             settings_service=settings_service,
             extension_registry=extension_registry,
             mcp_tool_provider=mcp_tool_provider,
+            plugin_manager=plugin_manager,
             mcp_settings=mcp_settings,
             debug_log_settings=debug_log_settings,
             memory_curation_settings=memory_curation_settings,

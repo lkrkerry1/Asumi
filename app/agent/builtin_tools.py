@@ -22,7 +22,7 @@ def create_builtin_tool_registry(
     notes = NotesStore(base_dir / "data" / "notes")
     memory = memory or MemoryStore(base_dir / "data" / "memory.json")
     reminders = reminders or ReminderStore(base_dir / "data" / "reminders.json")
-    return ToolRegistry(
+    registry = ToolRegistry(
         [
             create_screen_observation_tool(),
             Tool(
@@ -187,6 +187,36 @@ def create_builtin_tool_registry(
             ),
         ]
     )
+    registry.register(
+        Tool(
+            name="search_tools",
+            description=(
+                "搜索 Sakura 当前已安装但可能尚未暴露的工具。"
+                "当你需要浏览器、桌面、网页、文件等能力但当前工具列表不足时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "要搜索的工具关键词或能力名称。"},
+                },
+                "required": ["keyword"],
+            },
+            handler=registry.search_tools,
+            group="default",
+            risk="low",
+        )
+    )
+    registry.register(
+        Tool(
+            name="list_tool_groups",
+            description="列出 Sakura 当前可用工具组及数量，用于决定是否需要搜索并激活更多工具。",
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=registry.list_tool_groups,
+            group="default",
+            risk="low",
+        )
+    )
+    return registry
 
 
 def get_current_time() -> dict[str, str]:

@@ -111,6 +111,12 @@ REMINDER_CHECK_INTERVAL_MS = 30_000
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
+PROACTIVE_RECENT_CONVERSATION_LIMIT = 12
+PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT = 800
+PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT = (
+    "这些 recent_conversation 消息用于理解这段时间发生了什么、用户当前阶段和 Sakura "
+    "刚刚说过什么；不要逐字复述，应结合屏幕变化自然回应，并避免连续重复同一种休息提醒。"
+)
 REPLY_HISTORY_PANEL_WIDTH = 34
 REPLY_HISTORY_PANEL_HEIGHT = 70
 REPLY_HISTORY_BUTTON_SIZE = 30
@@ -135,6 +141,7 @@ class PetWindow(QWidget):
         self.reminder_store = context.reminder_store
         self.tool_registry = context.tool_registry
         self.mcp_tool_provider = context.mcp_tool_provider
+        self.plugin_manager = context.plugin_manager
         self.agent_runtime = context.agent_runtime
         self.tts_provider = context.tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
@@ -398,7 +405,7 @@ class PetWindow(QWidget):
 
         application = QApplication.instance()
         if application is not None:
-            application.aboutToQuit.connect(self.close_mcp_tools)
+            application.aboutToQuit.connect(self.close_external_tools)
 
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
@@ -436,8 +443,13 @@ class PetWindow(QWidget):
         self._handle_mouse_release(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        self.close_mcp_tools()
+        self.close_external_tools()
         super().closeEvent(event)
+
+    @Slot()
+    def close_external_tools(self) -> None:
+        self.close_mcp_tools()
+        self.close_plugins()
 
     @Slot()
     def close_mcp_tools(self) -> None:
@@ -445,6 +457,10 @@ class PetWindow(QWidget):
             return
         self.mcp_tool_provider.close()
         self.mcp_tool_provider = None
+
+    @Slot()
+    def close_plugins(self) -> None:
+        self.plugin_manager.shutdown_all()
 
     def _handle_mouse_press(self, event: QMouseEvent) -> bool:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1457,6 +1473,14 @@ class PetWindow(QWidget):
             "screen_context_count": len(screen_contexts),
             "screen_context_dropped_count": self.proactive_screen_context_dropped_count,
         }
+        recent_conversation = _build_proactive_recent_conversation(
+            getattr(self, "messages", []),
+        )
+        if recent_conversation:
+            payload["recent_conversation"] = recent_conversation
+            payload["recent_conversation_summary_hint"] = (
+                PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT
+            )
         if screen_contexts:
             payload["screen_contexts"] = screen_contexts
             payload["screen_context_window_started_at"] = screen_contexts[0].get("captured_at", "")
@@ -1886,6 +1910,7 @@ class PetWindow(QWidget):
             self.mcp_settings,
             self.debug_log_settings,
             self.memory_store,
+            self.plugin_manager.tools_tabs,
             self,
         )
         if (
@@ -2287,6 +2312,57 @@ def _build_proactive_visual_observation_jobs(event: AgentEvent) -> list[VisualOb
             ],
         )
     ]
+
+
+def _build_proactive_recent_conversation(
+    messages: list[dict[str, Any]],
+    *,
+    limit: int = PROACTIVE_RECENT_CONVERSATION_LIMIT,
+    content_limit: int = PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT,
+) -> list[dict[str, str]]:
+    """为主动事件提取近期用户/助手对话，帮助模型理解一段时间内的语境。"""
+    recent: list[dict[str, str]] = []
+    for message in messages:
+        role = str(message.get("role", "")).strip()
+        if role not in {"user", "assistant"}:
+            continue
+        content = _proactive_recent_conversation_content(message.get("content"))
+        if not content or content == PROACTIVE_SCREEN_CONTEXT_HISTORY_MARKER:
+            continue
+        recent.append(
+            {
+                "role": role,
+                "content": _truncate_proactive_recent_conversation_content(
+                    content,
+                    content_limit,
+                ),
+            }
+        )
+    return recent[-limit:]
+
+
+def _proactive_recent_conversation_content(content: Any) -> str:
+    if isinstance(content, str):
+        return " ".join(content.split())
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return " ".join(" ".join(parts).split())
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return " ".join(text.split())
+    return ""
+
+
+def _truncate_proactive_recent_conversation_content(content: str, limit: int) -> str:
+    if len(content) <= limit:
+        return content
+    return content[: max(0, limit - 1)].rstrip() + "…"
 
 
 def _last_user_message_index(messages: list[dict[str, Any]]) -> int | None:
