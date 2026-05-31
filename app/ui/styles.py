@@ -17,6 +17,27 @@ PET_WINDOW_STYLEHEET = """
     font-size: 19px;
     line-height: 1.35;
 }
+#replyHistoryPanel {
+    background: rgba(255, 255, 255, 92);
+    border: 1px solid rgba(238, 172, 200, 154);
+    border-radius: 17px;
+}
+#replyHistoryButton {
+    background: transparent;
+    border: none;
+    border-radius: 13px;
+    color: #7a3656;
+    font-size: 15px;
+    font-weight: 900;
+}
+#replyHistoryButton:hover {
+    background: rgba(255, 255, 255, 130);
+    color: #b13e73;
+}
+#replyHistoryButton:disabled {
+    background: transparent;
+    color: rgba(122, 54, 86, 92);
+}
 #inputBar {
     background: transparent;
     border: none;

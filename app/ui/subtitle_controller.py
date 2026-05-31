@@ -130,6 +130,15 @@ class SubtitleController(QObject):
             self.speech_timer.start()
         self._log_stage("speech_text_started", {"text": cleaned})
 
+    def show_text_immediately(self, text: str) -> None:
+        """立即显示完整字幕，用于历史回看，不触发 TTS 或分段推进。"""
+        cleaned = " ".join(text.split())
+        self.speech_timer.stop()
+        self.speech_text = cleaned
+        self.speech_index = len(cleaned)
+        self.speech_label.setText(cleaned)
+        self._log_stage("speech_text_shown_immediately", {"text": cleaned})
+
     def restart_current_segment_speech(self) -> None:
         if self.current_segment_sequence_id is None or self.current_segment is None:
             return

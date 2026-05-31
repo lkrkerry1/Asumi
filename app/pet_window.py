@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSystemTrayIcon,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -114,6 +115,11 @@ SUBTITLE_LANGUAGE_ZH = "zh"
 SCREEN_OBSERVATION_ENABLED_KEY = "SCREEN_OBSERVATION_ENABLED"
 AUTONOMOUS_SCREEN_OBSERVATION_ENABLED_KEY = "AUTONOMOUS_SCREEN_OBSERVATION_ENABLED"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
+REPLY_HISTORY_PANEL_WIDTH = 34
+REPLY_HISTORY_PANEL_HEIGHT = 70
+REPLY_HISTORY_BUTTON_SIZE = 30
+REPLY_HISTORY_PREVIOUS_SYMBOL = "▲"
+REPLY_HISTORY_NEXT_SYMBOL = "▼"
 
 
 class PetWindow(QWidget):
@@ -186,6 +192,9 @@ class PetWindow(QWidget):
         self.active_interaction_id = ""
         self.active_interaction_started_at: float | None = None
         self.active_interaction_last_at: float | None = None
+        self.reply_history_segments: list[ChatSegment] = []
+        self.reply_history_index: int | None = None
+        self.reply_history_review_active = False
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(REMINDER_CHECK_INTERVAL_MS)
         self.reminder_timer.timeout.connect(self._check_due_reminders)
@@ -263,6 +272,26 @@ class PetWindow(QWidget):
         self.speech_label.setObjectName("speechText")
         self.speech_label.setWordWrap(True)
         self.speech_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+
+        self.reply_history_panel = QFrame(self.bubble)
+        _configure_reply_history_panel(self.reply_history_panel)
+
+        self.reply_history_previous_button = QToolButton(self.reply_history_panel)
+        _configure_reply_history_button(
+            self.reply_history_previous_button,
+            text=REPLY_HISTORY_PREVIOUS_SYMBOL,
+            tooltip="上一条历史消息",
+        )
+        self.reply_history_previous_button.clicked.connect(self._show_previous_reply_history)
+
+        self.reply_history_next_button = QToolButton(self.reply_history_panel)
+        _configure_reply_history_button(
+            self.reply_history_next_button,
+            text=REPLY_HISTORY_NEXT_SYMBOL,
+            tooltip="下一条历史消息",
+        )
+        self.reply_history_next_button.clicked.connect(self._show_next_reply_history)
+
         self.voice_playback_controller = VoicePlaybackController(
             self.tts_provider,
             self._log_interaction_stage,
@@ -285,11 +314,29 @@ class PetWindow(QWidget):
         bubble_header.addWidget(self.name_label)
         bubble_header.addStretch(1)
 
+        bubble_text_layout = QVBoxLayout()
+        bubble_text_layout.setContentsMargins(0, 0, 0, 0)
+        bubble_text_layout.setSpacing(6)
+        bubble_text_layout.addLayout(bubble_header)
+        bubble_text_layout.addWidget(self.speech_label, 1)
+
+        history_button_layout = QVBoxLayout()
+        history_button_layout.setContentsMargins(2, 3, 2, 3)
+        history_button_layout.setSpacing(4)
+        history_button_layout.addWidget(self.reply_history_previous_button)
+        history_button_layout.addWidget(self.reply_history_next_button)
+        self.reply_history_panel.setLayout(history_button_layout)
+
+        bubble_body_layout = QHBoxLayout()
+        bubble_body_layout.setContentsMargins(0, 0, 0, 0)
+        bubble_body_layout.setSpacing(10)
+        bubble_body_layout.addLayout(bubble_text_layout, 1)
+        bubble_body_layout.addWidget(self.reply_history_panel, 0, Qt.AlignmentFlag.AlignVCenter)
+
         bubble_layout = QVBoxLayout()
-        bubble_layout.setContentsMargins(22, 12, 22, 14)
-        bubble_layout.setSpacing(6)
-        bubble_layout.addLayout(bubble_header)
-        bubble_layout.addWidget(self.speech_label, 1)
+        bubble_layout.setContentsMargins(22, 12, 18, 14)
+        bubble_layout.setSpacing(0)
+        bubble_layout.addLayout(bubble_body_layout, 1)
         self.bubble.setLayout(bubble_layout)
 
         self.input_backdrop = FrostedGlassFrame(self)
@@ -337,6 +384,7 @@ class PetWindow(QWidget):
 
         self.setStyleSheet(PET_WINDOW_STYLEHEET)
         self._apply_fonts()
+        self._update_reply_history_buttons()
         for drag_widget in (
             self.label,
             self.portrait_transition_label,
@@ -427,6 +475,120 @@ class PetWindow(QWidget):
 
     def _apply_reply_segment(self, segment: ChatSegment) -> None:
         self.portrait_controller.apply_for_segment(segment)
+        self._sync_reply_history_index_for_segment(segment)
+
+    def _remember_reply_history_segments(self, segments: list[ChatSegment]) -> None:
+        clean_segments = [segment for segment in segments if segment.text.strip()]
+        if not clean_segments:
+            return
+        self.reply_history_segments.extend(clean_segments)
+        if self.reply_history_index is None:
+            self.reply_history_index = len(self.reply_history_segments) - 1
+        self._update_reply_history_buttons()
+
+    def _sync_reply_history_index_for_segment(self, segment: ChatSegment) -> None:
+        for index in range(len(self.reply_history_segments) - 1, -1, -1):
+            if self.reply_history_segments[index] is segment:
+                self.reply_history_index = index
+                self.reply_history_review_active = False
+                self._update_reply_history_buttons()
+                return
+        for index in range(len(self.reply_history_segments) - 1, -1, -1):
+            if self.reply_history_segments[index] == segment:
+                self.reply_history_index = index
+                self.reply_history_review_active = False
+                self._update_reply_history_buttons()
+                return
+
+    @Slot()
+    def _show_previous_reply_history(self) -> None:
+        index = self._normalized_reply_history_index()
+        if index is None:
+            return
+        self._show_reply_history_at(index - 1)
+
+    @Slot()
+    def _show_next_reply_history(self) -> None:
+        index = self._normalized_reply_history_index()
+        if index is None:
+            return
+        self._show_reply_history_at(index + 1)
+
+    def _show_reply_history_at(self, index: int) -> None:
+        if not self._can_review_reply_history():
+            return
+        if index < 0 or index >= len(self.reply_history_segments):
+            return
+
+        segment = self.reply_history_segments[index]
+        self.reply_history_index = index
+        self.reply_history_review_active = True
+        self.portrait_controller.apply_for_segment(segment)
+        self.subtitle_controller.show_text_immediately(segment.display_text(self.subtitle_language))
+        self._log_interaction_stage(
+            "reply_history_reviewed",
+            {"index": index, "history_count": len(self.reply_history_segments)},
+        )
+        self._update_reply_history_buttons()
+
+    def _exit_reply_history_review(self, *, update_buttons: bool = True) -> None:
+        self.reply_history_review_active = False
+        if update_buttons:
+            self._update_reply_history_buttons()
+
+    def _refresh_reply_history_review_text(self) -> bool:
+        if not self.reply_history_review_active:
+            return False
+        index = self._normalized_reply_history_index()
+        if index is None:
+            return False
+        segment = self.reply_history_segments[index]
+        self.subtitle_controller.show_text_immediately(segment.display_text(self.subtitle_language))
+        return True
+
+    def _normalized_reply_history_index(self) -> int | None:
+        segments = getattr(self, "reply_history_segments", [])
+        if not segments:
+            if hasattr(self, "reply_history_index"):
+                self.reply_history_index = None
+            return None
+        if getattr(self, "reply_history_index", None) is None:
+            self.reply_history_index = len(segments) - 1
+        else:
+            self.reply_history_index = max(
+                0,
+                min(self.reply_history_index, len(segments) - 1),
+            )
+        return self.reply_history_index
+
+    def _can_review_reply_history(self) -> bool:
+        if len(getattr(self, "reply_history_segments", [])) < 2:
+            return False
+        if getattr(self, "worker_thread", None) is not None:
+            return False
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        if (
+            subtitle_controller is not None
+            and hasattr(subtitle_controller, "is_reply_sequence_active")
+            and subtitle_controller.is_reply_sequence_active()
+        ):
+            return False
+        return True
+
+    def _update_reply_history_buttons(self) -> None:
+        previous_button = getattr(self, "reply_history_previous_button", None)
+        next_button = getattr(self, "reply_history_next_button", None)
+        if previous_button is None or next_button is None:
+            return
+
+        index = self._normalized_reply_history_index()
+        can_review = self._can_review_reply_history()
+        previous_button.setEnabled(can_review and index is not None and index > 0)
+        next_button.setEnabled(
+            can_review
+            and index is not None
+            and index < len(getattr(self, "reply_history_segments", [])) - 1
+        )
 
     def _raise_foreground_controls(self) -> None:
         self.bubble.raise_()
@@ -579,6 +741,7 @@ class PetWindow(QWidget):
         self.active_interaction_id = ""
         self.active_interaction_started_at = None
         self.active_interaction_last_at = None
+        self._update_reply_history_buttons()
 
     def _mark_user_activity(self) -> None:
         self.last_user_activity_at = time.perf_counter()
@@ -721,6 +884,9 @@ class PetWindow(QWidget):
             text = MANUAL_SCREENSHOT_DEFAULT_TEXT
 
         self._set_pending_tool_action(None)
+        exit_reply_history_review = getattr(self, "_exit_reply_history_review", None)
+        if exit_reply_history_review is not None:
+            exit_reply_history_review()
         self.input_edit.clear()
         self._log_interaction_stage("input_cleared")
         self.subtitle_controller.cancel_reply_flow("......")
@@ -1631,6 +1797,9 @@ class PetWindow(QWidget):
             self.cancel_action_button.setEnabled(not busy)
         self.send_button.setText("等待" if busy else "发送")
         self._log_interaction_stage("set_busy", {"busy": busy})
+        update_reply_history_buttons = getattr(self, "_update_reply_history_buttons", None)
+        if update_reply_history_buttons is not None:
+            update_reply_history_buttons()
 
     @Slot(str)
     def set_speech(self, text: str) -> None:
@@ -1770,7 +1939,8 @@ class PetWindow(QWidget):
 
         self._apply_speech_font()
         self.subtitle_controller.set_subtitle_language(self.subtitle_language)
-        self.subtitle_controller.restart_current_segment_speech()
+        if not self._refresh_reply_history_review_text():
+            self.subtitle_controller.restart_current_segment_speech()
         if self.history_window is not None:
             self.history_window.set_subtitle_language(self.subtitle_language)
 
@@ -1923,6 +2093,8 @@ class PetWindow(QWidget):
         )
 
     def _show_reply_segments(self, segments: list[ChatSegment]) -> None:
+        self._exit_reply_history_review(update_buttons=False)
+        self._remember_reply_history_segments(segments)
         self.subtitle_controller.show_segments(segments)
 
     def _load_subtitle_language(self) -> str:
@@ -1979,6 +2151,10 @@ class PetWindow(QWidget):
 
         if profile.id != previous_character_id:
             self.messages = []
+            self.reply_history_segments = []
+            self.reply_history_index = None
+            self.reply_history_review_active = False
+            self._update_reply_history_buttons()
             self.subtitle_controller.cancel_reply_flow(profile.initial_message)
 
     def _create_history_store(self, profile: CharacterProfile) -> ChatHistoryStore:
@@ -2099,3 +2275,15 @@ def _parse_bool(value: str | None, default: bool = False) -> bool:
 
 def _format_bool(value: bool) -> str:
     return "true" if value else "false"
+
+
+def _configure_reply_history_panel(panel: QFrame) -> None:
+    panel.setObjectName("replyHistoryPanel")
+    panel.setFixedSize(REPLY_HISTORY_PANEL_WIDTH, REPLY_HISTORY_PANEL_HEIGHT)
+
+
+def _configure_reply_history_button(button: QToolButton, *, text: str, tooltip: str) -> None:
+    button.setObjectName("replyHistoryButton")
+    button.setText(text)
+    button.setFixedSize(REPLY_HISTORY_BUTTON_SIZE, REPLY_HISTORY_BUTTON_SIZE)
+    button.setToolTip(tooltip)

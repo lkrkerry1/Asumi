@@ -85,6 +85,59 @@ def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
     app.processEvents()
 
 
+def test_reply_history_controls_use_capsule_sizing() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QToolButton")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.pet_window import (
+        REPLY_HISTORY_BUTTON_SIZE,
+        REPLY_HISTORY_NEXT_SYMBOL,
+        REPLY_HISTORY_PANEL_HEIGHT,
+        REPLY_HISTORY_PANEL_WIDTH,
+        REPLY_HISTORY_PREVIOUS_SYMBOL,
+        _configure_reply_history_button,
+        _configure_reply_history_panel,
+    )
+
+    QApplication = qtwidgets.QApplication
+    QFrame = qtwidgets.QFrame
+    QToolButton = qtwidgets.QToolButton
+    app = QApplication.instance() or QApplication([])
+    panel = QFrame()
+    previous_button = QToolButton(panel)
+    next_button = QToolButton(panel)
+
+    _configure_reply_history_panel(panel)
+    _configure_reply_history_button(
+        previous_button,
+        text=REPLY_HISTORY_PREVIOUS_SYMBOL,
+        tooltip="上一条历史消息",
+    )
+    _configure_reply_history_button(
+        next_button,
+        text=REPLY_HISTORY_NEXT_SYMBOL,
+        tooltip="下一条历史消息",
+    )
+
+    assert panel.objectName() == "replyHistoryPanel"
+    assert panel.minimumWidth() == REPLY_HISTORY_PANEL_WIDTH
+    assert panel.maximumWidth() == REPLY_HISTORY_PANEL_WIDTH
+    assert panel.minimumHeight() == REPLY_HISTORY_PANEL_HEIGHT
+    assert panel.maximumHeight() == REPLY_HISTORY_PANEL_HEIGHT
+    assert previous_button.objectName() == "replyHistoryButton"
+    assert previous_button.text() == "▲"
+    assert previous_button.toolTip() == "上一条历史消息"
+    assert previous_button.minimumWidth() == REPLY_HISTORY_BUTTON_SIZE
+    assert previous_button.maximumWidth() == REPLY_HISTORY_BUTTON_SIZE
+    assert next_button.text() == "▼"
+    assert next_button.toolTip() == "下一条历史消息"
+
+    panel.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabled() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -429,9 +482,29 @@ class _DummyButton:
 class _DummySubtitleController:
     def __init__(self) -> None:
         self.cancelled_with: list[str | None] = []
+        self.active = False
+        self.segments = []
+        self.shown_immediately: list[str] = []
+        self.subtitle_languages: list[str] = []
+        self.restarted = False
 
     def cancel_reply_flow(self, placeholder_text: str | None = None) -> None:
         self.cancelled_with.append(placeholder_text)
+
+    def show_segments(self, segments):  # type: ignore[no-untyped-def]
+        self.segments.append(segments)
+
+    def show_text_immediately(self, text: str) -> None:
+        self.shown_immediately.append(text)
+
+    def is_reply_sequence_active(self) -> bool:
+        return self.active
+
+    def set_subtitle_language(self, subtitle_language: str) -> None:
+        self.subtitle_languages.append(subtitle_language)
+
+    def restart_current_segment_speech(self) -> None:
+        self.restarted = True
 
 
 def test_manual_screenshot_empty_input_sends_default_text() -> None:
@@ -593,6 +666,124 @@ def test_progress_reply_records_segments_as_separate_history_entries() -> None:
         ("assistant", "二つ目。", "第二段。"),
     ]
     assert shown and len(shown[0]) == 2
+
+
+def test_reply_history_buttons_review_segments_without_tts_or_history() -> None:
+    from app.pet_window import PetWindow, SUBTITLE_LANGUAGE_ZH
+
+    class DummyPortraitController:
+        def __init__(self) -> None:
+            self.applied: list[ChatSegment] = []
+
+        def apply_for_segment(self, segment: ChatSegment) -> None:
+            self.applied.append(segment)
+
+    class MinimalReplyHistoryWindow:
+        _remember_reply_history_segments = PetWindow._remember_reply_history_segments
+        _show_reply_segments = PetWindow._show_reply_segments
+        _show_previous_reply_history = PetWindow._show_previous_reply_history
+        _show_next_reply_history = PetWindow._show_next_reply_history
+        _show_reply_history_at = PetWindow._show_reply_history_at
+        _exit_reply_history_review = PetWindow._exit_reply_history_review
+        _normalized_reply_history_index = PetWindow._normalized_reply_history_index
+        _can_review_reply_history = PetWindow._can_review_reply_history
+        _update_reply_history_buttons = PetWindow._update_reply_history_buttons
+
+    window = MinimalReplyHistoryWindow()
+    window.reply_history_segments = []
+    window.reply_history_index = None
+    window.reply_history_review_active = False
+    window.worker_thread = None
+    window.subtitle_language = SUBTITLE_LANGUAGE_ZH
+    window.subtitle_controller = _DummySubtitleController()
+    window.portrait_controller = DummyPortraitController()
+    window.reply_history_previous_button = _DummyButton()
+    window.reply_history_next_button = _DummyButton()
+    window.messages = [{"role": "assistant", "content": "既存"}]
+    window._record_history = lambda *_args: (_ for _ in ()).throw(AssertionError("回看不应写历史"))
+    window._log_interaction_stage = lambda *_args, **_kwargs: None
+
+    first = ChatSegment("一つ目。", "中性", "第一段。", "站立待机")
+    second = ChatSegment("二つ目。", "困惑", "第二段。", "张嘴疑问")
+
+    window._show_reply_segments([first, second])
+    assert window.subtitle_controller.segments == [[first, second]]
+    assert window.reply_history_previous_button.enabled
+    assert not window.reply_history_next_button.enabled
+
+    window._show_previous_reply_history()
+    assert window.reply_history_index == 0
+    assert window.reply_history_review_active
+    assert window.subtitle_controller.shown_immediately[-1] == "第一段。"
+    assert window.portrait_controller.applied[-1] == first
+    assert window.messages == [{"role": "assistant", "content": "既存"}]
+    assert not window.reply_history_previous_button.enabled
+    assert window.reply_history_next_button.enabled
+
+    window._show_next_reply_history()
+    assert window.reply_history_index == 1
+    assert window.subtitle_controller.shown_immediately[-1] == "第二段。"
+    assert window.portrait_controller.applied[-1] == second
+
+
+def test_reply_history_buttons_disable_while_busy_or_playing() -> None:
+    from app.pet_window import PetWindow
+
+    class MinimalReplyHistoryWindow:
+        _normalized_reply_history_index = PetWindow._normalized_reply_history_index
+        _can_review_reply_history = PetWindow._can_review_reply_history
+        _update_reply_history_buttons = PetWindow._update_reply_history_buttons
+
+    window = MinimalReplyHistoryWindow()
+    window.reply_history_segments = [ChatSegment("一つ目。"), ChatSegment("二つ目。")]
+    window.reply_history_index = 1
+    window.reply_history_previous_button = _DummyButton()
+    window.reply_history_next_button = _DummyButton()
+    window.subtitle_controller = _DummySubtitleController()
+
+    window.worker_thread = object()
+    window._update_reply_history_buttons()
+    assert not window.reply_history_previous_button.enabled
+    assert not window.reply_history_next_button.enabled
+
+    window.worker_thread = None
+    window.subtitle_controller.active = True
+    window._update_reply_history_buttons()
+    assert not window.reply_history_previous_button.enabled
+    assert not window.reply_history_next_button.enabled
+
+    window.subtitle_controller.active = False
+    window._update_reply_history_buttons()
+    assert window.reply_history_previous_button.enabled
+    assert not window.reply_history_next_button.enabled
+
+
+def test_reply_history_review_text_refreshes_when_subtitle_language_changes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.pet_window as pet_window_module
+    from app.pet_window import PetWindow, SUBTITLE_LANGUAGE_ZH
+
+    class MinimalReplyHistoryWindow:
+        _toggle_chinese_subtitles = PetWindow._toggle_chinese_subtitles
+        _refresh_reply_history_review_text = PetWindow._refresh_reply_history_review_text
+        _normalized_reply_history_index = PetWindow._normalized_reply_history_index
+
+    window = MinimalReplyHistoryWindow()
+    window.env_path = Path(".env")
+    window.subtitle_language = "ja"
+    window.subtitle_controller = _DummySubtitleController()
+    window.history_window = None
+    window.reply_history_review_active = True
+    window.reply_history_index = 0
+    window.reply_history_segments = [ChatSegment("原文", "中性", "译文")]
+    window._apply_speech_font = lambda: None
+    monkeypatch.setattr(pet_window_module, "save_env_values", lambda *_args, **_kwargs: None)
+
+    window._toggle_chinese_subtitles(True)
+
+    assert window.subtitle_language == SUBTITLE_LANGUAGE_ZH
+    assert window.subtitle_controller.subtitle_languages == [SUBTITLE_LANGUAGE_ZH]
+    assert window.subtitle_controller.shown_immediately == ["译文"]
+    assert not window.subtitle_controller.restarted
 
 
 def test_screen_observation_followup_uses_last_user_message_after_progress(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -892,3 +1083,48 @@ def test_action_resolution_clears_queued_reply_batches() -> None:
             {"cleared_batch_count": 2},
         )
     ]
+
+
+def test_subtitle_controller_show_text_immediately_does_not_use_tts() -> None:
+    from app.ui.subtitle_controller import SubtitleController
+    from app.voice import VoicePlaybackController
+
+    class DummyLabel:
+        def __init__(self) -> None:
+            self.text = ""
+            self.cleared = False
+
+        def clear(self) -> None:
+            self.cleared = True
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class FailingTTS:
+        def speak(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("立即显示历史文本不应调用 TTS")
+
+        def discard_prepared(self, _handle):  # type: ignore[no-untyped-def]
+            pass
+
+    stages = []
+    label = DummyLabel()
+    controller = SubtitleController(
+        label,  # type: ignore[arg-type]
+        VoicePlaybackController(FailingTTS(), lambda *_args, **_kwargs: None),
+        "zh",
+        lambda stage, payload=None: stages.append((stage, payload)),
+        lambda _segment: None,
+        lambda: None,
+        lambda: True,
+    )
+
+    controller.show_text_immediately("  第一段。  第二段。 ")
+
+    assert label.text == "第一段。 第二段。"
+    assert controller.speech_text == "第一段。 第二段。"
+    assert controller.speech_index == len("第一段。 第二段。")
+    assert stages[-1] == (
+        "speech_text_shown_immediately",
+        {"text": "第一段。 第二段。"},
+    )
