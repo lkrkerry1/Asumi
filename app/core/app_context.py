@@ -66,6 +66,7 @@ class AppContext:
     core: CoreServices
     storage: StorageServices
     features: FeatureServices
+    startup_initializing: bool = False
 
     @property
     def api_client(self) -> OpenAICompatibleClient:

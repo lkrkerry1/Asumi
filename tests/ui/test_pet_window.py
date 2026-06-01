@@ -233,6 +233,83 @@ def test_pet_window_loads_normalized_portrait_scale_percent() -> None:
     assert MinimalWindow({"portrait_scale_percent": 180})._load_portrait_scale_percent() == 150
 
 
+def test_pet_window_locks_controls_during_startup_initialization() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    qtgui = pytest.importorskip("PySide6.QtGui")
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.core.bootstrap import build_initial_app_context
+    from app.ui.pet_window import PetWindow, STARTUP_INITIALIZING_TEXT
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _build_runtime_root_with_character(qtgui.QPixmap, qtcore.Qt)
+    context = build_initial_app_context(root)
+    window = PetWindow(context)
+
+    assert window.startup_initializing
+    assert window.speech_label.text() == STARTUP_INITIALIZING_TEXT
+    assert not window.input_edit.isEnabled()
+    assert not window.send_button.isEnabled()
+    assert not window.screenshot_button.isEnabled()
+
+    menu = window._build_menu()
+    settings_action = next(action for action in menu.actions() if action.text() == "设置")
+    quit_action = next(action for action in menu.actions() if action.text() == "退出")
+    assert not settings_action.isEnabled()
+    assert quit_action.isEnabled()
+
+    menu.deleteLater()
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_pet_window_unlocks_after_deferred_services_are_applied() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    qtgui = pytest.importorskip("PySide6.QtGui")
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.core.bootstrap import DeferredStartupServices, build_initial_app_context
+    from app.core.extensions import ExtensionRegistry
+    from app.core.plugin_manager import SakuraPluginManager
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import NullTTSProvider
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _build_runtime_root_with_character(qtgui.QPixmap, qtcore.Qt)
+    context = build_initial_app_context(root)
+    window = PetWindow(context)
+    services = DeferredStartupServices(
+        tts_provider=NullTTSProvider(),
+        tool_registry=context.tool_registry,
+        extension_registry=ExtensionRegistry(),
+        plugin_manager=SakuraPluginManager(base_dir=root),
+        mcp_settings=context.mcp_settings,
+        mcp_tool_provider=None,
+    )
+
+    window.apply_deferred_services(services)
+    app.processEvents()
+
+    assert not window.startup_initializing
+    assert window.input_edit.isEnabled()
+    assert window.send_button.isEnabled()
+    assert window.screenshot_button.isEnabled()
+    assert window.subtitle_controller.speech_text == window.character_profile.initial_message
+
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabled() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -1571,6 +1648,61 @@ def _build_minimal_proactive_window(
     window._run_event_worker = lambda event, reminder_id=None: captured_events.append(event)
     window._record_history = lambda *args: captured_history.append(args)
     return window
+
+
+def _build_runtime_root_with_character(QPixmap, Qt):  # type: ignore[no-untyped-def]
+    root = (
+        Path(__file__).resolve().parents[2]
+        / "__pycache__"
+        / "test_runtime"
+        / "pet_window_startup"
+        / uuid.uuid4().hex
+    )
+    config_dir = root / "data" / "config"
+    character_dir = root / "characters" / "demo"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    character_dir.mkdir(parents=True, exist_ok=True)
+
+    (config_dir / "api.yaml").write_text(
+        """
+llm:
+  base_url: https://api.example.com/v1
+  api_key: test-key
+  model: test-model
+tts:
+  provider: none
+  enabled: false
+""".strip(),
+        encoding="utf-8",
+    )
+    (config_dir / "characters.yaml").write_text(
+        "current_character_id: demo\n",
+        encoding="utf-8",
+    )
+    (config_dir / "system_config.yaml").write_text(
+        "ui:\n  portrait_scale_percent: 100\n",
+        encoding="utf-8",
+    )
+    (character_dir / "card.md").write_text("system prompt", encoding="utf-8")
+    portrait_path = character_dir / "portrait.png"
+    portrait = QPixmap(320, 480)
+    portrait.fill(Qt.GlobalColor.white)
+    assert portrait.save(str(portrait_path))
+    (character_dir / "character.json").write_text(
+        """
+{
+  "id": "demo",
+  "display_name": "Demo",
+  "initial_message": "hello",
+  "card": "card.md",
+  "portrait": {
+    "default": "portrait.png"
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    return root
 
 
 def _minimal_tts_settings() -> GPTSoVITSTTSSettings:

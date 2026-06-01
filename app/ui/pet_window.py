@@ -3,10 +3,11 @@ from __future__ import annotations
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import (
     QEvent,
+    QObject,
     QPoint,
     QRect,
     Qt,
@@ -110,8 +111,12 @@ from app.ui import (
 )
 from app.voice import VoicePlaybackController
 
+if TYPE_CHECKING:
+    from app.core.bootstrap import DeferredStartupServices
+
 
 REMINDER_CHECK_INTERVAL_MS = 30_000
+STARTUP_INITIALIZING_TEXT = "初始化中……"
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
@@ -138,6 +143,9 @@ class PetWindow(QWidget):
         super().__init__()
         self.context = context
         self.base_dir = context.base_dir
+        self.startup_initializing = context.startup_initializing
+        self.deferred_startup_thread: QThread | None = None
+        self.deferred_startup_worker: QObject | None = None
         self.settings_service = context.settings_service
         self.character_registry = context.character_registry
         self.character_profile = context.character_profile
@@ -209,12 +217,13 @@ class PetWindow(QWidget):
         self.reminder_timer = QTimer(self)
         self.reminder_timer.setInterval(REMINDER_CHECK_INTERVAL_MS)
         self.reminder_timer.timeout.connect(self._check_due_reminders)
-        self.reminder_timer.start()
         self.proactive_care_timer = QTimer(self)
         self.proactive_care_timer.setInterval(PROACTIVE_TIMER_POLL_INTERVAL_MS)
         self.proactive_care_timer.timeout.connect(self._check_proactive_care)
-        self._sync_proactive_care_timer()
-        QTimer.singleShot(0, self._maybe_start_memory_backfill)
+        if not self.startup_initializing:
+            self.reminder_timer.start()
+            self._sync_proactive_care_timer()
+            QTimer.singleShot(0, self._maybe_start_memory_backfill)
         debug_log(
             "PetWindow",
             "窗口运行状态初始化",
@@ -280,7 +289,12 @@ class PetWindow(QWidget):
         self.name_label = QLabel(self.character_profile.display_name, self.bubble)
         self.name_label.setObjectName("speakerName")
 
-        self.speech_label = QLabel(self.character_profile.initial_message, self.bubble)
+        initial_speech = (
+            STARTUP_INITIALIZING_TEXT
+            if self.startup_initializing
+            else self.character_profile.initial_message
+        )
+        self.speech_label = QLabel(initial_speech, self.bubble)
         self.speech_label.setObjectName("speechText")
         self.speech_label.setWordWrap(True)
         self.speech_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
@@ -410,6 +424,8 @@ class PetWindow(QWidget):
         self.portrait_controller.apply_current()
         self._create_tray_icon()
         self._move_to_default_position()
+        if getattr(self, "startup_initializing", False):
+            self._apply_startup_initializing_state()
 
         application = QApplication.instance()
         if application is not None:
@@ -702,6 +718,7 @@ class PetWindow(QWidget):
             self,
             chinese_subtitles_checked=self.subtitle_language == SUBTITLE_LANGUAGE_ZH,
             free_access_checked=self.free_access_enabled,
+            interactions_enabled=not getattr(self, "startup_initializing", False),
             on_hide=self.hide,
             on_toggle_chinese_subtitles=self._toggle_chinese_subtitles,
             on_toggle_free_access=self._toggle_free_access,
@@ -786,17 +803,23 @@ class PetWindow(QWidget):
 
     @Slot()
     def _handle_return_pressed(self) -> None:
+        if getattr(self, "startup_initializing", False):
+            return
         self._begin_interaction("return_pressed")
         self.send_message("return_pressed")
 
     @Slot()
     def _handle_send_button_clicked(self) -> None:
+        if getattr(self, "startup_initializing", False):
+            return
         self._begin_interaction("send_button_clicked")
         self.send_message("send_button_clicked")
 
     @Slot()
     def _handle_screenshot_button_clicked(self) -> None:
         self._mark_user_activity()
+        if getattr(self, "startup_initializing", False):
+            return
         if self.worker_thread is not None:
             return
         if not self.screen_observation_enabled:
@@ -878,6 +901,8 @@ class PetWindow(QWidget):
 
     @Slot()
     def send_message(self, source: str = "direct_call") -> None:
+        if getattr(self, "startup_initializing", False):
+            return
         text = self.input_edit.text().strip()
         manual_observation = self.pending_manual_screen_observation
         self._mark_user_activity()
@@ -1364,6 +1389,8 @@ class PetWindow(QWidget):
 
     @Slot()
     def _check_proactive_care(self) -> None:
+        if getattr(self, "startup_initializing", False):
+            return
         if not self._can_run_proactive_care():
             return
 
@@ -1524,6 +1551,8 @@ class PetWindow(QWidget):
             debug_log("ProactiveCare", "主动屏幕上下文批次已清空", {"reason": reason})
 
     def _run_event_worker(self, event: AgentEvent, reminder_id: str | None = None) -> None:
+        if getattr(self, "startup_initializing", False):
+            return
         if self.worker_thread is not None or self.active_reminder_id is not None or self.active_event_type:
             return
 
@@ -1689,6 +1718,8 @@ class PetWindow(QWidget):
             QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
 
     def _maybe_start_auto_memory_curation(self) -> None:
+        if getattr(self, "startup_initializing", False):
+            return
         if not self.memory_curation_settings.enabled:
             return
         if self.memory_curation_state.pending_turns() < self.memory_curation_settings.trigger_turns:
@@ -1706,6 +1737,8 @@ class PetWindow(QWidget):
         )
 
     def _maybe_start_memory_backfill(self) -> None:
+        if getattr(self, "startup_initializing", False):
+            return
         if not self.memory_curation_settings.enabled:
             return
         state = self.memory_curation_state.snapshot()
@@ -1829,17 +1862,91 @@ class PetWindow(QWidget):
             self.history_window.set_memory_save_busy(False)
         QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
 
+    @Slot(object)
+    def apply_deferred_services(self, services: "DeferredStartupServices") -> None:
+        """后台启动服务就绪后注入同一个真实主窗口。"""
+
+        self._move_tts_provider_to_ui_thread(services.tts_provider)
+        if self.mcp_tool_provider is not None and self.mcp_tool_provider is not services.mcp_tool_provider:
+            self.mcp_tool_provider.close()
+        if self.plugin_manager is not services.plugin_manager:
+            self.plugin_manager.shutdown_all()
+
+        self.retired_tts_providers.append(self.tts_provider)
+        self.tts_provider = services.tts_provider
+        self.voice_playback_controller.set_provider(services.tts_provider)
+        self.tool_registry = services.tool_registry
+        self.free_access_enabled = self.tool_registry.free_access_enabled
+        self.agent_runtime.tools = services.tool_registry
+        self.mcp_tool_provider = services.mcp_tool_provider
+        self.plugin_manager = services.plugin_manager
+        self.mcp_settings = services.mcp_settings
+
+        self.startup_initializing = False
+        self.input_edit.setPlaceholderText(f"和{self.character_profile.display_name}说点什么...")
+        self.subtitle_controller.cancel_reply_flow(self.character_profile.initial_message)
+        self._set_busy(False)
+        self.reminder_timer.start()
+        self._sync_proactive_care_timer()
+        QTimer.singleShot(0, self._maybe_start_memory_backfill)
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setContextMenu(self._build_menu())
+        debug_log(
+            "Startup",
+            "后台启动服务已注入窗口",
+            {
+                "tool_count": len(self.tool_registry.all()),
+                "mcp_enabled": self.mcp_tool_provider is not None,
+                "tts_provider": type(self.tts_provider).__name__,
+                "error_count": len(services.errors),
+            },
+        )
+        for error in services.errors:
+            print(f"[Startup] {error}")
+
+    @Slot(str)
+    def handle_deferred_startup_failed(self, error: str) -> None:
+        self.startup_initializing = False
+        self.input_edit.setPlaceholderText(f"和{self.character_profile.display_name}说点什么...")
+        self.subtitle_controller.cancel_reply_flow(f"初始化失败：{error}")
+        self._set_busy(False)
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setContextMenu(self._build_menu())
+        debug_log("Startup", "后台启动服务失败", {"error": error})
+        print(f"[Startup] 后台初始化失败：{error}")
+
+    def _move_tts_provider_to_ui_thread(self, provider: TTSProvider) -> None:
+        if not isinstance(provider, QObject):
+            return
+        application = QApplication.instance()
+        if application is None:
+            return
+        if provider.thread() == application.thread():
+            return
+        provider.moveToThread(application.thread())
+
+    def _apply_startup_initializing_state(self) -> None:
+        self.input_edit.setPlaceholderText(STARTUP_INITIALIZING_TEXT)
+        self._set_busy(True)
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setContextMenu(self._build_menu())
+
     def _set_busy(self, busy: bool) -> None:
-        self.input_edit.setEnabled(not busy)
-        self.screenshot_button.setEnabled(not busy)
-        self.send_button.setEnabled(not busy)
+        startup_initializing = getattr(self, "startup_initializing", False)
+        controls_enabled = not busy and not startup_initializing
+        self.input_edit.setEnabled(controls_enabled)
+        self.screenshot_button.setEnabled(controls_enabled)
+        self.send_button.setEnabled(controls_enabled)
         tool_confirmation_panel = getattr(self, "tool_confirmation_panel", None)
         if tool_confirmation_panel is not None:
-            tool_confirmation_panel.set_busy(busy)
+            tool_confirmation_panel.set_busy(busy or startup_initializing)
         else:
-            self.confirm_action_button.setEnabled(not busy)
-            self.cancel_action_button.setEnabled(not busy)
-        self.send_button.setText("等待" if busy else "发送")
+            self.confirm_action_button.setEnabled(controls_enabled)
+            self.cancel_action_button.setEnabled(controls_enabled)
+        if startup_initializing:
+            self.send_button.setText("初始化")
+        else:
+            self.send_button.setText("等待" if busy else "发送")
         self._log_interaction_stage("set_busy", {"busy": busy})
         update_reply_history_buttons = getattr(self, "_update_reply_history_buttons", None)
         if update_reply_history_buttons is not None:
@@ -1897,6 +2004,8 @@ class PetWindow(QWidget):
 
     @Slot()
     def show_settings(self) -> None:
+        if getattr(self, "startup_initializing", False):
+            return
         try:
             tts_settings = self.settings_service.load_tts_settings(
                 validate_enabled=False,
@@ -2133,6 +2242,8 @@ class PetWindow(QWidget):
 
     @Slot()
     def _check_due_reminders(self) -> None:
+        if getattr(self, "startup_initializing", False):
+            return
         if self.worker_thread is not None or self.active_reminder_id is not None:
             return
         try:

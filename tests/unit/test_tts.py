@@ -177,6 +177,60 @@ def test_tts_weight_switch_error_includes_endpoint_and_path(monkeypatch) -> None
     assert "bad weights" in messages[0]
 
 
+def test_gptsovits_provider_initializes_qt_player_lazily(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.voice.tts as tts_module
+
+    calls: list[str] = []
+
+    class SignalStub:
+        def connect(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    class AudioOutputStub:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            calls.append("audio")
+
+    class MediaPlayerStub:
+        class MediaStatus:
+            EndOfMedia = object()
+
+        class PlaybackState:
+            PlayingState = object()
+
+        class Error:
+            pass
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            calls.append("player")
+            self.mediaStatusChanged = SignalStub()
+            self.playbackStateChanged = SignalStub()
+            self.errorOccurred = SignalStub()
+
+        def setAudioOutput(self, _output: object) -> None:
+            pass
+
+        def setSource(self, _source: object) -> None:
+            calls.append("source")
+
+        def play(self) -> None:
+            calls.append("play")
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(tts_module, "QAudioOutput", AudioOutputStub)
+    monkeypatch.setattr(tts_module, "QMediaPlayer", MediaPlayerStub)
+
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings())
+
+    assert calls == []
+
+    provider._pending_audio.append((Path("dummy.wav"), None, None, None))
+    provider._play_next()
+
+    assert calls == ["audio", "player", "source", "play"]
+
+
 def test_voice_playback_controller_falls_back_to_subtitle_callbacks_on_tts_error() -> None:
     from app.llm.chat_reply import ChatSegment
 

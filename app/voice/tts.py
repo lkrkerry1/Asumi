@@ -257,12 +257,8 @@ class GPTSoVITSTTSProvider(QObject):
         self._weights_ready = False
         self._service_checked = False
 
-        self._audio_output = QAudioOutput(self)
-        self._player = QMediaPlayer(self)
-        self._player.setAudioOutput(self._audio_output)
-        self._player.mediaStatusChanged.connect(self._handle_media_status)
-        self._player.playbackStateChanged.connect(self._handle_playback_state)
-        self._player.errorOccurred.connect(self._handle_player_error)
+        self._audio_output: QAudioOutput | None = None
+        self._player: QMediaPlayer | None = None
         self._audio_ready.connect(self._enqueue_audio)
         self._prepared_audio_ready.connect(self._store_prepared_audio)
         self._prepared_audio_failed.connect(self._fail_prepared_audio)
@@ -811,6 +807,7 @@ class GPTSoVITSTTSProvider(QObject):
     def _play_next(self) -> None:
         if self._current_audio is not None or not self._pending_audio:
             return
+        self._ensure_player()
         (
             self._current_audio,
             self._current_started,
@@ -819,8 +816,33 @@ class GPTSoVITSTTSProvider(QObject):
         ) = self._pending_audio.pop(0)
         self._current_started_emitted = False
         debug_log("TTS", "开始播放音频", {"audio_path": self._current_audio})
+        if self._player is None:
+            self._fail_audio_playback("播放器初始化失败。")
+            return
         self._player.setSource(QUrl.fromLocalFile(str(self._current_audio)))
         self._player.play()
+
+    def _ensure_player(self) -> None:
+        if self._player is not None:
+            return
+        self._audio_output = QAudioOutput(self)
+        self._player = QMediaPlayer(self)
+        self._player.setAudioOutput(self._audio_output)
+        self._player.mediaStatusChanged.connect(self._handle_media_status)
+        self._player.playbackStateChanged.connect(self._handle_playback_state)
+        self._player.errorOccurred.connect(self._handle_player_error)
+        debug_log("TTS", "Qt 多媒体播放器已初始化")
+
+    def _fail_audio_playback(self, message: str) -> None:
+        audio_path = self._current_audio
+        on_started = self._current_started
+        on_finished = self._current_finished
+        self._reset_current_audio_state()
+        if audio_path is not None:
+            self._schedule_audio_cleanup(audio_path)
+        self._log_error(message)
+        self._started.emit(on_started)
+        self._finished.emit(on_finished)
 
     def _emit_current_started(self) -> None:
         if self._current_started_emitted:
@@ -849,6 +871,8 @@ class GPTSoVITSTTSProvider(QObject):
             self._finishing_audio = False
 
     def _release_player_source(self) -> None:
+        if self._player is None:
+            return
         self._player.stop()
         self._player.setSource(QUrl())
 
