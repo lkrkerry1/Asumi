@@ -1,7 +1,6 @@
 @echo off
 chcp 65001 > nul
-set "SCRIPT_DIR=%~dp0"
-for %%I in ("%SCRIPT_DIR%..") do set "PRJ_ROOT=%%~fI"
+set "PRJ_ROOT=%~dp0"
 set "SAKURA_PRJ_ROOT=%PRJ_ROOT%"
 
 echo ========================================
@@ -75,6 +74,6 @@ if errorlevel 1 (
 
 echo.
 echo ========================================
-echo   安装完成！双击 scripts\start.bat 启动
+echo   安装完成！双击 start.bat 启动
 echo ========================================
 pause

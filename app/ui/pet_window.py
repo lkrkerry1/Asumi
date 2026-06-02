@@ -178,7 +178,8 @@ class PetWindow(QWidget):
         self.agent_runtime.set_autonomous_screen_observation_enabled(
             self.autonomous_screen_observation_enabled
         )
-        self.free_access_enabled = self.tool_registry.free_access_enabled
+        self.free_access_enabled = self._load_free_access_enabled()
+        self.tool_registry.set_free_access_enabled(self.free_access_enabled)
         self.history_window: HistoryWindow | None = None
         self.messages: list[dict[str, Any]] = []
         self.worker_thread: QThread | None = None
@@ -2206,6 +2207,7 @@ class PetWindow(QWidget):
     def _toggle_free_access(self, checked: bool) -> None:
         self.free_access_enabled = checked
         self.tool_registry.set_free_access_enabled(checked)
+        self._save_system_config_values("ui", {"free_access_enabled": checked})
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
 
@@ -2385,6 +2387,13 @@ class PetWindow(QWidget):
             enabled = enabled and self.screen_observation_enabled
             debug_log("PetWindow", "自主屏幕观察 YAML 配置已加载", {"enabled": enabled})
             return enabled
+        return False
+
+    def _load_free_access_enabled(self) -> bool:
+        """从 system_config.yaml 加载完整访问权限设置。"""
+        system_values = self._load_system_config_values("ui")
+        if "free_access_enabled" in system_values:
+            return _parse_bool(system_values.get("free_access_enabled"), default=True)
         return False
 
     def _load_system_config_values(self, section: str) -> dict[str, Any]:

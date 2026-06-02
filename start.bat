@@ -1,7 +1,6 @@
 @echo off
 chcp 65001 > nul
-set "SCRIPT_DIR=%~dp0"
-for %%I in ("%SCRIPT_DIR%..") do set "PRJ_ROOT=%%~fI"
+set "PRJ_ROOT=%~dp0"
 set "SAKURA_PRJ_ROOT=%PRJ_ROOT%"
 
 REM ============================================================
@@ -22,7 +21,7 @@ if exist "%PRJ_ROOT%\runtime\python.exe" (
 ) else (
     where python > nul 2>&1
     if errorlevel 1 (
-        echo [错误] 未检测到 Python，请先运行 scripts\install.bat 安装依赖
+        echo [错误] 未检测到 Python，请先运行 install.bat 安装依赖
         pause
         exit /b 1
     )
