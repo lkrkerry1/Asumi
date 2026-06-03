@@ -8,41 +8,6 @@ servers:
     name_prefix: web__
     risk: low
     requires_confirmation: false
-  playwright:
-    enabled: false
-    transport: stdio
-    command: "{node}"
-    args:
-      - "{base_dir}/tools/mcp/playwright-mcp-0.0.75/cli.js"
-      - "--isolated"
-      - "--browser"
-      - "msedge"
-      - "--image-responses"
-      - "omit"
-    name_prefix: browser__
-    call_timeout: 60
-    risk: high
-    requires_confirmation: true
-    include_tools:
-      - browser_navigate
-      - browser_snapshot
-      - browser_click
-      - browser_type
-      - browser_wait_for
-      - browser_mouse_wheel
-    exclude_tools:
-      - browser_take_screenshot
-      - browser_file_upload
-      - browser_drop
-      - browser_evaluate
-      - browser_run_code_unsafe
-    tool_policies:
-      browser_snapshot:
-        risk: medium
-        requires_confirmation: false
-      browser_wait_for:
-        risk: medium
-        requires_confirmation: false
   windows:
     enabled: false
     transport: stdio

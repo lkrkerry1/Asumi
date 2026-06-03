@@ -433,6 +433,7 @@ def test_memory_store_uses_local_embedding_cache_when_available(monkeypatch) -> 
         / "revision"
     )
     snapshot.mkdir(parents=True)
+    (snapshot / "model.safetensors").write_text("fake", encoding="utf-8")
     monkeypatch.setenv("HF_HOME", str(cache_root))
     monkeypatch.delenv("SENTENCE_TRANSFORMERS_HOME", raising=False)
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
@@ -443,6 +444,30 @@ def test_memory_store_uses_local_embedding_cache_when_available(monkeypatch) -> 
     config = store.build_mem0_config()
 
     assert config["embedder"]["config"]["model_kwargs"] == {"local_files_only": True}
+
+
+def test_memory_store_ignores_incomplete_local_embedding_cache(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = _runtime_root_path("memory_incomplete_embedding_cache")
+    cache_root = root / "hf"
+    snapshot = (
+        cache_root
+        / "hub"
+        / "models--sentence-transformers--all-MiniLM-L6-v2"
+        / "snapshots"
+        / "revision"
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HF_HOME", str(cache_root))
+    monkeypatch.delenv("SENTENCE_TRANSFORMERS_HOME", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_CACHE", raising=False)
+
+    store = MemoryStore(base_dir=root)
+
+    config = store.build_mem0_config()
+
+    assert config["embedder"]["config"]["model_kwargs"] == {}
 
 
 def test_memory_store_create_update_search_and_delete() -> None:
@@ -832,7 +857,7 @@ def test_mcp_provider_skips_disabled_server() -> None:
     provider.close()
 
 
-def test_mcp_runtime_settings_enable_windows_server_override() -> None:
+def test_mcp_runtime_settings_force_disables_windows_server() -> None:
     config_path = _runtime_root_path("mcp_runtime_override") / "mcp.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
@@ -853,18 +878,18 @@ servers:
     )
 
     assert config.servers[0].name == "windows"
-    assert config.servers[0].enabled
+    assert not config.servers[0].enabled
 
 
-def test_settings_service_saves_and_loads_mcp_runtime_settings() -> None:
+def test_settings_service_saves_and_loads_windows_mcp_as_disabled() -> None:
     service = AppSettingsService(_runtime_root_path("mcp_runtime_save"))
 
     service.save_mcp_runtime_settings(MCPRuntimeSettings(windows_enabled=True))
 
-    assert service.load_mcp_runtime_settings().windows_enabled
+    assert not service.load_mcp_runtime_settings().windows_enabled
 
 
-def test_register_mcp_tools_uses_runtime_windows_mcp_override() -> None:
+def test_register_mcp_tools_skips_unavailable_windows_mcp() -> None:
     root = _runtime_root_path("mcp_register_windows_override")
     config_dir = root / "data" / "config"
     config_dir.mkdir(parents=True)
@@ -889,9 +914,8 @@ servers:
         runtime_settings=MCPRuntimeSettings(windows_enabled=True),
     )
 
-    assert provider is not None
-    assert registry.get("windows__echo") is not None
-    provider.close()
+    assert provider is None
+    assert registry.get("windows__echo") is None
 
 
 def test_mcp_provider_filters_tools_and_applies_tool_policies() -> None:

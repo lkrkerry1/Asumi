@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from PySide6.QtCore import (
     Qt,
     QThread,
     QTimer,
+    Signal,
     Slot,
 )
 from PySide6.QtGui import (
@@ -125,6 +127,8 @@ if TYPE_CHECKING:
 REMINDER_CHECK_INTERVAL_MS = 30_000
 STARTUP_INITIALIZING_TEXT = "初始化中……"
 TTS_ERROR_DISPLAY_MS = 8_000
+MEMORY_STATUS_DISPLAY_MS = 7_000
+MEMORY_STATUS_STARTUP_DELAY_MS = 1_000
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
@@ -144,6 +148,8 @@ DEFAULT_STAGE_HEIGHT = 640
 
 
 class PetWindow(QWidget):
+    memory_status_changed = Signal(str, str)
+
     def __init__(
         self,
         context: AppContext,
@@ -185,6 +191,7 @@ class PetWindow(QWidget):
         )
         self.free_access_enabled = self._load_free_access_enabled()
         self.tool_registry.set_free_access_enabled(self.free_access_enabled)
+        self.always_on_top_enabled = self._load_always_on_top_enabled()
         self.history_window: HistoryWindow | None = None
         self.messages: list[dict[str, Any]] = []
         self.worker_thread: QThread | None = None
@@ -214,6 +221,8 @@ class PetWindow(QWidget):
         self.active_reminder_text = ""
         self.active_event_type = ""
         self.active_event: AgentEvent | None = None
+        self.memory_status_message_active = False
+        self.memory_status_last_message = ""
         self.last_user_activity_at = time.perf_counter()
         self.last_proactive_care_at: float | None = None
         self.last_proactive_screen_context_at: float | None = None
@@ -254,29 +263,22 @@ class PetWindow(QWidget):
                 "reply_segment_pause_ms": self.reply_segment_pause_ms,
                 "proactive_care": self.proactive_care_settings,
                 "auto_memory": self.memory_curation_settings,
+                "always_on_top_enabled": self.always_on_top_enabled,
             },
         )
 
         self.setWindowTitle(self.character_profile.display_name)
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
+        self._apply_window_flags()
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         self.label = QLabel(self)
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.label.customContextMenuRequested.connect(self._show_context_menu)
         self.portrait_opacity_effect = QGraphicsOpacityEffect(self.label)
         self.portrait_opacity_effect.setOpacity(1.0)
         self.label.setGraphicsEffect(self.portrait_opacity_effect)
 
         self.portrait_transition_label = QLabel(self)
         self.portrait_transition_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.portrait_transition_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.portrait_transition_label.customContextMenuRequested.connect(self._show_context_menu)
         self.portrait_transition_label.hide()
         self.portrait_transition_opacity_effect = QGraphicsOpacityEffect(self.portrait_transition_label)
         self.portrait_transition_opacity_effect.setOpacity(0.0)
@@ -298,8 +300,6 @@ class PetWindow(QWidget):
 
         self.bubble = QFrame(self)
         self.bubble.setObjectName("speechBubble")
-        self.bubble.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.bubble.customContextMenuRequested.connect(self._show_context_menu)
 
         self.name_label = QLabel(self.character_profile.display_name, self.bubble)
         self.name_label.setObjectName("speakerName")
@@ -455,6 +455,8 @@ class PetWindow(QWidget):
 
         self.portrait_controller.apply_current()
         self._create_tray_icon()
+        self.memory_status_changed.connect(self._handle_memory_status_changed)
+        self._connect_memory_status_listener()
         self._move_to_default_position()
         if getattr(self, "startup_initializing", False):
             self._apply_startup_initializing_state()
@@ -547,7 +549,6 @@ class PetWindow(QWidget):
             event.accept()
             return True
         if event.button() == Qt.MouseButton.RightButton:
-            self._show_context_menu(event.position().toPoint())
             event.accept()
             return True
         return False
@@ -562,6 +563,10 @@ class PetWindow(QWidget):
     def _handle_mouse_release(self, event: QMouseEvent) -> bool:
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_offset = None
+            event.accept()
+            return True
+        if event.button() == Qt.MouseButton.RightButton:
+            self._show_context_menu(event.position().toPoint())
             event.accept()
             return True
         return False
@@ -773,10 +778,12 @@ class PetWindow(QWidget):
             self,
             chinese_subtitles_checked=self.subtitle_language == SUBTITLE_LANGUAGE_ZH,
             free_access_checked=self.free_access_enabled,
+            always_on_top_checked=self.always_on_top_enabled,
             interactions_enabled=not getattr(self, "startup_initializing", False),
             on_hide=self.hide,
             on_toggle_chinese_subtitles=self._toggle_chinese_subtitles,
             on_toggle_free_access=self._toggle_free_access,
+            on_toggle_always_on_top=self._toggle_always_on_top,
             on_show_history=self.show_history,
             on_show_settings=self.show_settings,
         )
@@ -784,6 +791,7 @@ class PetWindow(QWidget):
     def _show_context_menu(self, position: QPoint) -> None:
         _ = position
         self._build_menu().exec(QCursor.pos())
+        self._sync_native_topmost_state()
 
     def _handle_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -1954,6 +1962,11 @@ class PetWindow(QWidget):
         self.startup_initializing = False
         self.input_edit.setPlaceholderText(f"和{self.character_profile.display_name}说点什么...")
         self.subtitle_controller.cancel_reply_flow(self.character_profile.initial_message)
+        if self.memory_status_message_active:
+            QTimer.singleShot(
+                MEMORY_STATUS_STARTUP_DELAY_MS,
+                self._show_pending_memory_status_after_startup,
+            )
         self._set_busy(False)
         self.reminder_timer.start()
         self._sync_proactive_care_timer()
@@ -2065,6 +2078,79 @@ class PetWindow(QWidget):
     @Slot(str)
     def set_speech(self, text: str) -> None:
         self.subtitle_controller.set_speech(text)
+
+    def _connect_memory_status_listener(self) -> None:
+        add_listener = getattr(self.memory_store, "add_status_listener", None)
+        if not callable(add_listener):
+            return
+        try:
+            add_listener(self.memory_status_changed.emit)
+        except (TypeError, RuntimeError) as exc:
+            debug_log("Memory", "连接长期记忆状态监听失败", {"error": str(exc)})
+
+    @Slot(str, str)
+    def _handle_memory_status_changed(self, status: str, message: str) -> None:
+        message = str(message).strip()
+        if not message:
+            return
+        debug_log("Memory", "长期记忆状态变化", {"status": status, "message": message})
+        if status in {"loading", "reloading", "failed"}:
+            self._show_memory_status_message(status, message)
+            return
+        if status == "ready":
+            self._show_memory_ready_message(message)
+
+    def _show_memory_status_message(self, status: str, message: str) -> None:
+        self.memory_status_message_active = True
+        self.memory_status_last_message = message
+        if (
+            not self.startup_initializing
+            and not self.active_interaction_id
+            and not self.reply_history_review_active
+        ):
+            self.subtitle_controller.show_text_immediately(message)
+        if hasattr(self, "tray_icon") and self.tray_icon.isVisible():
+            icon = (
+                QSystemTrayIcon.MessageIcon.Critical
+                if status == "failed"
+                else QSystemTrayIcon.MessageIcon.Information
+            )
+            self.tray_icon.showMessage("Sakura 长期记忆", message, icon, MEMORY_STATUS_DISPLAY_MS)
+
+    @Slot()
+    def _show_pending_memory_status_after_startup(self) -> None:
+        if (
+            not self.memory_status_message_active
+            or self.startup_initializing
+            or self.active_interaction_id
+            or self.reply_history_review_active
+            or not self.memory_status_last_message
+        ):
+            return
+        self.subtitle_controller.show_text_immediately(self.memory_status_last_message)
+
+    def _show_memory_ready_message(self, message: str) -> None:
+        if hasattr(self, "tray_icon") and self.tray_icon.isVisible():
+            self.tray_icon.showMessage(
+                "Sakura 长期记忆",
+                message,
+                QSystemTrayIcon.MessageIcon.Information,
+                MEMORY_STATUS_DISPLAY_MS,
+            )
+        if not self.memory_status_message_active:
+            return
+        self.memory_status_message_active = False
+        if self.active_interaction_id or self.reply_history_review_active:
+            return
+        QTimer.singleShot(MEMORY_STATUS_DISPLAY_MS, self._restore_memory_status_speech)
+
+    @Slot()
+    def _restore_memory_status_speech(self) -> None:
+        if self.memory_status_message_active:
+            return
+        if self.active_interaction_id or self.reply_history_review_active:
+            return
+        self.subtitle_controller.show_text_immediately(self.character_profile.initial_message)
 
     @Slot(str)
     def _show_tts_error(self, message: str) -> None:
@@ -2326,6 +2412,25 @@ class PetWindow(QWidget):
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
 
+    @Slot(bool)
+    def _toggle_always_on_top(self, checked: bool) -> None:
+        if checked == self.always_on_top_enabled:
+            return
+        previous_enabled = self.always_on_top_enabled
+        self.always_on_top_enabled = checked
+        try:
+            self._save_system_config_values("ui", {"always_on_top_enabled": checked})
+        except OSError as exc:
+            self.always_on_top_enabled = previous_enabled
+            QMessageBox.warning(self, "保存失败", f"无法保存置顶设置：{exc}")
+            return
+
+        self._apply_window_flags()
+        if checked:
+            self.raise_()
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.setContextMenu(self._build_menu())
+
     def _create_tts_provider_from_settings(
         self,
         settings: GPTSoVITSTTSSettings,
@@ -2518,6 +2623,13 @@ class PetWindow(QWidget):
             return _parse_bool(system_values.get("free_access_enabled"), default=True)
         return False
 
+    def _load_always_on_top_enabled(self) -> bool:
+        """从 system_config.yaml 加载主窗口置顶设置，默认不置顶。"""
+        system_values = self._load_system_config_values("ui")
+        if "always_on_top_enabled" in system_values:
+            return _parse_bool(system_values.get("always_on_top_enabled"), default=False)
+        return False
+
     def _load_system_config_values(self, section: str) -> dict[str, Any]:
         return self.settings_service.load_system_values(section)
 
@@ -2527,6 +2639,37 @@ class PetWindow(QWidget):
         values: dict[str, Any],
     ) -> None:
         self.settings_service.save_system_values(section, values)
+
+    def _window_flags(self) -> Qt.WindowType:
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+        if self.always_on_top_enabled:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        return flags
+
+    def _apply_window_flags(self) -> None:
+        was_visible = self.isVisible()
+        self.setWindowFlags(self._window_flags())
+        if was_visible:
+            self.show()
+            self._sync_native_topmost_state()
+
+    def _sync_native_topmost_state(self) -> None:
+        if sys.platform != "win32" or not self.isVisible():
+            return
+        try:
+            import ctypes
+
+            hwnd = int(self.winId())
+            hwnd_topmost = -1
+            hwnd_notopmost = -2
+            swp_no_size = 0x0001
+            swp_no_move = 0x0002
+            swp_no_activate = 0x0010
+            insert_after = hwnd_topmost if self.always_on_top_enabled else hwnd_notopmost
+            flags = swp_no_size | swp_no_move | swp_no_activate
+            ctypes.windll.user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)
+        except Exception as exc:  # noqa: BLE001
+            debug_log("PetWindow", "同步原生置顶状态失败", {"error": str(exc)})
 
     def _apply_portrait_scale_percent(self, portrait_scale_percent: int) -> None:
         self.portrait_scale_percent = normalize_portrait_scale_percent(portrait_scale_percent)

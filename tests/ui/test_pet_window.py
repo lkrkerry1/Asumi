@@ -66,8 +66,10 @@ def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
     host = QWidget()
     host.subtitle_language = SUBTITLE_LANGUAGE_ZH
     host.free_access_enabled = True
+    host.always_on_top_enabled = False
     host._toggle_chinese_subtitles = lambda _checked: None
     host._toggle_free_access = lambda _checked: None
+    host._toggle_always_on_top = lambda _checked: None
     host.show_history = lambda: None
     host.show_settings = lambda: None
 
@@ -82,11 +84,52 @@ def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
     assert "自由访问权限" not in texts
     assert "显示中文字幕" in checkable_texts
     assert "完整访问权限" in checkable_texts
-    assert len(checkable_texts) == 2
+    assert "保持置顶" in checkable_texts
+    assert len(checkable_texts) == 3
 
     menu.deleteLater()
     host.deleteLater()
     app.processEvents()
+
+
+def test_pet_window_context_menu_opens_on_right_release_not_press() -> None:
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    from app.ui.pet_window import PetWindow
+
+    class MouseEventStub:
+        def __init__(self) -> None:
+            self.accepted = False
+
+        def button(self):  # type: ignore[no-untyped-def]
+            return qtcore.Qt.MouseButton.RightButton
+
+        def position(self):  # type: ignore[no-untyped-def]
+            return qtcore.QPointF(12, 24)
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    class MinimalWindow:
+        _handle_mouse_press = PetWindow._handle_mouse_press
+        _handle_mouse_release = PetWindow._handle_mouse_release
+
+        def __init__(self) -> None:
+            self.context_menu_positions: list[object] = []
+
+        def _show_context_menu(self, position) -> None:  # type: ignore[no-untyped-def]
+            self.context_menu_positions.append(position)
+
+    window = MinimalWindow()
+    press_event = MouseEventStub()
+    release_event = MouseEventStub()
+
+    assert window._handle_mouse_press(press_event) is True
+    assert press_event.accepted
+    assert window.context_menu_positions == []
+
+    assert window._handle_mouse_release(release_event) is True
+    assert release_event.accepted
+    assert window.context_menu_positions == [release_event.position().toPoint()]
 
 
 def test_reply_history_controls_use_capsule_sizing() -> None:
@@ -270,6 +313,25 @@ def test_pet_window_loads_normalized_subtitle_display_speed() -> None:
     )._load_subtitle_display_speed() == (200, 3000)
 
 
+def test_pet_window_loads_always_on_top_disabled_by_default() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _load_always_on_top_enabled = PetWindow._load_always_on_top_enabled
+
+        def __init__(self, values):  # type: ignore[no-untyped-def]
+            self.values = values
+
+        def _load_system_config_values(self, section: str):  # type: ignore[no-untyped-def]
+            assert section == "ui"
+            return self.values
+
+    assert MinimalWindow({})._load_always_on_top_enabled() is False
+    assert MinimalWindow({"always_on_top_enabled": "invalid"})._load_always_on_top_enabled() is False
+    assert MinimalWindow({"always_on_top_enabled": True})._load_always_on_top_enabled() is True
+    assert MinimalWindow({"always_on_top_enabled": "on"})._load_always_on_top_enabled() is True
+
+
 def test_pet_window_defaults_autonomous_screen_observation_to_enabled() -> None:
     from app.ui.pet_window import PetWindow
 
@@ -424,7 +486,7 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
     app.processEvents()
 
 
-def test_settings_dialog_exposes_windows_mcp_restart_setting() -> None:
+def test_settings_dialog_marks_windows_mcp_as_unavailable() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
@@ -445,18 +507,20 @@ def test_settings_dialog_exposes_windows_mcp_restart_setting() -> None:
         base_dir=root,
         **_settings_dialog_character_kwargs(root),
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
-        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=True),
     )
 
     labels = [label.text() for label in dialog.findChildren(qtwidgets.QLabel)]
 
     assert not dialog.windows_mcp_enabled_check.isChecked()
+    assert not dialog.windows_mcp_enabled_check.isEnabled()
+    assert any("待测试，未开放" in text for text in labels)
     assert any("重启 Sakura" in text for text in labels)
 
     dialog.windows_mcp_enabled_check.setChecked(True)
     dialog.accept()
 
-    assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=True)
+    assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=False)
     dialog.deleteLater()
     app.processEvents()
 
@@ -535,6 +599,11 @@ def test_settings_dialog_download_success_fills_tts_work_dir(monkeypatch) -> Non
     assert dialog.tts_enabled_check.isChecked()
     assert dialog.tts_api_url_edit.text() == "http://127.0.0.1:9880/tts"
     assert dialog.tts_work_dir_edit.text().endswith("gpt_sovits_v2pro")
+    monkeypatch.setattr(
+        dialog,
+        "_start_tts_settings_test",
+        lambda _settings, accept_values: dialog._complete_accept(accept_values),
+    )
 
     dialog.accept()
 
@@ -587,6 +656,11 @@ def test_settings_dialog_download_success_fills_genie_provider(monkeypatch) -> N
     assert dialog.tts_provider_combo.currentData() == "genie-tts"
     assert dialog.tts_api_url_edit.text() == "http://127.0.0.1:9881/"
     assert dialog.tts_work_dir_edit.text().endswith("genie_tts_server")
+    monkeypatch.setattr(
+        dialog,
+        "_start_tts_settings_test",
+        lambda _settings, accept_values: dialog._complete_accept(accept_values),
+    )
 
     dialog.accept()
 
@@ -594,6 +668,173 @@ def test_settings_dialog_download_success_fills_genie_provider(monkeypatch) -> N
     assert dialog.result_tts_settings.provider == "genie-tts"
     assert dialog.result_tts_settings.work_dir == root / "data" / "tts_bundles" / "installed" / "genie_tts_server"
     assert dialog.result_tts_settings.onnx_model_dir == root / "data" / "tts_bundles" / "onnx" / "sakura"
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_skips_tts_test_when_tts_disabled(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("tts_save_disabled")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    monkeypatch.setattr(
+        dialog,
+        "_start_tts_settings_test",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("TTS 关闭时不应检测")),
+    )
+
+    dialog.accept()
+
+    assert dialog.result_tts_settings is not None
+    assert not dialog.result_tts_settings.enabled
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_enabled_tts_saves_after_successful_test(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("tts_save_success")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    dialog.tts_enabled_check.setChecked(True)
+    calls: list[str] = []
+
+    def fake_start_tts_test(settings, accept_values):  # type: ignore[no-untyped-def]
+        calls.append(settings.api_url)
+        dialog._complete_accept(accept_values)
+
+    monkeypatch.setattr(dialog, "_start_tts_settings_test", fake_start_tts_test)
+
+    dialog.accept()
+
+    assert calls == ["http://127.0.0.1:9880/tts"]
+    assert dialog.result_tts_settings is not None
+    assert dialog.result_tts_settings.enabled
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_tts_test_failure_disables_tts_and_saves(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("tts_save_failure")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    dialog.tts_enabled_check.setChecked(True)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+
+    def fake_start_tts_test(_settings, accept_values):  # type: ignore[no-untyped-def]
+        dialog._pending_accept_values = accept_values
+        dialog._handle_tts_test_failed("服务启动失败")
+
+    monkeypatch.setattr(dialog, "_start_tts_settings_test", fake_start_tts_test)
+
+    dialog.accept()
+
+    assert warnings and "服务启动失败" in warnings[0]
+    assert not dialog.tts_enabled_check.isChecked()
+    assert dialog.result_tts_settings is not None
+    assert not dialog.result_tts_settings.enabled
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_blocks_save_while_tts_test_is_running(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("tts_save_running")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    messages: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "information",
+        lambda _parent, _title, message: messages.append(message),
+    )
+    dialog._tts_test_thread = object()  # type: ignore[assignment]
+
+    dialog.accept()
+
+    assert messages and "TTS 服务检测仍在进行" in messages[0]
+    assert dialog.result_tts_settings is None
+    dialog._tts_test_thread = None
     dialog.deleteLater()
     app.processEvents()
 
@@ -884,11 +1125,102 @@ def test_settings_dialog_loads_memory_on_open_in_background() -> None:
         memory_store=memory_store,  # type: ignore[arg-type]
     )
 
-    assert dialog.memory_status_label.text() == "正在加载长期记忆..."
+    assert dialog.memory_status_label.text() == "正在读取长期记忆..."
     assert _process_events_until(app, lambda: memory_store.list_calls == 1)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
     assert dialog.memory_status_label.text() == "已加载 1 条记忆"
     assert dialog.memory_table.item(0, 1).text() == "主人喜欢精简的管理界面"
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_memory_loader_thread_is_not_dialog_child() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class BlockingMemoryStore:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            self.started.set()
+            assert self.release.wait(2)
+            return []
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    memory_store = BlockingMemoryStore()
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    try:
+        assert memory_store.started.wait(1.5)
+        assert dialog._memory_list_thread is not None
+        assert dialog._memory_list_thread.parent() is None
+    finally:
+        memory_store.release.set()
+
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_shows_memory_dependency_download_hint() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.list_calls = 0
+
+        def needs_embedding_model_download(self) -> bool:
+            return True
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            self.list_calls += 1
+            return []
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    memory_store = MemoryStoreStub()
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    expected = "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。"
+    assert dialog.memory_status_label.text() == expected
+    assert dialog.memory_table.item(0, 1).text() == expected
+    assert _process_events_until(app, lambda: memory_store.list_calls == 1)
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    assert dialog.memory_status_label.text() == "已加载 0 条记忆"
     dialog.deleteLater()
     app.processEvents()
 
@@ -2781,6 +3113,142 @@ def test_reply_history_review_text_refreshes_when_subtitle_language_changes(monk
     assert not window.subtitle_controller.restarted
 
 
+def test_pet_window_toggle_always_on_top_saves_and_applies() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _toggle_always_on_top = PetWindow._toggle_always_on_top
+
+        def __init__(self) -> None:
+            self.always_on_top_enabled = False
+            self.saved_values: list[tuple[str, dict[str, bool]]] = []
+            self.apply_count = 0
+            self.raise_count = 0
+
+        def _save_system_config_values(self, section: str, values: dict[str, bool]) -> None:
+            self.saved_values.append((section, values))
+
+        def _apply_window_flags(self) -> None:
+            self.apply_count += 1
+
+        def raise_(self) -> None:
+            self.raise_count += 1
+
+    window = MinimalWindow()
+
+    window._toggle_always_on_top(True)
+
+    assert window.always_on_top_enabled is True
+    assert window.saved_values == [("ui", {"always_on_top_enabled": True})]
+    assert window.apply_count == 1
+    assert window.raise_count == 1
+
+    window._toggle_always_on_top(False)
+
+    assert window.always_on_top_enabled is False
+    assert window.saved_values[-1] == ("ui", {"always_on_top_enabled": False})
+    assert window.apply_count == 2
+    assert window.raise_count == 1
+
+
+def test_pet_window_apply_window_flags_syncs_native_topmost_state() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _apply_window_flags = PetWindow._apply_window_flags
+
+        def __init__(self) -> None:
+            self.visible = True
+            self.show_count = 0
+            self.sync_count = 0
+            self.applied_flags = None
+
+        def isVisible(self) -> bool:
+            return self.visible
+
+        def _window_flags(self):  # type: ignore[no-untyped-def]
+            return "flags"
+
+        def setWindowFlags(self, flags) -> None:  # type: ignore[no-untyped-def]
+            self.applied_flags = flags
+
+        def show(self) -> None:
+            self.show_count += 1
+
+        def _sync_native_topmost_state(self) -> None:
+            self.sync_count += 1
+
+    window = MinimalWindow()
+
+    window._apply_window_flags()
+
+    assert window.applied_flags == "flags"
+    assert window.show_count == 1
+    assert window.sync_count == 1
+
+
+def test_pet_window_apply_window_flags_does_not_sync_native_state_before_visible() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _apply_window_flags = PetWindow._apply_window_flags
+
+        def __init__(self) -> None:
+            self.show_count = 0
+            self.sync_count = 0
+
+        def isVisible(self) -> bool:
+            return False
+
+        def _window_flags(self):  # type: ignore[no-untyped-def]
+            return "flags"
+
+        def setWindowFlags(self, _flags) -> None:  # type: ignore[no-untyped-def]
+            return None
+
+        def show(self) -> None:
+            self.show_count += 1
+
+        def _sync_native_topmost_state(self) -> None:
+            self.sync_count += 1
+
+    window = MinimalWindow()
+
+    window._apply_window_flags()
+
+    assert window.show_count == 0
+    assert window.sync_count == 0
+
+
+def test_pet_window_context_menu_resyncs_topmost_after_menu_closes() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MenuStub:
+        def __init__(self, events: list[str]) -> None:
+            self.events = events
+
+        def exec(self, _position) -> None:  # type: ignore[no-untyped-def]
+            self.events.append("exec")
+
+    class MinimalWindow:
+        _show_context_menu = PetWindow._show_context_menu
+
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def _build_menu(self) -> MenuStub:
+            return MenuStub(self.events)
+
+        def _sync_native_topmost_state(self) -> None:
+            self.events.append("sync")
+
+    window = MinimalWindow()
+
+    window._show_context_menu(object())  # type: ignore[arg-type]
+
+    assert window.events == ["exec", "sync"]
+
+
 def test_screen_observation_followup_uses_last_user_message_after_progress(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from app.agent import AgentAction, AgentResult
     from app.llm.chat_reply import parse_chat_reply
@@ -3105,6 +3573,58 @@ def _minimal_tts_settings() -> GPTSoVITSTTSSettings:
         text_lang="ja",
         timeout_seconds=1,
     )
+
+
+def test_tts_test_worker_closes_provider_after_success(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtCore")
+    import app.ui.settings_dialog as settings_dialog
+
+    closed: list[bool] = []
+
+    class FakeProvider:
+        def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
+            self.settings = settings
+
+        def ensure_ready(self) -> tuple[bool, str]:
+            return True, "ok"
+
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(settings_dialog, "GPTSoVITSTTSProvider", FakeProvider)
+
+    worker = settings_dialog.TTSTestWorker(_minimal_tts_settings())
+    worker.run()
+
+    assert closed == [True]
+
+
+def test_tts_test_worker_emits_finished_when_provider_close_fails(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6.QtCore")
+    import app.ui.settings_dialog as settings_dialog
+
+    events: list[str] = []
+
+    class FakeProvider:
+        def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
+            self.settings = settings
+
+        def ensure_ready(self) -> tuple[bool, str]:
+            return True, "ok"
+
+        def close(self) -> None:
+            raise RuntimeError("关闭失败")
+
+    monkeypatch.setattr(settings_dialog, "GPTSoVITSTTSProvider", FakeProvider)
+
+    worker = settings_dialog.TTSTestWorker(_minimal_tts_settings())
+    worker.succeeded.connect(lambda *_args: events.append("succeeded"))
+    worker.finished.connect(lambda: events.append("finished"))
+    worker.run()
+
+    assert events == ["succeeded", "finished"]
 
 
 def _minimal_settings_window(pet_window_cls, settings_service, api_client, memory_store):  # type: ignore[no-untyped-def]

@@ -176,7 +176,7 @@ class TestBrowserRouting:
         assert _should_block_windows_tool_for_browser_page(call, browser_page_mode=True)
 
     def test_browser_page_mode_passes_non_windows_tools(self) -> None:
-        call = {"name": "browser__navigate", "arguments": {}, "reason": "导航"}
+        call = {"name": "playwright_navigate", "arguments": {}, "reason": "导航"}
         assert not _should_block_windows_tool_for_browser_page(call, browser_page_mode=True)
 
     def test_no_routing_when_both_modes_false(self) -> None:
@@ -186,13 +186,13 @@ class TestBrowserRouting:
 
     def test_browser_page_mode_filters_tools(self) -> None:
         tools = [
-            {"function": {"name": "browser__navigate"}},
+            {"function": {"name": "playwright_navigate"}},
             {"function": {"name": "windows__Click"}},
             {"function": {"name": "add_todo"}},
         ]
         result = _filter_openai_tools_for_browser_routing(tools, browser_page_mode=True, visible_browser_mode=False)
         names = {t["function"]["name"] for t in result}
-        assert "browser__navigate" in names
+        assert "playwright_navigate" in names
         assert "windows__Click" not in names
 
 

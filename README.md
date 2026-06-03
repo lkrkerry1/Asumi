@@ -18,19 +18,35 @@
 
 ## 🚀 新手教程（零基础也能用）
 
-**不需要会编程。** 只需四步，就能让你的桌宠活过来喵~
+**不需要会编程。** 推荐直接使用 **Release 里的 `0.9.3` 版本**，不要只下载 GitHub 页面上的源码压缩包。源码包缺少预置 `runtime`，新手会更容易卡在 Python 和依赖安装上喵~
 
-### 第一步：安装依赖
+> **平台提醒：** Windows 版本是当前主要测试目标。macOS 包会在 Release 中构建出来，但 **Mac 目前没有经过实际机器测试**，可能遇到权限、启动脚本或依赖问题；如果你用 Mac，请把它当作实验版本。
 
-`runtime` 文件夹自带了 Python，但依赖包还是要装一次：
+### 第一步：下载发布包
+
+打开 [Releases 页面](https://github.com/Rvosy/sakura/releases)，务必下载 `0.9.3` 及之后的版本, 之前的版本有重大BUG
+
+Release 里常见的文件含义如下：
+
+| 文件名 | 是什么 | 适合谁下载 |
+|:-:|---|---|
+| `sakura-v0.9.3-windows-x64.zip` | Windows 完整包，包含项目文件和 `runtime` | **Windows 新手首选** |
+| `runtime-windows-x64.zip` | 只有 Windows 预置 Python 运行环境 | 拉源码、缺 `runtime` 的用户 |
+
+> 如果你只是想运行桌宠，下载 `sakura-v0.9.3-windows-x64.zip` 这种 **完整包**。`runtime` 包不是完整程序，单独下载后不能直接启动。
+
+### 第二步：安装依赖
+
+解压完整包后，进入解压出来的项目目录。`runtime` 文件夹自带了 Python，但依赖包还是要装一次：
 
 - **Windows 用户：** 双击 `install.bat`，等待完成（约 5-15 分钟）。
-- **Mac / Linux 用户：** 打开终端，进入项目目录，运行 `bash scripts/install.sh`。
+- **Mac 用户：** 可尝试双击 `install.command`，或在终端进入项目目录后运行 `bash scripts/install.sh`。但 Mac 没有实机测试过，遇到问题请优先反馈日志。
+- **Linux 用户：** 当前没有正式发布包；如果从源码运行，进入项目目录后运行 `bash scripts/install.sh`。
 
-> 如果是直接拉取的源码, 需要先从Release页面下载预编译的依赖包（`runtime` 文件夹），放到项目根目录的 `runtime` 文件夹，再运行安装脚本。
-> 不管下载的是 Release 包还是 GitHub 源码，这一步都要做。装完命令行窗口会自动关闭。
+> 如果是直接拉取的源码，需要先从 Release 页面下载对应平台的预编译依赖包（`sakura-runtime-*.zip`），把里面的 `runtime` 文件夹放到项目根目录，再运行安装脚本。
+> 不管下载的是 Release 完整包还是 GitHub 源码，这一步都要做。装完命令行窗口会自动关闭。
 
-### 第二步：获取 API Key
+### 第三步：获取 API Key
 
 桌宠需要一个「AI 大脑」才能说话，你需要一个 API Key。就像给手机插 SIM 卡才能上网一样。
 
@@ -44,22 +60,36 @@
 >
 > 请选择支持视觉/多模态的模型，例如 Gemini Flash 等。
 
-### 第三步：一键启动
+### 第四步：一键启动
 
 - **Windows 用户：** 双击项目根目录的 **`start.bat`**
-- **Mac / Linux 用户：** 在终端里运行 `bash scripts/start.sh`
-
+- **Mac 用户：** 可尝试双击 `start.command`，或在终端里运行 `bash scripts/start.sh`。再次提醒：Mac 没有实机测试过。
+- **Linux 用户：** 在终端里运行 `bash scripts/start.sh`
 - **右键** 桌宠或托盘图标可以打开菜单（设置、聊天记录等）
-- 在设置里可以切换模式：聊天模式 / Agent 模式 / 静默模式等
-- 关掉窗口即可退出
 
 
-### 第四步：获取角色包
+### 第五步：获取角色包
 
 #### 获取渠道
 
-- **[Releases 页面](https://github.com/Rvosy/sakura/releases)**：在最新 Release 的 Assets 中下载角色包压缩包(暂未上传)
+暂时只有百度网盘
+
 - **[百度网盘](https://pan.baidu.com/s/5ZXvAi6n6i7-OJAYeWDpprg)**：包含所有已发布的角色包.
+
+#### 安装方式
+
+1. 下载角色包
+2. 设置页选择导入
+
+### 如何更新版本?
+
+如果你已经装过旧版，推荐按下面方式更新：
+
+1. 关闭正在运行的 Sakura。
+2. 下载同平台的最新**完整包**，例如 Windows 用户下载 `sakura-v0.9.3-windows-x64.zip`。
+3. 解压新包，把新包里的文件复制到旧 Sakura 目录，遇到同名文件选择 **覆盖/替换**。
+4. 如果启动失败, 再运行一次安装脚本：Windows 双击 `install.bat`；Mac/Linux 运行 `bash scripts/install.sh`。
+5. 启动 Sakura：Windows 双击 `start.bat`；Mac 可尝试 `start.command` 或 `bash scripts/start.sh`。
 
 
 以下内容面向想深入了解架构或做开发的用户。如果你是纯用来玩的，到这里就够啦~
@@ -69,11 +99,11 @@
 
 ## 设计思路
 
-用户的每一句话先进入 **DecisionLayer** 做路由判断：是随口聊天、是在看屏幕、还是要执行工具任务？角色表达层的回复和 Agent 层的工具执行是完全分离的——Agent 做完事情后，结果交给角色层用 Sakura 的语气转述出来，而不是直接向用户抛出一行命令行输出。
+Sakura 现在采用更直接的运行时结构：UI 负责收集用户输入、截图、确认面板和主动事件，`ChatWorker` / `ChatPipeline` 负责把这些上下文整理成一次运行请求，真正的对话决策和工具循环都交给 `AgentRuntime`。
 
-回复统一按段落组织为双语 JSON 片段（日文原文 + 中文字幕 + 语气标签），UI 对同一份结构同步驱动字幕、表情切换和 TTS 播放。
+`AgentRuntime` 直接使用 OpenAI 兼容接口的原生 `tool_calls` 协议。模型可以在同一轮对话里决定是否调用工具，工具结果会以 tool role 回填给模型，再由模型产出最终角色回复。这样不再需要额外的路由拆分模块，链路更短，也更容易保证提醒、主动关怀、工具确认后的回复都进入同一套字幕和语音播放流程。
 
-架构参考了 [KdaiP/EchoBot](https://github.com/KdaiP/EchoBot) 的「Decision - Roleplay - Agent」三层设计，将路由决策、角色表达和工具执行分离为独立层。
+最终回复仍然统一按分段 JSON 组织：每段包含日文原文、中文字幕、语气和立绘标识。UI 只消费这份结构，同步驱动字幕、表情切换和 TTS 播放；如果模型输出格式不合格，运行时会尝试一次格式修复，避免坏 JSON 直接进入界面。
 
 ## 核心功能
 
@@ -83,21 +113,21 @@
 
 - **语气联动表情和语音。** 语气同时驱动立绘切换和 TTS 参考音频选择，支持 GPT-SoVITS 权重切换。
 
-- **编排层路由决策。** `ConversationCoordinator` 先由 `DecisionLayer` 按用户意图选择路由（纯聊天 / 屏幕观察 / Agent 任务 / 确认询问 / 静默），再分发给 `RoleplayLayer`（角色表达）或 `AgentRunner`（工具执行），将决策与表达解耦。
+- **原生工具调用循环。** `AgentRuntime` 使用 OpenAI 兼容 `tool_calls` 协议执行工具，支持多步工具调用、工具结果回填、调用次数限制和最终回复格式修复。
 
-- **Agent 工具循环。** `AgentRuntime` 执行待办、提醒、笔记、记忆、浏览器、屏幕观察等工具，结果由角色表达层转述，不暴露内部实现细节。
+- **统一工具注册与权限控制。** `ToolRegistry` 统一管理内置工具、插件工具和 MCP 工具，并按工具组、能力开关、风险等级和确认策略决定是否暴露或执行。
 
 - **按需/自主屏幕观察。** 模型可在对话中请求当前屏幕截图，或自动决定是否获取屏幕信息。
 
-- **主动关怀。** 周期性根据上下文状态主动搭话，可选择附带屏幕信息。
+- **视觉观察记录。** 截图和主动屏幕观察会被整理成摘要、可见文本和关键元素，写入 `data/visual_observations/`，再作为上下文交给 Agent。
+
+- **主动关怀与提醒事件。** 周期性主动事件、提醒触发和用户确认后的动作都走同一套 `ChatPipeline -> AgentRuntime -> UI` 链路，确保回复能正常进入字幕、表情和语音播放。
 
 - **受控浏览器 + 桌面操作。** 通过 MCP Playwright / Windows MCP 工具支持浏览器和本地桌面交互。
 
 - **长期记忆与候选确认。** 长期记忆先写候选，用户确认后才写入正式记忆。支持自动记忆整理。
 
 - **MCP 扩展。** `data/config/mcp.yaml` 注册 stdio/SSE MCP Server，支持运行时开关。内置 Web 搜索 MCP Server。
-
-- **路由模式。** 支持 `auto`（自动决策）、`chat_only`（纯聊天）、`force_agent`（强制 Agent）、`quiet`（静默）、`proactive_only`（仅主动关怀）五种模式，可在设置中切换。
 
 - **历史回看与回溯、立绘缩放与动效、上下文修剪、调试日志。**
 
@@ -125,15 +155,14 @@ flowchart LR
     J --> K["AppContext"]
     K --> L["PetWindow"]
     I --> L
-    K --> O["ConversationCoordinator<br/>编排层"]
-    O --> P["DecisionLayer<br/>路由决策"]
-    P --> Q["RoleplayLayer<br/>角色表达"]
-    P --> R["AgentRunner<br/>任务执行"]
-    R --> S["AgentRuntime<br/>Agent 核心"]
+    L --> M["ChatWorker<br/>后台线程"]
+    M --> N["ChatPipeline<br/>运行管线"]
+    N --> S["AgentRuntime<br/>原生 tool_calls 循环"]
     S --> T["ToolRegistry"]
     T --> U["内置工具 + MCP 工具 + 插件工具"]
-    Q --> L
-    S --> L
+    S --> V["ChatReply<br/>分段 JSON 回复"]
+    V --> L
+    L --> W["字幕 / 立绘 / TTS"]
 ```
 
 ## 项目结构
@@ -142,18 +171,12 @@ flowchart LR
 .
 ├── main.py                             # 应用入口
 ├── app/
-│   ├── orchestration/                  # 编排层（决策路由 + 角色表达 + Agent 执行）
-│   │   ├── coordinator.py              # ConversationCoordinator 同步编排
-│   │   ├── decision.py                 # DecisionLayer LLM 路由决策
-│   │   ├── roleplay.py                 # RoleplayLayer 角色化表达
-│   │   ├── agent_runner.py             # AgentRunner Agent 执行桥接
-│   │   ├── events.py                   # 编排层事件/数据结构
-│   │   └── route_modes.py              # 路由模式定义
 │   ├── agent/                          # Agent 决策层
 │   │   ├── actions.py                  # 动作/事件/待确认数据结构
 │   │   ├── builtin_tools.py            # 内置工具（待办/提醒/笔记/记忆等）
 │   │   ├── memory.py / reminders.py    # 长期记忆 / 提醒
 │   │   ├── memory_curator.py           # 自动记忆整理（含后台 Worker）
+│   │   ├── memory_curation_worker.py   # 自动记忆整理 Qt Worker
 │   │   ├── runtime.py                  # AgentRuntime（决策/工具循环）
 │   │   ├── runtime_limits.py           # 运行时限制常量
 │   │   ├── screen_policy.py            # 屏幕观察策略
@@ -227,8 +250,8 @@ flowchart LR
 │   ├── memory/                         # 长期记忆
 │   └── visual_observations/            # 视觉观察记录
 ├── tests/                              # pytest 测试
-│   ├── unit/                           # 单元测试（配置 / LLM / 工具 / 编排等）
-│   ├── integration/                    # 集成测试（AgentCore / ChatPipeline / Coordinator）
+│   ├── unit/                           # 单元测试（配置 / LLM / 工具 / 运行时等）
+│   ├── integration/                    # 集成测试（AgentRuntime / ChatPipeline 等）
 │   └── ui/                             # UI 测试
 ├── docs/                               # 文档
 │   ├── ARCHITECTURE.md                 # 架构说明
@@ -272,7 +295,6 @@ tts:
 | `api.yaml: tts.gpt_sovits.api_url` | TTS 接口 | `http://127.0.0.1:9880/tts` |
 | `system_config.yaml: ui.subtitle_language` | 气泡语言 `ja`/`zh` | `ja` |
 | `system_config.yaml: ui.portrait_scale_percent` | 立绘缩放 | `100` |
-| `system_config.yaml: route_mode` | 路由模式 `auto`/`chat_only`/`force_agent`/`quiet`/`proactive_only` | `auto` |
 | `system_config.yaml: proactive_care.enabled` | 主动关怀 | `false` |
 | `system_config.yaml: proactive_care.check_interval_minutes` | 检查间隔 | `20` |
 | `system_config.yaml: proactive_care.cooldown_minutes` | 冷却时间 | `10` |
@@ -281,14 +303,19 @@ tts:
 | `system_config.yaml: debug.enabled` | 调试日志 | `false` |
 | `characters.yaml: current_character_id` | 当前角色 | `sakura` |
 
-> **从旧配置迁移？** 如果你还在用 `.env` 格式，参见 [MIGRATION.md](/D:/Project/sakura/docs/MIGRATION.md)。
-
 ## 测试
 
 ```powershell
 python -m pytest
 ```
+## Star History
+
+<a href="https://www.star-history.com/?repos=Rvosy%2Fsakura&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Rvosy/sakura&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Rvosy/sakura&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Rvosy/sakura&type=date&legend=top-left" />
+ </picture>
+</a>
 
 ## 许可证
-
-仓库根目录目前没有提供 `LICENSE` 文件。重新分发角色资源、模型权重或第三方运行前，请分别确认对应文件的授权。
