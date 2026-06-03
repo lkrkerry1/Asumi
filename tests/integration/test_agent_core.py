@@ -433,6 +433,7 @@ def test_memory_store_uses_local_embedding_cache_when_available(monkeypatch) -> 
         / "revision"
     )
     snapshot.mkdir(parents=True)
+    (snapshot / "model.safetensors").write_text("fake", encoding="utf-8")
     monkeypatch.setenv("HF_HOME", str(cache_root))
     monkeypatch.delenv("SENTENCE_TRANSFORMERS_HOME", raising=False)
     monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
@@ -443,6 +444,30 @@ def test_memory_store_uses_local_embedding_cache_when_available(monkeypatch) -> 
     config = store.build_mem0_config()
 
     assert config["embedder"]["config"]["model_kwargs"] == {"local_files_only": True}
+
+
+def test_memory_store_ignores_incomplete_local_embedding_cache(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    root = _runtime_root_path("memory_incomplete_embedding_cache")
+    cache_root = root / "hf"
+    snapshot = (
+        cache_root
+        / "hub"
+        / "models--sentence-transformers--all-MiniLM-L6-v2"
+        / "snapshots"
+        / "revision"
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HF_HOME", str(cache_root))
+    monkeypatch.delenv("SENTENCE_TRANSFORMERS_HOME", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_CACHE", raising=False)
+
+    store = MemoryStore(base_dir=root)
+
+    config = store.build_mem0_config()
+
+    assert config["embedder"]["config"]["model_kwargs"] == {}
 
 
 def test_memory_store_create_update_search_and_delete() -> None:

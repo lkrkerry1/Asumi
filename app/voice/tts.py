@@ -364,6 +364,7 @@ class GPTSoVITSTTSProvider(QObject):
         self._failed.connect(self._log_error)
         self._started.connect(self._run_callback)
         self._finished.connect(self._run_callback)
+        self._adopt_existing_configured_service()
 
     def speak(
         self,
@@ -702,6 +703,14 @@ class GPTSoVITSTTSProvider(QObject):
 
         deadline = time.monotonic() + max(3, min(self.settings.timeout_seconds, 30))
         while time.monotonic() < deadline:
+            exit_code = self._server_process.poll() if self._server_process is not None else None
+            if exit_code is not None:
+                log_path = _local_tts_service_log_path(self.settings.provider)
+                fail_callback(
+                    f"GPT-SoVITS 本地服务进程已退出，退出码：{exit_code}。"
+                    f"请查看启动日志：{log_path}"
+                )
+                return False
             if GPTSoVITSTTSProvider._probe_service_port(self, host, port, timeout):
                 self._service_checked = True
                 debug_log(
@@ -712,7 +721,10 @@ class GPTSoVITSTTSProvider(QObject):
                 return True
             time.sleep(0.5)
 
-        fail_callback(f"GPT-SoVITS 已尝试启动，但端口仍不可用：{self.settings.api_url}")
+        fail_callback(
+            f"GPT-SoVITS 已尝试启动，但端口仍不可用：{self.settings.api_url}。"
+            f"请查看启动日志：{_local_tts_service_log_path(self.settings.provider)}"
+        )
         return False
 
     def _adopt_existing_local_service(self, host: str, port: int) -> None:
@@ -734,6 +746,17 @@ class GPTSoVITSTTSProvider(QObject):
                 "work_dir": str(self.settings.work_dir) if self.settings.work_dir is not None else "",
             },
         )
+
+    def _adopt_existing_configured_service(self) -> None:
+        parsed_url = urlparse(self.settings.api_url)
+        host = parsed_url.hostname or "127.0.0.1"
+        try:
+            port = parsed_url.port
+        except ValueError:
+            return
+        if port is None:
+            return
+        self._adopt_existing_local_service(host, port)
 
     def _probe_service_port(self, host: str, port: int, timeout: int) -> bool:
         try:
@@ -774,20 +797,33 @@ class GPTSoVITSTTSProvider(QObject):
             return True
 
         try:
+            log_path = _local_tts_service_log_path(self.settings.provider)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             kwargs: dict[str, object] = {
                 "cwd": str(work_dir),
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL,
+                "stderr": subprocess.STDOUT,
             }
             if hasattr(subprocess, "CREATE_NO_WINDOW"):
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW")
-            self._server_process = subprocess.Popen([str(python_exe), str(api_script)], **kwargs)
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动 GPT-SoVITS：{work_dir}\n")
+                log_file.flush()
+                kwargs["stdout"] = log_file
+                self._server_process = subprocess.Popen([str(python_exe), str(api_script)], **kwargs)
         except OSError as exc:
             debug_log("TTS", "本地 GPT-SoVITS 服务启动失败", {"work_dir": str(work_dir), "error": str(exc)})
             fail_callback(f"GPT-SoVITS 服务启动失败：{exc}")
             return False
 
-        debug_log("TTS", "已启动本地 GPT-SoVITS 服务", {"work_dir": str(work_dir), "pid": self._server_process.pid})
+        debug_log(
+            "TTS",
+            "已启动本地 GPT-SoVITS 服务",
+            {
+                "work_dir": str(work_dir),
+                "pid": self._server_process.pid,
+                "log_path": str(_local_tts_service_log_path(self.settings.provider)),
+            },
+        )
         return True
 
     def _ensure_character_weights(
@@ -1795,6 +1831,13 @@ def _can_bind_local_port(host: str, port: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _local_tts_service_log_path(provider: str) -> Path:
+    """返回本地 TTS 子进程启动日志路径。"""
+
+    safe_provider = re.sub(r"[^A-Za-z0-9_.-]+", "-", provider.strip().lower()) or "tts"
+    return Path.cwd() / "data" / "logs" / f"{safe_provider}-service.log"
 
 
 def _resolve_path(path_text: str, base_dir: Path) -> Path:

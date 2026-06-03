@@ -261,11 +261,35 @@ def test_genie_service_probe_adopts_existing_local_process_when_port_is_ready(mo
     assert provider._server_process.pid == 41608
 
 
+def test_tts_provider_adopts_existing_local_process_on_init(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    work_dir = _runtime_root("gptsovits_adopt_init") / "gpt-sovits"
+
+    class FakeAttachedProcess:
+        pid = 24680
+
+        def poll(self) -> None:
+            return None
+
+    attached = FakeAttachedProcess()
+
+    def fake_find_process(settings, port):  # type: ignore[no-untyped-def]
+        assert settings.work_dir == work_dir
+        assert port == 9880
+        return attached
+
+    monkeypatch.setattr("app.voice.tts._find_running_local_tts_process", fake_find_process)
+
+    provider = GPTSoVITSTTSProvider(_minimal_tts_settings(work_dir=work_dir))
+
+    assert provider._server_process is attached
+
+
 def test_tts_service_probe_starts_local_gptsovits_when_port_is_down(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     work_dir = _runtime_root("gptsovits_start") / "gpt-sovits"
     (work_dir / "runtime").mkdir(parents=True)
     (work_dir / "runtime" / "python.exe").write_text("fake", encoding="utf-8")
     (work_dir / "api_v2.py").write_text("fake", encoding="utf-8")
+    monkeypatch.chdir(work_dir.parent)
     provider = types.SimpleNamespace()
     provider.settings = _minimal_tts_settings(work_dir=work_dir)
     provider._service_checked = False
@@ -305,6 +329,7 @@ def test_tts_service_probe_starts_local_gptsovits_when_port_is_down(monkeypatch)
     assert messages == []
     assert len(popen_calls) == 1
     assert popen_calls[0] == [str(work_dir / "runtime" / "python.exe"), str(work_dir / "api_v2.py")]
+    assert (work_dir.parent / "data" / "logs" / "gpt-sovits-service.log").is_file()
 
 
 def test_tts_service_probe_reports_missing_local_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
