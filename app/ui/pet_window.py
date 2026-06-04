@@ -11,6 +11,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QRect,
+    QSize,
     Qt,
     QThread,
     QTimer,
@@ -135,6 +136,9 @@ MEMORY_STATUS_STARTUP_DELAY_MS = 1_000
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
+_UI_ASSETS_DIR = Path(__file__).with_name("assets")
+_SCREENSHOT_ICON_PATH = _UI_ASSETS_DIR / "screenshot-select.svg"
+_SCREENSHOT_ATTACHED_ICON_PATH = _UI_ASSETS_DIR / "screenshot-attached.svg"
 PROACTIVE_RECENT_CONVERSATION_LIMIT = 12
 PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT = 800
 PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT = (
@@ -220,6 +224,7 @@ class PetWindow(QWidget):
         self.pending_screen_observation_event_reminder_id: str | None = None
         self.pending_visual_observation_jobs: list[VisualObservationJob] = []
         self.pending_event_visual_observation_jobs: list[VisualObservationJob] = []
+        self.plugin_chat_ui_widget_instances: list[QWidget] = []
         self.hidden_to_tray = False
         self.screen_observation_followup_in_progress = False
         self.active_reminder_id: str | None = None
@@ -420,9 +425,11 @@ class PetWindow(QWidget):
         self.send_button.setFixedHeight(38)
         self.send_button.clicked.connect(self._handle_send_button_clicked)
 
-        self.screenshot_button = QPushButton("截图", self.input_bar)
+        self.screenshot_button = QToolButton(self.input_bar)
         self.screenshot_button.setObjectName("screenshotButton")
-        self.screenshot_button.setFixedHeight(38)
+        self.screenshot_button.setFixedSize(38, 38)
+        self.screenshot_button.setIcon(QIcon(str(_SCREENSHOT_ICON_PATH)))
+        self.screenshot_button.setIconSize(QSize(18, 18))
         self.screenshot_button.setProperty("screenshotAttached", False)
         self.screenshot_button.setToolTip("框选截图并附加到下一条消息；右键清除")
         self.screenshot_button.installEventFilter(self)
@@ -444,6 +451,7 @@ class PetWindow(QWidget):
         input_layout.addWidget(self.screenshot_button)
         input_layout.addWidget(self.send_button)
         self.input_bar.setLayout(input_layout)
+        self._sync_plugin_chat_ui_widgets()
 
         self._apply_theme_settings(self.theme_settings)
         self._apply_fonts()
@@ -1003,7 +1011,9 @@ class PetWindow(QWidget):
 
     def _update_manual_screenshot_button(self) -> None:
         attached = self.pending_manual_screen_observation is not None
-        self.screenshot_button.setText("截图✓" if attached else "截图")
+        self.screenshot_button.setText("")
+        icon_path = _SCREENSHOT_ATTACHED_ICON_PATH if attached else _SCREENSHOT_ICON_PATH
+        self.screenshot_button.setIcon(QIcon(str(icon_path)))
         self.screenshot_button.setProperty("screenshotAttached", attached)
         self.screenshot_button.style().unpolish(self.screenshot_button)
         self.screenshot_button.style().polish(self.screenshot_button)
@@ -1999,8 +2009,10 @@ class PetWindow(QWidget):
         self.tool_registry = services.tool_registry
         self.free_access_enabled = self.tool_registry.free_access_enabled
         self.agent_runtime.tools = services.tool_registry
+        self.agent_runtime.set_prompt_patches(services.plugin_manager.prompt_patches)
         self.mcp_tool_provider = services.mcp_tool_provider
         self.plugin_manager = services.plugin_manager
+        self._sync_plugin_chat_ui_widgets()
         self.mcp_settings = services.mcp_settings
 
         self.startup_initializing = False
@@ -2042,6 +2054,29 @@ class PetWindow(QWidget):
             self.tray_icon.setContextMenu(self._build_menu())
         debug_log("Startup", "后台启动服务失败", {"error": error})
         print(f"[Startup] 后台初始化失败：{error}")
+
+    def _sync_plugin_chat_ui_widgets(self) -> None:
+        layout = self.input_bar.layout() if hasattr(self, "input_bar") else None
+        if layout is None:
+            return
+        for widget in getattr(self, "plugin_chat_ui_widget_instances", []):
+            layout.removeWidget(widget)
+            widget.setParent(None)
+            widget.deleteLater()
+        self.plugin_chat_ui_widget_instances = []
+
+        contributions = getattr(self.plugin_manager, "chat_ui_widgets", [])
+        for index, contribution in enumerate(sorted(contributions, key=lambda item: item.order)):
+            try:
+                widget = contribution.build(self.input_bar)
+            except Exception as exc:
+                widget = QLabel(f"{contribution.widget_id} 加载失败：{exc}", self.input_bar)
+                widget.setObjectName("pluginChatWidgetError")
+                widget.setToolTip(str(exc))
+            if not isinstance(widget, QWidget):
+                continue
+            layout.insertWidget(1 + index, widget)
+            self.plugin_chat_ui_widget_instances.append(widget)
 
     def _move_tts_provider_to_ui_thread(self, provider: TTSProvider) -> None:
         if not isinstance(provider, QObject):
@@ -2303,7 +2338,8 @@ class PetWindow(QWidget):
             self.mcp_settings,
             self.debug_log_settings,
             self.memory_store,
-            self.plugin_manager.tools_tabs,
+            getattr(self.plugin_manager, "tools_tabs", []),
+            getattr(self.plugin_manager, "settings_panels", []),
             parent=self,
             portrait_scale_percent=self.portrait_scale_percent,
             subtitle_typing_interval_ms=self.subtitle_typing_interval_ms,
@@ -2424,6 +2460,8 @@ class PetWindow(QWidget):
             message += "\n\n长期记忆系统正在后台刷新 API 配置。"
         if mcp_restart_required:
             message += "\n\nWindows MCP 开关需要重启 Sakura 后才会生效。"
+        if getattr(dialog, "result_plugin_config_changed", False):
+            message += "\n\n插件启用状态需要重启 Sakura 后才会生效。"
         QMessageBox.information(self, "保存成功", message)
 
     @Slot(bool)
@@ -3098,6 +3136,7 @@ def _configure_reply_history_button(button: QToolButton, *, text: str, tooltip: 
     button.setText(text)
     button.setFixedSize(REPLY_HISTORY_BUTTON_SIZE, REPLY_HISTORY_BUTTON_SIZE)
     button.setToolTip(tooltip)
+    button.setAutoRaise(False)
 
 
 def _build_status_tray_icon(color_text: str) -> QIcon:

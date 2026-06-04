@@ -15,7 +15,7 @@ from app.config.settings_service import DebugLogSettings
 from app.llm.api_client import ApiSettings
 from app.llm.chat_reply import ChatSegment
 from app.ui.portrait_utils import portrait_kind_key, should_crossfade_portrait
-from app.ui.theme import DEFAULT_THEME_SETTINGS, ThemeSettings
+from app.ui.theme import DEFAULT_THEME_SETTINGS, ThemeSettings, build_pet_window_stylesheet
 from app.agent.proactive_care import ProactiveCareSettings
 from app.agent.screen_observation import ScreenObservation
 from app.voice.tts import GPTSoVITSTTSSettings
@@ -91,6 +91,12 @@ def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
     assert "完整访问权限" in checkable_texts
     assert "保持置顶" in checkable_texts
     assert len(checkable_texts) == 3
+    stylesheet = build_pet_window_stylesheet(DEFAULT_THEME_SETTINGS)
+    assert "QMenu {" in stylesheet
+    assert "QMenu::item:selected" in stylesheet
+    assert "QMenu::separator" in stylesheet
+    assert "QMenu::indicator:checked" in stylesheet
+    assert "menu-check.svg" in stylesheet
 
     menu.deleteLater()
     host.deleteLater()
@@ -322,8 +328,16 @@ def test_reply_history_controls_use_capsule_sizing() -> None:
     assert previous_button.toolTip() == "上一条历史消息"
     assert previous_button.minimumWidth() == REPLY_HISTORY_BUTTON_SIZE
     assert previous_button.maximumWidth() == REPLY_HISTORY_BUTTON_SIZE
+    assert not previous_button.autoRaise()
     assert next_button.text() == "▼"
     assert next_button.toolTip() == "下一条历史消息"
+    assert not next_button.autoRaise()
+    stylesheet = build_pet_window_stylesheet(DEFAULT_THEME_SETTINGS)
+    hover_start = stylesheet.index("#replyHistoryButton:hover")
+    hover_end = stylesheet.index("#replyHistoryButton:disabled")
+    hover_stylesheet = stylesheet[hover_start:hover_end]
+    assert "background: transparent" in hover_stylesheet
+    assert f"color: {DEFAULT_THEME_SETTINGS.accent_color}" in hover_stylesheet
 
     panel.deleteLater()
     app.processEvents()
@@ -516,6 +530,10 @@ def test_pet_window_locks_controls_during_startup_initialization(monkeypatch) ->
     assert not window.input_edit.isEnabled()
     assert not window.send_button.isEnabled()
     assert not window.screenshot_button.isEnabled()
+    assert window.screenshot_button.text() == ""
+    assert window.screenshot_button.minimumWidth() == 38
+    assert window.screenshot_button.maximumWidth() == 38
+    assert not window.screenshot_button.icon().isNull()
 
     menu = window._build_menu()
     settings_action = next(action for action in menu.actions() if action.text() == "设置")
@@ -630,6 +648,278 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
     app.processEvents()
 
 
+def test_settings_dialog_disables_tts_settings_when_tts_disabled() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("tts_disabled_controls")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+
+    controlled_widgets = (
+        dialog.tts_provider_combo,
+        dialog.tts_api_url_edit,
+        dialog.tts_work_dir_edit,
+        dialog.tts_python_path_edit,
+        dialog.tts_config_path_edit,
+        dialog.ref_lang_edit,
+        dialog.text_lang_edit,
+        dialog.tts_timeout_spin,
+    )
+    assert all(not widget.isEnabled() for widget in controlled_widgets)
+    assert dialog.tts_bundle_download_button.isEnabled()
+
+    dialog.tts_enabled_check.setChecked(True)
+    app.processEvents()
+    assert dialog.tts_provider_combo.isEnabled()
+    assert all(
+        not widget.isEnabled()
+        for widget in (
+            dialog.tts_api_url_edit,
+            dialog.tts_work_dir_edit,
+            dialog.tts_python_path_edit,
+            dialog.tts_config_path_edit,
+        )
+    )
+    assert dialog.ref_lang_edit.isEnabled()
+    assert dialog.text_lang_edit.isEnabled()
+    assert dialog.tts_timeout_spin.isEnabled()
+    assert dialog.tts_bundle_download_button.isEnabled()
+
+    dialog.tts_enabled_check.setChecked(False)
+    app.processEvents()
+    assert all(not widget.isEnabled() for widget in controlled_widgets)
+    assert dialog.tts_bundle_download_button.isEnabled()
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_adds_plugin_settings_panel() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QLabel", "QTabWidget")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+    from sdk.types import SettingsPanelContribution
+
+    QApplication = qtwidgets.QApplication
+    QLabel = qtwidgets.QLabel
+    QTabWidget = qtwidgets.QTabWidget
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        settings_panel_contributions=[
+            SettingsPanelContribution(
+                section_id="demo",
+                title="Demo 插件",
+                build=lambda parent=None: QLabel("插件设置", parent),
+            )
+        ],
+    )
+
+    tabs = dialog.findChild(QTabWidget)
+    assert tabs is not None
+    assert "插件" in [tabs.tabText(index) for index in range(tabs.count())]
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_manages_plugin_enabled_state() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTabWidget", "QTableWidget", "QCheckBox")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.plugins.discovery import PluginDiscovery
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    QTableWidget = qtwidgets.QTableWidget
+    QCheckBox = qtwidgets.QCheckBox
+    Qt = qtcore.Qt
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("plugin_manager_dialog")
+    plugin_dir = root / "plugins" / "demo"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        """
+api_version: 1
+id: demo
+name: Demo 插件
+description: 用于测试插件管理页。
+version: 1.0.0
+entry: plugin:DemoPlugin
+enabled: true
+priority: 10
+""".strip(),
+        encoding="utf-8",
+    )
+
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+
+    table = dialog.findChild(QTableWidget, "pluginManagerTable")
+    assert table is not None
+    assert table.rowCount() == 1
+    assert table.item(0, 1).text() == "Demo 插件"
+    assert table.item(0, 5).text() == "用于测试插件管理页。"
+
+    checkbox = table.cellWidget(0, 0).findChild(QCheckBox)
+    assert checkbox is not None
+    checkbox.setCheckState(Qt.CheckState.Unchecked)
+    dialog.accept()
+
+    specs = PluginDiscovery(root).discover()
+    assert specs[0].plugin_id == "demo"
+    assert specs[0].enabled is False
+    assert dialog.result_plugin_config_changed is True
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTabWidget")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    QTabWidget = qtwidgets.QTabWidget
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("grouped_settings_tabs")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+
+    tabs = dialog.findChild(QTabWidget)
+    assert tabs is not None
+    assert [tabs.tabText(index) for index in range(tabs.count())] == [
+        "角色与外观",
+        "模型与语音",
+        "权限与工具",
+        "插件",
+        "系统",
+    ]
+    assert dialog.minimumWidth() >= 680
+    assert dialog.minimumHeight() >= 500
+    assert dialog.width() >= 820
+    assert dialog.height() >= 640
+    assert "QWidget#settingsScrollViewport" in dialog.styleSheet()
+    assert "QWidget#settingsPluginTab" in dialog.styleSheet()
+    assert "QComboBox::drop-down" in dialog.styleSheet()
+    assert "QComboBox::down-arrow" in dialog.styleSheet()
+    assert "QComboBox QAbstractItemView" in dialog.styleSheet()
+    assert "QComboBox QAbstractItemView::item:selected" in dialog.styleSheet()
+    assert "QComboBox QAbstractItemView::item:selected:!active" in dialog.styleSheet()
+    assert "QSpinBox::up-button" in dialog.styleSheet()
+    assert "QSpinBox::down-button" in dialog.styleSheet()
+    assert "QLineEdit:disabled" in dialog.styleSheet()
+    assert 'QLineEdit[readOnly="true"]' in dialog.styleSheet()
+    assert "QComboBox:disabled" in dialog.styleSheet()
+    assert "QSpinBox::up-button:disabled" in dialog.styleSheet()
+    assert "QGroupBox QWidget" not in dialog.styleSheet()
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_pet_window_syncs_plugin_chat_ui_widgets() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QHBoxLayout", "QLineEdit", "QPushButton")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.pet_window import PetWindow
+    from sdk.types import ChatUIWidgetContribution
+
+    QApplication = qtwidgets.QApplication
+    QFrame = qtwidgets.QFrame
+    QHBoxLayout = qtwidgets.QHBoxLayout
+    QLineEdit = qtwidgets.QLineEdit
+    QPushButton = qtwidgets.QPushButton
+    app = QApplication.instance() or QApplication([])
+
+    def build_button(parent=None):  # type: ignore[no-untyped-def]
+        button = QPushButton("插件", parent)
+        button.setObjectName("demoPluginButton")
+        return button
+
+    class PluginManagerStub:
+        chat_ui_widgets = [
+            ChatUIWidgetContribution(
+                widget_id="demo_widget",
+                build=build_button,
+                order=10,
+            )
+        ]
+
+    host = QFrame()
+    host.input_bar = QFrame(host)
+    host.input_edit = QLineEdit(host.input_bar)
+    host.plugin_manager = PluginManagerStub()
+    host.plugin_chat_ui_widget_instances = []
+
+    layout = QHBoxLayout()
+    layout.addWidget(host.input_edit)
+    layout.addWidget(QPushButton("截图", host.input_bar))
+    layout.addWidget(QPushButton("发送", host.input_bar))
+    host.input_bar.setLayout(layout)
+
+    PetWindow._sync_plugin_chat_ui_widgets(host)  # type: ignore[arg-type]
+
+    assert layout.itemAt(1).widget().objectName() == "demoPluginButton"
+
+    host.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_marks_windows_mcp_as_unavailable() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -669,17 +959,24 @@ def test_settings_dialog_marks_windows_mcp_as_unavailable() -> None:
     app.processEvents()
 
 
-def test_settings_dialog_exposes_tts_bundle_controls() -> None:
+def test_settings_dialog_exposes_tts_bundle_controls(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
+    import app.ui.settings_dialog as settings_dialog_module
     from app.ui.settings_dialog import SettingsDialog
 
     QApplication = qtwidgets.QApplication
     app = QApplication.instance() or QApplication([])
-    root = _ui_runtime_root("mcp_restart_dialog")
+    root = _ui_runtime_root("tts_bundle_controls")
+    bundle_work_dir = root / "tts" / "gpt"
+    monkeypatch.setattr(
+        settings_dialog_module,
+        "default_provider_bundle_work_dir",
+        lambda _provider, _base_dir: bundle_work_dir,
+    )
     dialog = SettingsDialog(
         api_settings=ApiSettings(
             base_url="https://api.example.com/v1",
@@ -703,8 +1000,38 @@ def test_settings_dialog_exposes_tts_bundle_controls() -> None:
     assert custom_index >= 0
     assert "macOS/Linux" in dialog.tts_provider_combo.itemText(custom_index)
     assert dialog.tts_bundle_download_button.text() == "一键下载 TTS 整合包"
+    assert not dialog.tts_provider_combo.isEnabled()
+    assert dialog.tts_bundle_download_button.isEnabled()
+    dialog.tts_enabled_check.setChecked(True)
+    app.processEvents()
+    assert dialog.tts_provider_combo.isEnabled()
+    bundled_edits = (
+        dialog.tts_api_url_edit,
+        dialog.tts_work_dir_edit,
+        dialog.tts_python_path_edit,
+        dialog.tts_config_path_edit,
+    )
+    assert all(edit.isReadOnly() for edit in bundled_edits)
+    assert all(not edit.isEnabled() for edit in bundled_edits)
+    assert all(edit.text().strip() for edit in bundled_edits)
+    assert dialog.tts_api_url_edit.text() == "http://127.0.0.1:9880/tts"
+    assert dialog.tts_work_dir_edit.text().endswith(("tts\\gpt", "tts/gpt", "tts\\g50", "tts/g50"))
+    assert dialog.tts_python_path_edit.text().endswith(("runtime\\python.exe", "runtime/python.exe"))
+    assert dialog.tts_config_path_edit.text().endswith((
+        "GPT_SoVITS\\configs\\tts_infer.yaml",
+        "GPT_SoVITS/configs/tts_infer.yaml",
+    ))
+    for edit in bundled_edits:
+        label = dialog._tts_form_layout.labelForField(edit)
+        assert label is not None
+        assert label.isEnabled()
+    settings = dialog._validated_tts_settings()
+    assert settings is not None
+    assert settings.python_path is None
+    assert settings.tts_config_path is None
     dialog.tts_provider_combo.setCurrentIndex(custom_index)
     app.processEvents()
+    assert all(edit.isEnabled() for edit in bundled_edits)
     assert not dialog.tts_python_path_edit.isReadOnly()
     assert not dialog.tts_config_path_edit.isReadOnly()
     dialog.deleteLater()
@@ -2957,7 +3284,6 @@ def test_settings_dialog_returns_theme_settings() -> None:
     dialog.theme_color_edits["input_background_color"].setText("#ffffff")
     dialog.theme_color_edits["bubble_background_color"].setText("#dddddd")
     dialog.theme_color_edits["border_color"].setText("#cccccc")
-    dialog.theme_ai_enabled_check.setChecked(True)
     dialog.accept()
 
     assert dialog.result_theme_settings == ThemeSettings(
@@ -2972,7 +3298,7 @@ def test_settings_dialog_returns_theme_settings() -> None:
         input_background_color="#ffffff",
         bubble_background_color="#dddddd",
         border_color="#cccccc",
-        ai_enabled=True,
+        ai_enabled=False,
     )
     dialog.deleteLater()
     app.processEvents()
@@ -3015,7 +3341,7 @@ def test_settings_dialog_resets_default_theme_colors() -> None:
     assert dialog.theme_accent_edit.text() == DEFAULT_THEME_SETTINGS.accent_color
     assert dialog.theme_text_edit.text() == DEFAULT_THEME_SETTINGS.text_color
     assert dialog.theme_color_edits["input_background_color"].text() == DEFAULT_THEME_SETTINGS.input_background_color
-    assert dialog.theme_ai_enabled_check.isChecked()
+    assert dialog._selected_theme_settings() == ThemeSettings(ai_enabled=True).normalized()
     dialog.deleteLater()
     app.processEvents()
 
