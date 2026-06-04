@@ -540,13 +540,31 @@ def _normalize_scope_id(scope_id: str | None) -> str:
 def _local_embedding_model_kwargs(model_name: str, base_dir: Path | None = None) -> dict[str, Any]:
     """本地已有 HuggingFace 缓存时禁止联网探测，避免设置页反复卡顿。"""
 
-    if _embedding_model_cached(model_name, base_dir):
-        return {"local_files_only": True}
-    return {}
+    cache_folder = _embedding_model_cache_folder(model_name, base_dir)
+    if cache_folder is None:
+        return {}
+    return {"cache_folder": str(cache_folder), "local_files_only": True}
 
 
 def _embedding_model_cached(model_name: str, base_dir: Path | None = None) -> bool:
     """判断本地是否已有完整嵌入模型缓存，避免半下载缓存触发离线加载失败。"""
+
+    return _embedding_model_cache_folder(model_name, base_dir) is not None
+
+
+def _embedding_model_cache_folder(model_name: str, base_dir: Path | None = None) -> Path | None:
+    """返回已命中的 HuggingFace 缓存根目录，供 SentenceTransformer 离线加载复用。"""
+
+    model_cache_name = "models--" + model_name.replace("/", "--")
+    for root in _embedding_model_cache_candidates(base_dir):
+        snapshot_dir = root / model_cache_name / "snapshots"
+        if _hub_snapshot_has_model_weights(snapshot_dir):
+            return root
+    return None
+
+
+def _embedding_model_cache_candidates(base_dir: Path | None = None) -> list[Path]:
+    """按加载优先级列出可能包含 hub 模型快照的缓存目录。"""
 
     cache_root = (
         os.environ.get("SENTENCE_TRANSFORMERS_HOME")
@@ -554,21 +572,23 @@ def _embedding_model_cached(model_name: str, base_dir: Path | None = None) -> bo
         or os.environ.get("TRANSFORMERS_CACHE")
     )
     cache_candidates: list[Path] = []
+
+    def add_candidate(path: Path) -> None:
+        candidate = path.expanduser()
+        if candidate not in cache_candidates:
+            cache_candidates.append(candidate)
+
     if cache_root:
         cache_path = Path(cache_root)
-        cache_candidates.extend([cache_path, cache_path / "hub"])
+        add_candidate(cache_path)
+        add_candidate(cache_path / "hub")
     if base_dir is not None:
         runtime_cache = Path(base_dir) / "runtime" / "hf-cache"
-        cache_candidates.extend([runtime_cache, runtime_cache / "hub"])
+        add_candidate(runtime_cache)
+        add_candidate(runtime_cache / "hub")
     default_hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    cache_candidates.append(default_hf_home / "hub")
-
-    model_cache_name = "models--" + model_name.replace("/", "--")
-    for root in cache_candidates:
-        snapshot_dir = root / model_cache_name / "snapshots"
-        if _hub_snapshot_has_model_weights(snapshot_dir):
-            return True
-    return False
+    add_candidate(default_hf_home / "hub")
+    return cache_candidates
 
 
 def _hub_snapshot_has_model_weights(snapshot_dir: Path) -> bool:
