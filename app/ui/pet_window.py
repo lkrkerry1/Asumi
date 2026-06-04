@@ -11,6 +11,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QRect,
+    QSize,
     Qt,
     QThread,
     QTimer,
@@ -133,6 +134,9 @@ MEMORY_STATUS_STARTUP_DELAY_MS = 1_000
 SUBTITLE_LANGUAGE_JA = "ja"
 SUBTITLE_LANGUAGE_ZH = "zh"
 MANUAL_SCREENSHOT_DEFAULT_TEXT = "请根据我框选的截图继续对话。"
+_UI_ASSETS_DIR = Path(__file__).with_name("assets")
+_SCREENSHOT_ICON_PATH = _UI_ASSETS_DIR / "screenshot-select.svg"
+_SCREENSHOT_ATTACHED_ICON_PATH = _UI_ASSETS_DIR / "screenshot-attached.svg"
 PROACTIVE_RECENT_CONVERSATION_LIMIT = 12
 PROACTIVE_RECENT_CONVERSATION_CONTENT_LIMIT = 800
 PROACTIVE_RECENT_CONVERSATION_SUMMARY_HINT = (
@@ -418,9 +422,11 @@ class PetWindow(QWidget):
         self.send_button.setFixedHeight(38)
         self.send_button.clicked.connect(self._handle_send_button_clicked)
 
-        self.screenshot_button = QPushButton("截图", self.input_bar)
+        self.screenshot_button = QToolButton(self.input_bar)
         self.screenshot_button.setObjectName("screenshotButton")
-        self.screenshot_button.setFixedHeight(38)
+        self.screenshot_button.setFixedSize(38, 38)
+        self.screenshot_button.setIcon(QIcon(str(_SCREENSHOT_ICON_PATH)))
+        self.screenshot_button.setIconSize(QSize(18, 18))
         self.screenshot_button.setProperty("screenshotAttached", False)
         self.screenshot_button.setToolTip("框选截图并附加到下一条消息；右键清除")
         self.screenshot_button.installEventFilter(self)
@@ -963,7 +969,9 @@ class PetWindow(QWidget):
 
     def _update_manual_screenshot_button(self) -> None:
         attached = self.pending_manual_screen_observation is not None
-        self.screenshot_button.setText("截图✓" if attached else "截图")
+        self.screenshot_button.setText("")
+        icon_path = _SCREENSHOT_ATTACHED_ICON_PATH if attached else _SCREENSHOT_ICON_PATH
+        self.screenshot_button.setIcon(QIcon(str(icon_path)))
         self.screenshot_button.setProperty("screenshotAttached", attached)
         self.screenshot_button.style().unpolish(self.screenshot_button)
         self.screenshot_button.style().polish(self.screenshot_button)
@@ -3055,3 +3063,4 @@ def _configure_reply_history_button(button: QToolButton, *, text: str, tooltip: 
     button.setText(text)
     button.setFixedSize(REPLY_HISTORY_BUTTON_SIZE, REPLY_HISTORY_BUTTON_SIZE)
     button.setToolTip(tooltip)
+    button.setAutoRaise(False)
