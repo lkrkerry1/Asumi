@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QStringListModel, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QDialog,
     QDialogButtonBox,
     QColorDialog,
@@ -137,6 +138,61 @@ class ApiConnectionTestWorker(QObject):
             self.succeeded.emit(message)
         finally:
             self.finished.emit()
+
+
+class ApiModelListProbeWorker(QObject):
+    succeeded = Signal(list)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, settings: ApiSettings) -> None:
+        super().__init__()
+        self.settings = settings
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            models = OpenAICompatibleClient(self.settings).list_models()
+        except Exception as exc:  # UI 边界统一转成可读错误。
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(models)
+        finally:
+            self.finished.emit()
+
+
+class ModelComboBox(QComboBox):
+    """可编辑模型选择框，保留 QLineEdit 风格的 text/setText 兼容接口。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._model_names: list[str] = []
+        self._completion_model = QStringListModel(self)
+        completer = QCompleter(self._completion_model, self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.setCompleter(completer)
+
+    def setText(self, text: str) -> None:
+        self.setEditText(text)
+
+    def text(self) -> str:
+        return self.currentText()
+
+    def set_model_names(self, model_names: list[str]) -> None:
+        current_text = self.currentText().strip()
+        self._model_names = list(model_names)
+        self.blockSignals(True)
+        self.clear()
+        self.addItems(self._model_names)
+        self._completion_model.setStringList(self._model_names)
+        if current_text:
+            self.setEditText(current_text)
+        elif self._model_names:
+            self.setCurrentIndex(0)
+        self.blockSignals(False)
 
 
 class TTSTestWorker(QObject):
@@ -342,6 +398,8 @@ class SettingsDialog(QDialog):
         self.result_plugin_config_changed = False
         self._api_test_thread: QThread | None = None
         self._api_test_worker: ApiConnectionTestWorker | None = None
+        self._api_model_probe_thread: QThread | None = None
+        self._api_model_probe_worker: ApiModelListProbeWorker | None = None
         self._tts_test_thread: QThread | None = None
         self._tts_test_worker: TTSTestWorker | None = None
         self._pending_api_accept_values: dict[str, object] | None = None
@@ -642,7 +700,8 @@ class SettingsDialog(QDialog):
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key_edit.setPlaceholderText("请输入 API Key")
 
-        self.model_edit = QLineEdit(settings.model, tab)
+        self.model_edit = ModelComboBox(tab)
+        self.model_edit.setText(settings.model)
         self.model_edit.setPlaceholderText("gpt-4.1-mini")
 
         self.api_timeout_spin = QSpinBox(tab)
@@ -650,8 +709,18 @@ class SettingsDialog(QDialog):
         self.api_timeout_spin.setSuffix(" 秒")
         self.api_timeout_spin.setValue(settings.timeout_seconds)
 
+        self.api_model_probe_button = QPushButton("检测模型", tab)
+        self.api_model_probe_button.clicked.connect(self._probe_api_models)
+
         self.api_test_button = QPushButton("测试 API", tab)
         self.api_test_button.clicked.connect(self._test_api_settings)
+
+        api_actions = QWidget(tab)
+        api_actions_layout = QHBoxLayout(api_actions)
+        api_actions_layout.setContentsMargins(0, 0, 0, 0)
+        api_actions_layout.setSpacing(8)
+        api_actions_layout.addWidget(self.api_model_probe_button)
+        api_actions_layout.addWidget(self.api_test_button)
 
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)
@@ -660,7 +729,7 @@ class SettingsDialog(QDialog):
         form_layout.addRow("API Key", self.api_key_edit)
         form_layout.addRow("模型", self.model_edit)
         form_layout.addRow("超时", self.api_timeout_spin)
-        form_layout.addRow("", self.api_test_button)
+        form_layout.addRow("", api_actions)
         tab.setLayout(form_layout)
         return tab
 
@@ -1799,6 +1868,9 @@ class SettingsDialog(QDialog):
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再保存设置。")
             return
+        if self._api_model_probe_thread is not None:
+            QMessageBox.information(self, "检测中", "模型列表仍在检测，请等待完成后再保存设置。")
+            return
         if self._tts_test_thread is not None:
             QMessageBox.information(self, "检测中", "TTS 服务检测仍在进行，请等待完成后再保存设置。")
             return
@@ -1952,6 +2024,9 @@ class SettingsDialog(QDialog):
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再关闭设置。")
             return
+        if self._api_model_probe_thread is not None:
+            QMessageBox.information(self, "检测中", "模型列表仍在检测，请等待完成后再关闭设置。")
+            return
         if self._tts_test_thread is not None:
             QMessageBox.information(self, "检测中", "TTS 服务检测仍在进行，请等待完成后再关闭设置。")
             return
@@ -1966,6 +2041,10 @@ class SettingsDialog(QDialog):
     def closeEvent(self, event):  # type: ignore[no-untyped-def]
         if self._api_test_thread is not None:
             QMessageBox.information(self, "测试中", "API 测试仍在进行，请等待完成后再关闭设置。")
+            event.ignore()
+            return
+        if self._api_model_probe_thread is not None:
+            QMessageBox.information(self, "检测中", "模型列表仍在检测，请等待完成后再关闭设置。")
             event.ignore()
             return
         if self._tts_test_thread is not None:
@@ -1984,7 +2063,7 @@ class SettingsDialog(QDialog):
 
     def _test_api_settings(self) -> None:
         settings = self._validated_api_settings()
-        if settings is None or self._api_test_thread is not None:
+        if settings is None or self._api_test_thread is not None or self._api_model_probe_thread is not None:
             return
 
         self._start_api_settings_test(settings)
@@ -1994,7 +2073,7 @@ class SettingsDialog(QDialog):
         settings: ApiSettings,
         accept_values: dict[str, object] | None = None,
     ) -> None:
-        if self._api_test_thread is not None:
+        if self._api_test_thread is not None or self._api_model_probe_thread is not None:
             return
 
         self._pending_api_accept_values = dict(accept_values) if accept_values is not None else None
@@ -2039,6 +2118,7 @@ class SettingsDialog(QDialog):
     def _set_api_test_busy(self, busy: bool) -> None:
         self.api_test_button.setEnabled(not busy)
         self.api_test_button.setText("测试中..." if busy else "测试 API")
+        self.api_model_probe_button.setEnabled(not busy)
         if not hasattr(self, "button_box"):
             return
         save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
@@ -2049,6 +2129,65 @@ class SettingsDialog(QDialog):
                 self._save_button_text = save_button.text()
             save_button.setText("测试 API...")
         elif self._tts_test_thread is not None:
+            return
+        elif self._save_button_text is not None:
+            save_button.setText(self._save_button_text)
+            self._save_button_text = None
+
+    def _probe_api_models(self) -> None:
+        settings = self._validated_api_model_probe_settings()
+        if settings is None or self._api_model_probe_thread is not None or self._api_test_thread is not None:
+            return
+
+        self._set_api_model_probe_busy(True)
+        thread = QThread()
+        worker = ApiModelListProbeWorker(settings)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_api_model_probe_success)
+        worker.failed.connect(self._handle_api_model_probe_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reset_api_model_probe_state)
+
+        self._api_model_probe_thread = thread
+        self._api_model_probe_worker = worker
+        thread.start()
+
+    @Slot(list)
+    def _handle_api_model_probe_success(self, model_names: list[str]) -> None:
+        if not model_names:
+            QMessageBox.warning(self, "探测失败", "模型列表为空，请检查服务是否暴露 /models 接口。")
+            return
+        self.model_edit.set_model_names(model_names)
+        QMessageBox.information(self, "探测成功", f"已发现 {len(model_names)} 个模型。")
+
+    @Slot(str)
+    def _handle_api_model_probe_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "探测失败", message)
+
+    @Slot()
+    def _reset_api_model_probe_state(self) -> None:
+        self._api_model_probe_thread = None
+        self._api_model_probe_worker = None
+        self._set_api_model_probe_busy(False)
+
+    def _set_api_model_probe_busy(self, busy: bool) -> None:
+        self.api_model_probe_button.setEnabled(not busy)
+        self.api_model_probe_button.setText("检测中..." if busy else "检测模型")
+        self.api_test_button.setEnabled(not busy)
+        if not hasattr(self, "button_box"):
+            return
+        save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
+        if save_button is None:
+            return
+        if busy:
+            if self._save_button_text is None:
+                self._save_button_text = save_button.text()
+            save_button.setText("检测模型...")
+            save_button.setEnabled(False)
+        elif self._api_test_thread is not None or self._tts_test_thread is not None:
             return
         elif self._save_button_text is not None:
             save_button.setText(self._save_button_text)
@@ -2395,6 +2534,24 @@ class SettingsDialog(QDialog):
             base_url=base_url,
             api_key=api_key,
             model=model,
+            timeout_seconds=self.api_timeout_spin.value(),
+        )
+
+    def _validated_api_model_probe_settings(self) -> ApiSettings | None:
+        base_url = self.base_url_edit.text().strip().rstrip("/")
+        api_key = self.api_key_edit.text().strip()
+
+        if not _is_http_url(base_url):
+            QMessageBox.warning(self, "配置无效", "Base URL 必须是有效的 http 或 https 地址。")
+            return None
+        if not api_key:
+            QMessageBox.warning(self, "配置无效", "API Key 不能为空。")
+            return None
+
+        return ApiSettings(
+            base_url=base_url,
+            api_key=api_key,
+            model=self.model_edit.text().strip(),
             timeout_seconds=self.api_timeout_spin.value(),
         )
 

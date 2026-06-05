@@ -1681,6 +1681,121 @@ def test_settings_dialog_tests_api_when_api_changes(monkeypatch) -> None:  # typ
     app.processEvents()
 
 
+def test_settings_dialog_model_combo_saves_manual_input(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    dialog, app = _build_api_settings_dialog("api_manual_model")
+    dialog.model_edit.setText("manual-model")
+    monkeypatch.setattr(dialog, "_start_api_settings_test", lambda settings, accept_values=None: dialog._continue_accept_after_api_test(accept_values))
+
+    dialog.accept()
+
+    assert dialog.result_api_settings is not None
+    assert dialog.result_api_settings.model == "manual-model"
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_model_probe_populates_candidates_and_selects_first(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+
+    dialog, app = _build_api_settings_dialog("api_model_probe_empty", model="")
+    infos: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "information",
+        lambda _parent, _title, message: infos.append(message),
+    )
+
+    dialog._handle_api_model_probe_success(["z-model", "a-model"])
+
+    assert dialog.model_edit.currentText() == "z-model"
+    assert [dialog.model_edit.itemText(index) for index in range(dialog.model_edit.count())] == ["z-model", "a-model"]
+    assert infos and "2" in infos[0]
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_model_probe_keeps_current_input(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+
+    dialog, app = _build_api_settings_dialog("api_model_probe_keep_input", model="custom-model")
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args: None)
+
+    dialog._handle_api_model_probe_success(["a-model", "b-model"])
+
+    assert dialog.model_edit.currentText() == "custom-model"
+    assert dialog.model_edit.completer().completionModel().rowCount() == 2
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_model_probe_failure_keeps_current_model(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    import app.ui.settings_dialog as settings_dialog_module
+
+    dialog, app = _build_api_settings_dialog("api_model_probe_failure", model="current-model")
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+
+    dialog._handle_api_model_probe_failed("无法连接")
+
+    assert warnings == ["无法连接"]
+    assert dialog.model_edit.currentText() == "current-model"
+    assert dialog.result_api_settings is None
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_model_probe_busy_state_disables_actions() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from PySide6.QtWidgets import QDialogButtonBox
+
+    dialog, app = _build_api_settings_dialog("api_model_probe_busy")
+    save_button = dialog.button_box.button(QDialogButtonBox.StandardButton.Save)
+
+    dialog._set_api_model_probe_busy(True)
+
+    assert not dialog.api_model_probe_button.isEnabled()
+    assert not dialog.api_test_button.isEnabled()
+    assert save_button is not None
+    assert not save_button.isEnabled()
+    assert save_button.text() == "检测模型..."
+
+    dialog._set_api_model_probe_busy(False)
+
+    assert dialog.api_model_probe_button.isEnabled()
+    assert dialog.api_test_button.isEnabled()
+    assert save_button.isEnabled()
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_api_test_failure_blocks_save(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -5421,6 +5536,28 @@ def _settings_dialog_character_kwargs(root: Path) -> dict[str, object]:
         "character_registry": CharacterRegistry(root),
         "current_character": profile,
     }
+
+
+def _build_api_settings_dialog(name: str, *, model: str = "test-model"):
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root(name)
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model=model,
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    return dialog, app
 
 
 def _minimal_tts_settings() -> GPTSoVITSTTSSettings:

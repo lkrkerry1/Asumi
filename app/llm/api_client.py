@@ -101,6 +101,34 @@ class OpenAICompatibleClient:
 
         return str(content).strip() or "OK"
 
+    def list_models(self) -> list[str]:
+        """读取 OpenAI 兼容 /models 接口，返回可选择的模型 id 列表。"""
+        self._ensure_model_list_config()
+        url = f"{self.settings.base_url}/models"
+        request = urllib.request.Request(
+            url=url,
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {self.settings.api_key}",
+            },
+        )
+        debug_log(
+            "API",
+            "准备检测模型列表",
+            {
+                "url": url,
+                "timeout_seconds": self.settings.timeout_seconds,
+            },
+        )
+        response_body = self._send_with_retries(request)
+
+        try:
+            data: dict[str, Any] = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise ApiRequestError(f"API 返回格式无法解析：{response_body}") from exc
+
+        return _parse_model_ids(data)
+
     def chat(
         self,
         system_prompt: str,
@@ -282,6 +310,12 @@ class OpenAICompatibleClient:
         if not self.settings.model:
             raise ApiConfigError("缺少 MODEL。")
 
+    def _ensure_model_list_config(self) -> None:
+        if not self.settings.api_key:
+            raise ApiConfigError("缺少 API_KEY。请在设置中填写 API Key。")
+        if not self.settings.base_url:
+            raise ApiConfigError("缺少 BASE_URL。")
+
     def _post_chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
         """调用 OpenAI 兼容的 chat/completions 接口并返回 JSON 数据。"""
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -410,6 +444,22 @@ def _build_segmented_reply_instruction(
     reply_portraits: list[str] | None = None,
 ) -> str:
     return build_segmented_reply_instruction(reply_tones, reply_portraits)
+
+
+def _parse_model_ids(data: dict[str, Any]) -> list[str]:
+    """解析 /models 响应中的模型 id，过滤坏数据并稳定排序。"""
+    raw_models = data.get("data")
+    if not isinstance(raw_models, list):
+        raise ApiRequestError(f"API 模型列表格式无法解析：{json.dumps(data, ensure_ascii=False)}")
+
+    model_ids: set[str] = set()
+    for item in raw_models:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if isinstance(model_id, str) and model_id.strip():
+            model_ids.add(model_id.strip())
+    return sorted(model_ids, key=str.casefold)
 
 
 def _build_chat_completion_payload(

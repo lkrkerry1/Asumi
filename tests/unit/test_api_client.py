@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.llm.api_client import (
+    ApiConfigError,
     ApiRequestError,
     ApiSettings,
     OpenAICompatibleClient,
@@ -326,6 +327,122 @@ def test_segmented_reply_instruction_requests_portrait_field() -> None:
 
     assert '"portrait":"站立待机"' in instruction
     assert "portrait 只能从这些类别中选择：站立待机、伸手命令" in instruction
+
+
+def test_list_models_requests_models_endpoint(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    captured: dict[str, Any] = {}
+    client = OpenAICompatibleClient(
+        ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="key",
+            model="",
+            timeout_seconds=12,
+        )
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_args):  # type: ignore[no-untyped-def]
+            return None
+
+        def read(self) -> bytes:
+            return b'{"data":[{"id":"z-model"},{"id":"a-model"},{"id":"a-model"}]}'
+
+    def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["auth"] = request.headers.get("Authorization")
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    assert client.list_models() == ["a-model", "z-model"]
+    assert captured == {
+        "url": "https://api.example.com/v1/models",
+        "method": "GET",
+        "auth": "Bearer key",
+        "timeout": 12,
+    }
+
+
+def test_list_models_allows_empty_model_but_requires_key() -> None:
+    client = OpenAICompatibleClient(ApiSettings("https://api.example.com/v1", "", ""))
+
+    try:
+        client.list_models()
+    except ApiConfigError as exc:
+        assert "API_KEY" in str(exc)
+    else:
+        raise AssertionError("缺少 API Key 时应拒绝检测模型列表")
+
+
+def test_list_models_returns_empty_list(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client = OpenAICompatibleClient(ApiSettings("https://api.example.com/v1", "key", ""))
+
+    monkeypatch.setattr(client, "_send_with_retries", lambda _request: '{"data":[]}')
+
+    assert client.list_models() == []
+
+
+def test_list_models_rejects_bad_response_shape(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client = OpenAICompatibleClient(ApiSettings("https://api.example.com/v1", "key", ""))
+
+    monkeypatch.setattr(client, "_send_with_retries", lambda _request: '{"object":"list"}')
+
+    try:
+        client.list_models()
+    except ApiRequestError as exc:
+        assert "模型列表格式无法解析" in str(exc)
+    else:
+        raise AssertionError("模型列表格式错误时应抛出 ApiRequestError")
+
+
+def test_list_models_wraps_http_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client = OpenAICompatibleClient(ApiSettings("https://api.example.com/v1", "key", "", timeout_seconds=1))
+
+    def fake_urlopen(_request, timeout):  # type: ignore[no-untyped-def]
+        import urllib.error
+
+        raise urllib.error.HTTPError(
+            "https://api.example.com/v1/models",
+            401,
+            "Unauthorized",
+            {},
+            None,
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    try:
+        client.list_models()
+    except ApiRequestError as exc:
+        assert "API HTTP 401" in str(exc)
+    else:
+        raise AssertionError("HTTP 错误应包装为 ApiRequestError")
+
+
+def test_list_models_wraps_url_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    client = OpenAICompatibleClient(ApiSettings("https://api.example.com/v1", "key", "", timeout_seconds=1))
+
+    def fake_urlopen(_request, timeout):  # type: ignore[no-untyped-def]
+        import urllib.error
+
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    try:
+        client.list_models()
+    except ApiRequestError as exc:
+        assert "API 请求失败" in str(exc)
+    else:
+        raise AssertionError("URL 错误应包装为 ApiRequestError")
 
 
 def test_parse_chat_reply_keeps_segment_portrait() -> None:
