@@ -639,7 +639,7 @@ class PetWindow(QWidget):
             self._schedule_native_topmost_sync()
 
     def event(self, event) -> bool:  # type: ignore[override]
-        if event.type() == QEvent.Type.ScreenChangeInternal:
+        if _is_screen_change_event(event):
             self._schedule_screen_change_relayout()
         return super().event(event)
 
@@ -3401,6 +3401,14 @@ def _stage_size_for_portrait_scale_percent(portrait_scale_percent: int) -> tuple
         DEFAULT_STAGE_WIDTH,
         max(MIN_STAGE_HEIGHT, round(DEFAULT_STAGE_HEIGHT * scale)),
     )
+
+
+def _is_screen_change_event(event: object) -> bool:
+    """兼容旧版 Qt：缺少 ScreenChangeInternal 枚举时直接忽略。"""
+
+    screen_change_type = getattr(QEvent.Type, "ScreenChangeInternal", None)
+    event_type = getattr(event, "type", None)
+    return screen_change_type is not None and callable(event_type) and event_type() == screen_change_type
 
 
 def _configure_reply_history_panel(panel: QFrame) -> None:

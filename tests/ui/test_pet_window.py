@@ -541,6 +541,23 @@ def test_pet_window_screen_change_restores_stage_geometry(monkeypatch) -> None: 
     app.processEvents()
 
 
+def test_screen_change_event_check_tolerates_missing_qt_enum(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import _is_screen_change_event
+
+    class FakeQEvent:
+        class Type:
+            pass
+
+    class EventStub:
+        def type(self) -> object:
+            return object()
+
+    monkeypatch.setattr(pet_window_module, "QEvent", FakeQEvent)
+
+    assert not _is_screen_change_event(EventStub())
+
+
 def test_reply_history_controls_use_capsule_sizing() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
