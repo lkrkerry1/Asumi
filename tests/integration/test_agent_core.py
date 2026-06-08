@@ -1185,24 +1185,26 @@ def test_playwright_search_web_returns_structured_results(monkeypatch: pytest.Mo
 
     class ResultEl:
         def query_selector(self, selector: str):  # type: ignore[no-untyped-def]
-            if selector == ".result__title":
+            if selector == "h2":
                 return TitleEl()
-            if selector == ".result__snippet":
+            if selector == "p":
                 return SnippetEl()
-            if selector == ".result__url":
+            if selector == ".b_attribution cite":
                 return DisplayUrlEl()
-            if selector == ".result__a":
+            if selector == "h2 a":
                 return LinkEl()
             return None
 
     class Page:
-        url = "https://html.duckduckgo.com/html/?q=%E4%BA%8C%E9%98%B6%E5%A0%82%E7%9C%9F%E7%BA%A2"
+        url = "https://www.bing.com/search?q=%E4%BA%8C%E9%98%B6%E5%A0%82%E7%9C%9F%E7%BA%A2"
+        navigated: list[str] = []
 
-        def goto(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+        def goto(self, url, **_kwargs):  # type: ignore[no-untyped-def]
+            self.navigated.append(url)
             return None
 
         def query_selector_all(self, selector: str):  # type: ignore[no-untyped-def]
-            return [ResultEl()] if selector == ".result__body" else []
+            return [ResultEl()] if selector == "li.b_algo" else []
 
     from plugins.playwright_browser import browser
 
@@ -1210,10 +1212,12 @@ def test_playwright_search_web_returns_structured_results(monkeypatch: pytest.Mo
     monkeypatch.setattr(browser, "_bg_executor", None)
     monkeypatch.setattr(browser, "_browser_thread_id", None)
     monkeypatch.setattr(browser, "_use_bg_thread", True)
-    monkeypatch.setattr(browser, "_ensure_browser", lambda: Page())
+    page = Page()
+    monkeypatch.setattr(browser, "_ensure_browser", lambda: page)
 
     result = browser.search_web("二阶堂真红")
 
+    assert page.navigated == ["https://www.bing.com/search?q=%E4%BA%8C%E9%98%B6%E5%A0%82%E7%9C%9F%E7%BA%A2"]
     assert "萌娘百科 - 二阶堂真红" in result
     assert "二阶堂真红是《五彩斑斓的世界》系列角色。" in result
     assert "zh.moegirl.org.cn" in result
@@ -1239,13 +1243,13 @@ def test_playwright_search_web_registry_keeps_default_limit(monkeypatch: pytest.
 
     class ResultEl:
         def query_selector(self, selector: str):  # type: ignore[no-untyped-def]
-            if selector == ".result__title":
+            if selector == "h2":
                 return TitleEl()
-            if selector == ".result__snippet":
+            if selector == "p":
                 return SnippetEl()
-            if selector == ".result__url":
+            if selector == ".b_attribution cite":
                 return DisplayUrlEl()
-            if selector == ".result__a":
+            if selector == "h2 a":
                 return LinkEl()
             return None
 
@@ -1254,7 +1258,7 @@ def test_playwright_search_web_registry_keeps_default_limit(monkeypatch: pytest.
             return None
 
         def query_selector_all(self, selector: str):  # type: ignore[no-untyped-def]
-            return [ResultEl()] if selector == ".result__body" else []
+            return [ResultEl()] if selector == "li.b_algo" else []
 
     from plugins.playwright_browser import browser
 
