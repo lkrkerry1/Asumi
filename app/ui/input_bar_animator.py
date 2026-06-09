@@ -58,6 +58,8 @@ class InputBarAnimator(QObject):
         self._started = False
         # 拖动期间挂起：停轮询并强制隐藏，避免静态模糊背景与移动后的真实桌面对不上而穿帮。
         self._suspended = False
+        # 外部强制常显（如设置对话框打开期间）：优先于 hover/pinned，便于实时调整时输入栏不被收起。
+        self._force_visible = False
         self._anim: QPropertyAnimation | None = None
         self._send_anim: QSequentialAnimationGroup | None = None
 
@@ -77,6 +79,15 @@ class InputBarAnimator(QObject):
     def sync(self) -> None:
         """外部 pinned 状态（如待确认动作出现）变化时，立即重算可见性。"""
         self._sync()
+
+    def set_force_visible(self, value: bool) -> None:
+        """外部强制常显开关（如设置对话框打开期间）：开启立即现身，关闭后按常规可见性重算。"""
+        value = bool(value)
+        if value == self._force_visible:
+            return
+        self._force_visible = value
+        if self._started and not self._suspended:
+            self._sync()
 
     def suspend_for_drag(self) -> None:
         """拖动开始：停轮询并淡出隐藏输入栏，避免静态模糊背景与移动后的真实桌面穿帮。"""
@@ -111,7 +122,7 @@ class InputBarAnimator(QObject):
         self._sync()
 
     def _target_visible(self) -> bool:
-        return self._hover or bool(self._is_pinned())
+        return self._force_visible or self._hover or bool(self._is_pinned())
 
     def _sync(self) -> None:
         if self._suspended:
