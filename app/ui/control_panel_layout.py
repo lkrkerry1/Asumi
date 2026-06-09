@@ -29,6 +29,11 @@ DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET = 0
 MIN_CONTROL_PANEL_VERTICAL_OFFSET = -200
 MAX_CONTROL_PANEL_VERTICAL_OFFSET = 200
 
+# 输入栏相对气泡的额外下移：只能向下（>=0），用于加大输入栏与气泡的间距。
+DEFAULT_INPUT_BAR_OFFSET = 0
+MIN_INPUT_BAR_OFFSET = 0
+MAX_INPUT_BAR_OFFSET = 200
+
 # 布局固定量：输入栏高度、气泡与输入栏间距、控制组距舞台底部的基础留白。
 # 取自重构前 _layout_stage 中的硬编码值，提取为常量便于布局统一引用。
 INPUT_BAR_HEIGHT = 52
@@ -72,4 +77,13 @@ def normalize_control_panel_vertical_offset(value: object) -> int:
         minimum=MIN_CONTROL_PANEL_VERTICAL_OFFSET,
         maximum=MAX_CONTROL_PANEL_VERTICAL_OFFSET,
         default=DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
+    )
+
+
+def normalize_input_bar_offset(value: object) -> int:
+    return _clamp_int(
+        value,
+        minimum=MIN_INPUT_BAR_OFFSET,
+        maximum=MAX_INPUT_BAR_OFFSET,
+        default=DEFAULT_INPUT_BAR_OFFSET,
     )

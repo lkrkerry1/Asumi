@@ -4771,7 +4771,7 @@ def test_settings_dialog_emits_control_panel_layout_preview() -> None:
     QApplication = qtwidgets.QApplication
     app = QApplication.instance() or QApplication([])
     root = _ui_runtime_root("control_panel_preview_dialog")
-    previews: list[tuple[int, int, int]] = []
+    previews: list[tuple[int, int, int, int, int]] = []
     dialog = SettingsDialog(
         api_settings=ApiSettings(
             base_url="https://api.example.com/v1",
@@ -4786,7 +4786,7 @@ def test_settings_dialog_emits_control_panel_layout_preview() -> None:
         control_panel_width=600,
         bubble_height=150,
         control_panel_vertical_offset=0,
-        on_control_panel_layout_preview=lambda w, h, o: previews.append((w, h, o)),
+        on_layout_preview=lambda p, w, h, o, i: previews.append((p, w, h, o, i)),
     )
 
     # 构造时的初始 setValue 不应触发预览（信号连接在赋值之后）
@@ -4795,10 +4795,18 @@ def test_settings_dialog_emits_control_panel_layout_preview() -> None:
     # 修改某个滑块即实时触发预览，参数为当前三项取值
     dialog.bubble_height_spin.setValue(180)
     assert previews
-    assert previews[-1] == (600, 180, 0)
+    assert previews[-1] == (100, 600, 180, 0, 0)
 
     dialog.control_panel_width_spin.setValue(720)
-    assert previews[-1] == (720, 180, 0)
+    assert previews[-1] == (100, 720, 180, 0, 0)
+
+    # 立绘缩放也接入实时预览
+    dialog.portrait_scale_spin.setValue(120)
+    assert previews[-1] == (120, 720, 180, 0, 0)
+
+    # 输入框下移也接入实时预览
+    dialog.input_bar_offset_spin.setValue(40)
+    assert previews[-1] == (120, 720, 180, 0, 40)
 
     dialog.deleteLater()
     app.processEvents()
@@ -6886,7 +6894,7 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
     class MinimalSettingsWindow:
         show_settings = pet_window_cls.show_settings
         _activate_settings_dialog = pet_window_cls._activate_settings_dialog
-        _preview_control_panel_layout = pet_window_cls._preview_control_panel_layout
+        _preview_layout = pet_window_cls._preview_layout
         _retire_tts_provider = pet_window_cls._retire_tts_provider
         _apply_subtitle_display_speed = pet_window_cls._apply_subtitle_display_speed
         _apply_launch_at_login_settings = pet_window_cls._apply_launch_at_login_settings
@@ -6903,12 +6911,14 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
             control_panel_width,
             bubble_height,
             vertical_offset,
+            input_bar_offset,
             *,
             persist: bool = True,
         ) -> None:
             self.control_panel_width = control_panel_width
             self.bubble_height = bubble_height
             self.control_panel_vertical_offset = vertical_offset
+            self.input_bar_offset = input_bar_offset
 
         def _sync_proactive_care_timer(self) -> None:
             pass
@@ -6938,6 +6948,7 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
     window.control_panel_width = 640
     window.bubble_height = 128
     window.control_panel_vertical_offset = 0
+    window.input_bar_offset = 0
     window.subtitle_typing_interval_ms = 35
     window.reply_segment_pause_ms = 100
     window.retired_tts_providers = []

@@ -88,15 +88,19 @@ from app.ui.control_panel_layout import (
     DEFAULT_BUBBLE_HEIGHT,
     DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
     DEFAULT_CONTROL_PANEL_WIDTH,
+    DEFAULT_INPUT_BAR_OFFSET,
     MAX_BUBBLE_HEIGHT,
     MAX_CONTROL_PANEL_VERTICAL_OFFSET,
     MAX_CONTROL_PANEL_WIDTH,
+    MAX_INPUT_BAR_OFFSET,
     MIN_BUBBLE_HEIGHT,
     MIN_CONTROL_PANEL_VERTICAL_OFFSET,
     MIN_CONTROL_PANEL_WIDTH,
+    MIN_INPUT_BAR_OFFSET,
     normalize_bubble_height,
     normalize_control_panel_vertical_offset,
     normalize_control_panel_width,
+    normalize_input_bar_offset,
 )
 from app.ui.subtitle_controller import (
     REPLY_SEGMENT_PAUSE_MAX_MS,
@@ -497,12 +501,13 @@ class SettingsDialog(QDialog):
         control_panel_width: int = DEFAULT_CONTROL_PANEL_WIDTH,
         bubble_height: int = DEFAULT_BUBBLE_HEIGHT,
         control_panel_vertical_offset: int = DEFAULT_CONTROL_PANEL_VERTICAL_OFFSET,
+        input_bar_offset: int = DEFAULT_INPUT_BAR_OFFSET,
         subtitle_typing_interval_ms: int = SPEECH_TYPING_INTERVAL_MS,
         reply_segment_pause_ms: int = REPLY_SEGMENT_PAUSE_MS,
         theme_settings: ThemeSettings | None = None,
         startup_settings: StartupSettings | None = None,
         bubble_settings: BubbleSettings | None = None,
-        on_control_panel_layout_preview: Callable[[int, int, int], None] | None = None,
+        on_layout_preview: Callable[[int, int, int, int, int], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.base_dir = base_dir
@@ -530,8 +535,9 @@ class SettingsDialog(QDialog):
         self.control_panel_vertical_offset = normalize_control_panel_vertical_offset(
             control_panel_vertical_offset
         )
-        # 控制组三项滑块拖动时的实时预览回调（由宿主窗口注入，不持久化）。
-        self._on_control_panel_layout_preview = on_control_panel_layout_preview
+        self.input_bar_offset = normalize_input_bar_offset(input_bar_offset)
+        # 立绘/控制组滑块拖动时的实时预览回调（由宿主窗口注入，不持久化）。
+        self._on_layout_preview = on_layout_preview
         (
             self.subtitle_typing_interval_ms,
             self.reply_segment_pause_ms,
@@ -553,6 +559,7 @@ class SettingsDialog(QDialog):
         self.result_control_panel_width: int | None = None
         self.result_bubble_height: int | None = None
         self.result_control_panel_vertical_offset: int | None = None
+        self.result_input_bar_offset: int | None = None
         self.result_subtitle_typing_interval_ms: int | None = None
         self.result_reply_segment_pause_ms: int | None = None
         self.result_proactive_care_settings: ProactiveCareSettings | None = None
@@ -723,6 +730,7 @@ class SettingsDialog(QDialog):
         form_layout.addRow("对话框宽度", self._build_control_panel_width_control(tab))
         form_layout.addRow("气泡高度", self._build_bubble_height_control(tab))
         form_layout.addRow("气泡上下位置", self._build_control_panel_offset_control(tab))
+        form_layout.addRow("输入框下移", self._build_input_bar_offset_control(tab))
         form_layout.addRow("角色包", self._build_character_archive_controls(tab))
         tab.setLayout(form_layout)
         self._sync_character_archive_controls()
@@ -860,6 +868,8 @@ class SettingsDialog(QDialog):
 
         self.portrait_scale_slider.valueChanged.connect(self.portrait_scale_spin.setValue)
         self.portrait_scale_spin.valueChanged.connect(self.portrait_scale_slider.setValue)
+        # 立绘缩放也接入实时预览。
+        self.portrait_scale_spin.valueChanged.connect(self._emit_layout_preview)
 
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -898,8 +908,8 @@ class SettingsDialog(QDialog):
 
         slider.valueChanged.connect(spin.setValue)
         spin.valueChanged.connect(slider.setValue)
-        # 拖动时实时回调宿主窗口预览（_build_range_control 仅被控制组三项滑块复用）。
-        spin.valueChanged.connect(self._emit_control_panel_layout_preview)
+        # 拖动时实时回调宿主窗口预览（_build_range_control 被控制组各项滑块复用）。
+        spin.valueChanged.connect(self._emit_layout_preview)
 
         setattr(self, slider_attr, slider)
         setattr(self, spin_attr, spin)
@@ -945,6 +955,19 @@ class SettingsDialog(QDialog):
             minimum=MIN_CONTROL_PANEL_VERTICAL_OFFSET,
             maximum=MAX_CONTROL_PANEL_VERTICAL_OFFSET,
             value=self.control_panel_vertical_offset,
+            single_step=10,
+            suffix=" px",
+        )
+
+    def _build_input_bar_offset_control(self, parent: QWidget) -> QWidget:
+        # 输入栏相对气泡的额外下移：只能往下（>=0）。
+        return self._build_range_control(
+            parent,
+            slider_attr="input_bar_offset_slider",
+            spin_attr="input_bar_offset_spin",
+            minimum=MIN_INPUT_BAR_OFFSET,
+            maximum=MAX_INPUT_BAR_OFFSET,
+            value=self.input_bar_offset,
             single_step=10,
             suffix=" px",
         )
@@ -2252,6 +2275,7 @@ class SettingsDialog(QDialog):
             "control_panel_width": self._selected_control_panel_width(),
             "bubble_height": self._selected_bubble_height(),
             "control_panel_vertical_offset": self._selected_control_panel_vertical_offset(),
+            "input_bar_offset": self._selected_input_bar_offset(),
             "subtitle_typing_interval_ms": subtitle_typing_interval_ms,
             "reply_segment_pause_ms": reply_segment_pause_ms,
             "theme_settings": theme_settings,
@@ -2294,6 +2318,7 @@ class SettingsDialog(QDialog):
         control_panel_width = values["control_panel_width"]
         bubble_height = values["bubble_height"]
         control_panel_vertical_offset = values["control_panel_vertical_offset"]
+        input_bar_offset = values["input_bar_offset"]
         subtitle_typing_interval_ms = values["subtitle_typing_interval_ms"]
         reply_segment_pause_ms = values["reply_segment_pause_ms"]
         theme_settings = values["theme_settings"]
@@ -2350,6 +2375,9 @@ class SettingsDialog(QDialog):
             control_panel_vertical_offset
             if isinstance(control_panel_vertical_offset, int)
             else self.control_panel_vertical_offset
+        )
+        self.result_input_bar_offset = (
+            input_bar_offset if isinstance(input_bar_offset, int) else self.input_bar_offset
         )
         self.result_subtitle_typing_interval_ms = subtitle_typing_interval_ms
         self.result_reply_segment_pause_ms = reply_segment_pause_ms
@@ -3043,15 +3071,22 @@ class SettingsDialog(QDialog):
             )
         return self.control_panel_vertical_offset
 
-    def _emit_control_panel_layout_preview(self, *_args) -> None:  # type: ignore[no-untyped-def]
-        """三个控制组滑块变化时，实时把当前取值回调给宿主窗口预览（不持久化）。"""
-        callback = getattr(self, "_on_control_panel_layout_preview", None)
+    def _selected_input_bar_offset(self) -> int:
+        if hasattr(self, "input_bar_offset_spin"):
+            return normalize_input_bar_offset(self.input_bar_offset_spin.value())
+        return self.input_bar_offset
+
+    def _emit_layout_preview(self, *_args) -> None:  # type: ignore[no-untyped-def]
+        """立绘/控制组滑块变化时，实时把当前取值回调给宿主窗口预览（不持久化）。"""
+        callback = getattr(self, "_on_layout_preview", None)
         if callback is None:
             return
         callback(
+            self._selected_portrait_scale_percent(),
             self._selected_control_panel_width(),
             self._selected_bubble_height(),
             self._selected_control_panel_vertical_offset(),
+            self._selected_input_bar_offset(),
         )
 
     def _refresh_character_combo(self, selected_character_id: str | None = None) -> None:
