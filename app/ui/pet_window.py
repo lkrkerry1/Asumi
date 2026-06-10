@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -4299,9 +4300,13 @@ def _theme_settings_for_character(
     saved_settings: ThemeSettings,
     profile: CharacterProfile,
 ) -> ThemeSettings:
+    saved = saved_settings.normalized()
     if profile.theme_source == THEME_SOURCE_PACKAGE:
-        return (profile.theme_settings or DEFAULT_THEME_SETTINGS).normalized()
-    return saved_settings.normalized()
+        # 角色包主题只贡献配色；visual_effect_mode 是用户级偏好
+        # （character.json 不存储该键），沿用已保存的视觉效果。
+        theme = (profile.theme_settings or DEFAULT_THEME_SETTINGS).normalized()
+        return replace(theme, visual_effect_mode=saved.visual_effect_mode)
+    return saved
 
 
 def _mark_dialog_always_on_top(window) -> None:  # type: ignore[no-untyped-def]

@@ -7413,3 +7413,84 @@ def test_subtitle_segment_pulse_creates_bubble_animation() -> None:
     controller.set_speech("一段台词", pulse=True)
 
     assert controller._bubble_fade_anim is not None
+
+
+def _make_character_profile(theme_settings: ThemeSettings | None, theme_source: str):  # type: ignore[no-untyped-def]
+    from app.config.character_loader import CharacterProfile
+
+    return CharacterProfile(
+        id="test",
+        display_name="Test",
+        package_dir=Path("."),
+        card_path=Path("card.md"),
+        initial_message="",
+        default_portrait_path=Path("portrait.png"),
+        theme_settings=theme_settings,
+        theme_source=theme_source,  # type: ignore[arg-type]
+    )
+
+
+def test_theme_settings_for_character_keeps_user_visual_effect_mode() -> None:
+    # 角色包主题只贡献配色；visual_effect_mode 是用户级偏好，必须沿用已保存值。
+    from app.config.character_loader import THEME_SOURCE_PACKAGE
+    from app.ui.pet_window import _theme_settings_for_character
+
+    saved = ThemeSettings(visual_effect_mode="macos_visual_effect", primary_color="#aa11bb")
+    package_theme = ThemeSettings(primary_color="#123456")
+    profile = _make_character_profile(package_theme, THEME_SOURCE_PACKAGE)
+
+    merged = _theme_settings_for_character(saved, profile)
+
+    assert merged.visual_effect_mode == "macos_visual_effect"
+    assert merged.primary_color == "#123456"
+
+
+def test_theme_settings_for_character_compat_default_returns_saved() -> None:
+    from app.config.character_loader import THEME_SOURCE_COMPAT_DEFAULT
+    from app.ui.pet_window import _theme_settings_for_character
+
+    saved = ThemeSettings(visual_effect_mode="windows_acrylic", primary_color="#aa11bb")
+    profile = _make_character_profile(ThemeSettings(), THEME_SOURCE_COMPAT_DEFAULT)
+
+    merged = _theme_settings_for_character(saved, profile)
+
+    assert merged.visual_effect_mode == "windows_acrylic"
+    assert merged.primary_color == "#aa11bb"
+
+
+def test_settings_dialog_theme_settings_for_character_keeps_user_visual_effect_mode() -> None:
+    from app.config.character_loader import THEME_SOURCE_PACKAGE
+    from app.ui.settings_dialog import _theme_settings_for_character
+
+    saved = ThemeSettings(visual_effect_mode="macos_visual_effect")
+    package_theme = ThemeSettings(primary_color="#123456")
+    profile = _make_character_profile(package_theme, THEME_SOURCE_PACKAGE)
+
+    merged = _theme_settings_for_character(saved, profile)
+
+    assert merged.visual_effect_mode == "macos_visual_effect"
+    assert merged.primary_color == "#123456"
+
+
+def test_settings_dialog_theme_settings_for_character_without_profile() -> None:
+    from app.ui.settings_dialog import _theme_settings_for_character
+
+    saved = ThemeSettings(visual_effect_mode="solid")
+
+    assert _theme_settings_for_character(saved, None).visual_effect_mode == "solid"
+
+
+def test_character_theme_round_trip_never_stores_visual_effect_mode() -> None:
+    # character.json 的 theme 块设计上不携带 visual_effect_mode（用户级/角色级分离）。
+    from app.config.character_loader import character_theme_from_mapping, character_theme_to_mapping
+
+    theme = ThemeSettings(primary_color="#123456", visual_effect_mode="macos_visual_effect")
+    mapping = character_theme_to_mapping(theme)
+
+    assert "visual_effect_mode" not in mapping
+
+    restored, source, missing = character_theme_from_mapping(mapping)
+    assert restored.visual_effect_mode == "gaussian_blur"
+    assert restored.primary_color == "#123456"
+    assert source == "package"
+    assert missing is False

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import mimetypes
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
@@ -2007,8 +2008,9 @@ class SettingsDialog(QDialog):
     ) -> None:
         """将主题控件的颜色值同步到界面，可选择性同步视觉效果下拉框。
 
-        sync_visual_effect 默认为 False：切换角色/AI配色/重置时不覆盖用户手动选择的视觉效果。
-        仅在对话框初始化（__init__）和点击"恢复默认配色"时传 True。
+        sync_visual_effect 默认为 False：视觉效果是用户级偏好（角色主题只贡献配色），
+        切换角色/AI配色/恢复默认配色均不覆盖用户手动选择的视觉效果。
+        仅在对话框初始化（__init__）时传 True。
         """
         theme = settings.normalized()
         self._syncing_theme_controls = True
@@ -2034,10 +2036,10 @@ class SettingsDialog(QDialog):
     def _reset_theme_colors(self) -> None:
         profile = self._selected_character_profile()
         if profile is None:
-            self._set_theme_controls(ThemeSettings(), sync_visual_effect=True)
+            self._set_theme_controls(ThemeSettings())
             self.theme_status_label.setText("已恢复默认 Sakura 粉色配色。")
         else:
-            self._set_theme_controls(profile.theme_settings or DEFAULT_THEME_SETTINGS, sync_visual_effect=True)
+            self._set_theme_controls(profile.theme_settings or DEFAULT_THEME_SETTINGS)
             if profile.theme_source == THEME_SOURCE_COMPAT_DEFAULT:
                 self.theme_status_label.setText("已恢复默认 Sakura 粉色配色。")
             else:
@@ -3061,9 +3063,13 @@ def _theme_settings_for_character(
     settings: ThemeSettings,
     profile: CharacterProfile | None,
 ) -> ThemeSettings:
+    saved = settings.normalized()
     if profile is not None and profile.theme_source == THEME_SOURCE_PACKAGE:
-        return (profile.theme_settings or DEFAULT_THEME_SETTINGS).normalized()
-    return settings.normalized()
+        # 角色包主题只贡献配色；visual_effect_mode 是用户级偏好
+        # （character.json 不存储该键），沿用已保存的视觉效果。
+        theme = (profile.theme_settings or DEFAULT_THEME_SETTINGS).normalized()
+        return replace(theme, visual_effect_mode=saved.visual_effect_mode)
+    return saved
 
 
 def _default_tts_api_url(provider: str) -> str:

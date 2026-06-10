@@ -103,7 +103,8 @@ class MacOSVisualEffectBackdrop:
 
     _MATERIAL = 13  # NSVisualEffectMaterialHUDWindow — 显著的暗色毛玻璃
     _BLENDING = 0   # NSVisualEffectBlendingModeBehindWindow
-    _STATE = 0      # NSVisualEffectStateActive
+    _STATE = 1      # NSVisualEffectStateActive — 强制始终 active；0 是 FollowsWindowActiveState，
+                    # 会在窗口非 key 时渲染为扁平灰白色（不采样背景模糊）
     _NS_WINDOW_BELOW = -1
 
     def __init__(self) -> None:
