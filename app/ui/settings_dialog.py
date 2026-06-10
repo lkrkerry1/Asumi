@@ -1538,7 +1538,7 @@ class SettingsDialog(QDialog):
 
     @Slot(list)
     def _handle_memory_load_success(self, memories: list[dict[str, object]]) -> None:
-        self._all_memories = list(memories)
+        self._all_memories = _sort_memories_by_latest_time(memories)
         all_ids = {str(memory.get("id", "")) for memory in self._all_memories}
         self._selected_memory_ids &= all_ids
         if self._editing_memory_id and self._editing_memory_id not in all_ids:
@@ -3157,6 +3157,32 @@ def _memory_row_background_color(row: int, checked: bool, theme: ThemeSettings) 
     if row % 2:
         return mix(theme.page_background_color, "#ffffff", 0.35)
     return mix(theme.page_background_color, "#ffffff", 0.70)
+
+
+def _sort_memories_by_latest_time(
+    memories: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """按更新时间倒序排列记忆，缺少更新时间时使用创建时间。"""
+    return sorted(memories, key=_memory_latest_time_sort_key, reverse=True)
+
+
+def _memory_latest_time_sort_key(memory: dict[str, object]) -> float:
+    for field in ("updated_at", "created_at"):
+        parsed = _parse_memory_time(str(memory.get(field) or ""))
+        if parsed is not None:
+            return parsed
+    return float("-inf")
+
+
+def _parse_memory_time(value: str) -> float | None:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (OSError, ValueError):
+        return None
+
 
 def _format_memory_time(value: str) -> str:
     text = value.strip()

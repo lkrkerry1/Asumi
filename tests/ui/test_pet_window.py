@@ -3151,6 +3151,65 @@ def test_settings_dialog_loads_memory_on_open_in_background() -> None:
     app.processEvents()
 
 
+def test_settings_dialog_sorts_memory_by_latest_time_on_top() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.list_calls = 0
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            self.list_calls += 1
+            return [
+                {
+                    "id": "memory-old",
+                    "content": "较旧记忆",
+                    "updated_at": "2026-06-01T10:00:00+08:00",
+                },
+                {"id": "memory-missing-time", "content": "缺少时间记忆"},
+                {
+                    "id": "memory-created",
+                    "content": "按创建时间兜底的记忆",
+                    "created_at": "2026-06-02T09:00:00+08:00",
+                },
+                {
+                    "id": "memory-new",
+                    "content": "最新记忆",
+                    "updated_at": "2026-06-03T12:00:00+08:00",
+                },
+            ]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+    )
+
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    assert [dialog.memory_table.item(row, 1).text() for row in range(4)] == [
+        "最新记忆",
+        "按创建时间兜底的记忆",
+        "较旧记忆",
+        "缺少时间记忆",
+    ]
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_memory_loader_thread_is_not_dialog_child() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
