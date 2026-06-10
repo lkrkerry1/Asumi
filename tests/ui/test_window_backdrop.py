@@ -22,6 +22,26 @@ def test_gradient_color_packs_abgr() -> None:
     assert wb._gradient_color(QColor(0x12, 0x34, 0x56, 0x78)) == 0x78563412
 
 
+def test_available_modes_omit_windows_acrylic_on_windows(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(wb.sys, "platform", "win32")
+    monkeypatch.setattr(wb, "_windows_build", lambda: 22631)
+
+    assert wb.VisualEffectMode.available_modes() == [
+        wb.VisualEffectMode.SOLID,
+        wb.VisualEffectMode.GAUSSIAN_BLUR,
+    ]
+
+
+def test_available_modes_keep_macos_native_blur_on_macos(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(wb.sys, "platform", "darwin")
+
+    assert wb.VisualEffectMode.available_modes() == [
+        wb.VisualEffectMode.SOLID,
+        wb.VisualEffectMode.GAUSSIAN_BLUR,
+        wb.VisualEffectMode.MACOS_VISUAL_EFFECT,
+    ]
+
+
 def test_create_window_backdrop_acrylic_on_win11(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(wb.sys, "platform", "win32")
     monkeypatch.setattr(wb, "_windows_build", lambda: 22631)

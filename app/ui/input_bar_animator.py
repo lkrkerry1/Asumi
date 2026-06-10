@@ -40,6 +40,8 @@ class InputBarAnimator(QObject):
         is_hover_active: Callable[[], bool],
         parent: QObject | None = None,
         before_show: Callable[[], None] | None = None,
+        after_show: Callable[[], None] | None = None,
+        before_hide: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._input_bar = input_bar
@@ -49,6 +51,9 @@ class InputBarAnimator(QObject):
         self._is_hover_active = is_hover_active
         # 显示前回调：输入栏现身前刷新软件模糊背景截图（截正后方桌面），避免现身后才换背景闪一下。
         self._before_show = before_show
+        # 显示/隐藏 hook：用于 macOS 原生 NSVisualEffectView 这类不走 Qt 绘制树的背景层。
+        self._after_show = after_show
+        self._before_hide = before_hide
 
         self._hover = False
         self._shown = False
@@ -77,9 +82,17 @@ class InputBarAnimator(QObject):
         """按当前视觉效果模式动态替换显示前回调。
 
         - 高斯模糊：_refresh_input_blur_background（截图桌面 + 模糊）
-        - 纯色块 / macOS 毛玻璃 / Windows 亚克力：None（无需截图）
+        - 纯色块 / macOS 原生毛玻璃：None（无需截图）
         """
         self._before_show = callback
+
+    def set_after_show(self, callback: Callable[[], None] | None) -> None:
+        """替换输入栏 show 后回调。"""
+        self._after_show = callback
+
+    def set_before_hide(self, callback: Callable[[], None] | None) -> None:
+        """替换输入栏 hide 前回调。"""
+        self._before_hide = callback
 
     def sync(self) -> None:
         """外部 pinned 状态（如待确认动作出现）变化时，立即重算可见性。"""
@@ -103,6 +116,7 @@ class InputBarAnimator(QObject):
             self._shown = False
             self._animate(False)
         else:
+            self._maybe_before_hide()
             self._input_card.hide()
 
     def resume_after_drag(self) -> None:
@@ -151,6 +165,9 @@ class InputBarAnimator(QObject):
         if show:
             self._maybe_before_show()
             self._input_card.show()
+            self._maybe_after_show()
+        else:
+            self._maybe_before_hide()
         anim = QPropertyAnimation(self._card_effect, b"opacity")
         anim.setDuration(HOVER_ANIM_DURATION_MS)
         anim.setEndValue(1.0 if show else 0.0)
@@ -175,7 +192,9 @@ class InputBarAnimator(QObject):
             self._maybe_before_show()
             self._card_effect.setOpacity(1.0)
             self._input_card.show()
+            self._maybe_after_show()
         else:
+            self._maybe_before_hide()
             self._card_effect.setOpacity(0.0)
             self._input_card.hide()
 
@@ -207,3 +226,13 @@ class InputBarAnimator(QObject):
         """显示前回调：在输入栏窗口 show 之前刷新软件模糊背景截图（存在才调）。"""
         if self._before_show is not None:
             self._before_show()
+
+    def _maybe_after_show(self) -> None:
+        """显示后回调：用于需要有效原生视图句柄的背景层。"""
+        if self._after_show is not None:
+            self._after_show()
+
+    def _maybe_before_hide(self) -> None:
+        """隐藏前回调：用于移除不随 Qt opacity 一起淡出的原生背景层。"""
+        if self._before_hide is not None:
+            self._before_hide()

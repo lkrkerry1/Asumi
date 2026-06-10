@@ -4,7 +4,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from PySide6.QtCore import (
     QEvent,
@@ -152,7 +152,7 @@ from app.storage.visual_observation import (
 from app.ui.fonts import _rounded_chinese_font, _rounded_japanese_font
 from app.ui.input_bar_animator import InputBarAnimator
 from app.ui.card_container import CardContainer
-from app.ui.window_backdrop import VisualEffectMode
+from app.ui.window_backdrop import MacOSVisualEffectBackdrop, VisualEffectMode
 from app.ui.input_blur_background import InputBlurBackground, make_blurred_pixmap
 from app.ui.bubble_auto_hide import BubbleAutoHideController
 from app.ui import (
@@ -662,10 +662,11 @@ class PetWindow(QWidget):
         input_layout.addWidget(self.screenshot_button)
         input_layout.addWidget(self.send_button)
         self.input_bar.setLayout(input_layout)
-        # 输入栏为「窗口内」卡片容器（单窗口重构）：原生亚克力/毛玻璃依赖独立 HWND 已不可用，
-        # 视觉收敛为「纯色 / 软件高斯模糊」；非纯色模式由窗口内软件模糊背景层呈现。
+        # 输入栏为「窗口内」卡片容器（单窗口重构）：Windows 亚克力不再暴露为可选项；
+        # macOS 原生毛玻璃用 NSVisualEffectView 挂在输入栏子视图背后，其余非纯色模式走软件高斯模糊。
         self.input_blur_background = InputBlurBackground(corner_radius=22.0)
-        needs_bg, input_before_show = self._input_bar_blur_pipeline()
+        self.input_native_backdrop = MacOSVisualEffectBackdrop()
+        needs_bg, input_before_show, input_after_show, input_before_hide = self._input_bar_blur_pipeline()
         self.input_card = CardContainer(
             self.input_bar,
             background_layer=self.input_blur_background if needs_bg else None,
@@ -679,6 +680,8 @@ class PetWindow(QWidget):
             self._cursor_in_pet_region,
             parent=self,
             before_show=input_before_show,
+            after_show=input_after_show,
+            before_hide=input_before_hide,
         )
         # 气泡无操作自动隐藏控制器：说完话后倒计时，悬停桌宠暂停，超时淡出，点击桌宠唤回。
         self.bubble_settings = self.settings_service.load_bubble_settings()
@@ -1233,6 +1236,7 @@ class PetWindow(QWidget):
         # 软件模糊背景截图需要输入栏/气泡的窗口本地矩形（转全局），此处缓存。
         self._bubble_local_rect = QRect(bx, by, bw, bh)
         self._input_local_rect = QRect(ix, iy, iw, ih)
+        self._sync_input_bar_native_backdrop_geometry()
 
     def _fit_bubble_for_label_height(self, label_h: int) -> None:
         """打字机溢出回调：按标签实际高度逐行扩展气泡（不持久化、不超上限）。"""
@@ -3858,9 +3862,15 @@ class PetWindow(QWidget):
     # ── 输入栏视觉效果（对称统一管线）────────────────────────────────
 
     def _input_bar_visual_effect_mode(self) -> str:
-        return VisualEffectMode.validate(
+        mode = VisualEffectMode.validate(
             getattr(self.theme_settings, "visual_effect_mode", VisualEffectMode.DEFAULT)
         )
+        if mode == VisualEffectMode.WINDOWS_ACRYLIC:
+            # 单窗口输入栏没有独立 HWND，旧 Windows 亚克力配置按当前可用效果降级为软件高斯模糊。
+            return VisualEffectMode.GAUSSIAN_BLUR
+        if mode == VisualEffectMode.MACOS_VISUAL_EFFECT and sys.platform != "darwin":
+            return VisualEffectMode.GAUSSIAN_BLUR
+        return mode
 
     def _apply_input_bar_visual_effect_property(self, mode: str) -> None:
         """同步动态样式属性，让纯色块等模式能触发对应 QSS。"""
@@ -3875,30 +3885,92 @@ class PetWindow(QWidget):
             style.polish(widget)
             widget.update()
 
-    def _input_bar_blur_pipeline(self) -> tuple[bool, Callable[[], None] | None]:
-        """根据当前视觉效果模式返回 (是否需要软件模糊背景层, 显示前截图回调)。
+    def _input_bar_uses_native_macos_backdrop(self) -> bool:
+        return (
+            sys.platform == "darwin"
+            and self._input_bar_visual_effect_mode() == VisualEffectMode.MACOS_VISUAL_EFFECT
+        )
 
-        单窗口重构后输入栏为子控件，原生亚克力/macOS 毛玻璃依赖独立 HWND 已不可用：
+    def _input_bar_blur_pipeline(
+        self,
+    ) -> tuple[
+        bool,
+        Callable[[], None] | None,
+        Callable[[], None] | None,
+        Callable[[], None] | None,
+    ]:
+        """根据当前视觉效果模式返回背景层与动画 hook。
+
+        单窗口重构后输入栏为子控件，Windows 亚克力依赖独立 HWND，不再作为可选效果：
         - SOLID：纯色块，无背景层、无回调；
-        - 其余（高斯模糊 / 原 Windows 亚克力 / 原 macOS 毛玻璃）：统一用窗口内软件高斯模糊呈现。
+        - GAUSSIAN_BLUR / 旧 WINDOWS_ACRYLIC：窗口内软件高斯模糊；
+        - macOS 原生毛玻璃：NSVisualEffectView，显示后挂载，隐藏前移除。
         同时同步动态 QSS 属性，使纯色等模式能触发对应样式。
         """
         mode = self._input_bar_visual_effect_mode()
         self._apply_input_bar_visual_effect_property(mode)
         if mode == VisualEffectMode.SOLID:
-            return False, None
-        return True, self._refresh_input_blur_background
+            return False, None, None, None
+        if mode == VisualEffectMode.MACOS_VISUAL_EFFECT:
+            return False, None, self._apply_input_bar_native_backdrop, self._remove_input_bar_native_backdrop
+        return True, self._refresh_input_blur_background, None, None
 
     def _sync_input_bar_backdrop(self) -> None:
-        """外观效果模式 / 主题改变时，重建输入栏窗口内软件模糊背景管线。"""
-        needs_bg, before_show = self._input_bar_blur_pipeline()
+        """外观效果模式 / 主题改变时，重建输入栏背景管线。"""
+        native_enabled = self._input_bar_uses_native_macos_backdrop()
+        needs_bg, before_show, after_show, before_hide = self._input_bar_blur_pipeline()
         card = getattr(self, "input_card", None)
         bg = getattr(self, "input_blur_background", None)
         if card is not None:
             card.set_background_layer(bg if needs_bg else None)
+        if native_enabled:
+            self._sync_input_bar_native_backdrop_geometry()
+        else:
+            self._remove_input_bar_native_backdrop()
         animator = getattr(self, "input_bar_animator", None)
         if animator is not None:
-            animator.set_before_show(before_show)
+            set_before_show = getattr(animator, "set_before_show", None)
+            if callable(set_before_show):
+                set_before_show(before_show)
+            set_after_show = getattr(animator, "set_after_show", None)
+            if callable(set_after_show):
+                set_after_show(after_show)
+            set_before_hide = getattr(animator, "set_before_hide", None)
+            if callable(set_before_hide):
+                set_before_hide(before_hide)
+
+    def _apply_input_bar_native_backdrop(self) -> None:
+        """在 macOS 输入栏子视图背后安装原生 NSVisualEffectView。"""
+        if not self._input_bar_uses_native_macos_backdrop():
+            return
+        card = getattr(self, "input_card", None)
+        if card is None or not card.isVisible():
+            return
+        backdrop = getattr(self, "input_native_backdrop", None)
+        if backdrop is None:
+            backdrop = MacOSVisualEffectBackdrop()
+            self.input_native_backdrop = backdrop
+        try:
+            backdrop.apply(card, self._card_tint())
+        except Exception as exc:  # noqa: BLE001
+            debug_log("UI", "输入栏 macOS 原生毛玻璃应用失败", {"error": str(exc)})
+
+    def _remove_input_bar_native_backdrop(self) -> None:
+        """移除输入栏 macOS 原生毛玻璃层，避免模式切换或隐藏后残留。"""
+        backdrop = getattr(self, "input_native_backdrop", None)
+        card = getattr(self, "input_card", None)
+        if backdrop is None or card is None:
+            return
+        try:
+            backdrop.remove(card)
+        except Exception as exc:  # noqa: BLE001
+            debug_log("UI", "输入栏 macOS 原生毛玻璃移除失败", {"error": str(exc)})
+
+    def _sync_input_bar_native_backdrop_geometry(self) -> None:
+        """输入栏布局变化时同步 NSVisualEffectView frame。"""
+        if not self._input_bar_uses_native_macos_backdrop():
+            return
+        self._apply_input_bar_native_backdrop()
 
     # ── 角色切换 ─────────────────────────────────────────────────────
 

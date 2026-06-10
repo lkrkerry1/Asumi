@@ -5111,6 +5111,52 @@ def test_settings_dialog_returns_theme_settings() -> None:
     app.processEvents()
 
 
+def test_settings_dialog_downgrades_saved_windows_acrylic_to_gaussian(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import window_backdrop as window_backdrop_module
+    from app.ui.settings_dialog import SettingsDialog
+    from app.ui.window_backdrop import VisualEffectMode
+
+    monkeypatch.setattr(window_backdrop_module.sys, "platform", "win32")
+    monkeypatch.setattr(window_backdrop_module, "_windows_build", lambda: 22631)
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("theme_settings_windows_acrylic_downgrade")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        theme_settings=ThemeSettings(visual_effect_mode=VisualEffectMode.WINDOWS_ACRYLIC),
+    )
+
+    labels = [
+        dialog.theme_visual_effect_combo.itemText(index)
+        for index in range(dialog.theme_visual_effect_combo.count())
+    ]
+    assert "Windows 亚克力模糊" not in labels
+    assert dialog.theme_visual_effect_combo.currentData() == VisualEffectMode.GAUSSIAN_BLUR
+
+    dialog.accept()
+
+    assert dialog.result_theme_settings is not None
+    assert dialog.result_theme_settings.visual_effect_mode == VisualEffectMode.GAUSSIAN_BLUR
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_character_selection_loads_character_theme() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -7347,7 +7393,7 @@ def test_pet_window_applies_visual_effect_dynamic_property() -> None:
 
 
 def test_sync_input_bar_backdrop_toggles_software_blur_layer_by_mode() -> None:
-    """单窗口重构后：纯色模式不挂软件模糊背景层，其余模式挂载并绑定截图回调。"""
+    """单窗口重构后：纯色模式不挂软件模糊背景层，高斯模式挂载并绑定截图回调。"""
     from app.ui.pet_window import PetWindow
     from app.ui.theme import ThemeSettings
     from app.ui.window_backdrop import VisualEffectMode
@@ -7389,6 +7435,130 @@ def test_sync_input_bar_backdrop_toggles_software_blur_layer_by_mode() -> None:
     PetWindow._sync_input_bar_backdrop(blur)
     assert blur.input_card.layer is blur_bg
     assert blur.input_bar_animator.before_show == blur._refresh_input_blur_background
+
+
+def test_input_bar_windows_acrylic_config_degrades_to_software_blur(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """旧 windows_acrylic 配置不再回显原生亚克力，运行时降级为高斯模糊。"""
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+    from app.ui.theme import ThemeSettings
+    from app.ui.window_backdrop import VisualEffectMode
+
+    monkeypatch.setattr(pet_window_module.sys, "platform", "win32")
+
+    class CardStub:
+        def __init__(self) -> None:
+            self.layer = "untouched"
+
+        def set_background_layer(self, layer) -> None:  # type: ignore[no-untyped-def]
+            self.layer = layer
+
+    class AnimatorStub:
+        def __init__(self) -> None:
+            self.before_show = "untouched"
+            self.after_show = "untouched"
+            self.before_hide = "untouched"
+
+        def set_before_show(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.before_show = callback
+
+        def set_after_show(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.after_show = callback
+
+        def set_before_hide(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.before_hide = callback
+
+    blur_bg = object()
+    window = PetWindow.__new__(PetWindow)
+    window.theme_settings = ThemeSettings(visual_effect_mode=VisualEffectMode.WINDOWS_ACRYLIC)
+    window.input_card = CardStub()
+    window.input_blur_background = blur_bg
+    window.input_bar = None
+    window.input_edit = None
+    window.input_bar_animator = AnimatorStub()
+
+    PetWindow._sync_input_bar_backdrop(window)
+
+    assert PetWindow._input_bar_visual_effect_mode(window) == VisualEffectMode.GAUSSIAN_BLUR
+    assert window.input_card.layer is blur_bg
+    assert window.input_bar_animator.before_show == window._refresh_input_blur_background
+    assert window.input_bar_animator.after_show is None
+    assert window.input_bar_animator.before_hide is None
+
+
+def test_sync_input_bar_backdrop_uses_macos_native_backdrop(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """macOS 原生毛玻璃模式不走软件截图模糊，而是挂载 NSVisualEffectView backdrop。"""
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+    from app.ui.theme import ThemeSettings
+    from app.ui.window_backdrop import VisualEffectMode
+
+    monkeypatch.setattr(pet_window_module.sys, "platform", "darwin")
+
+    class CardStub:
+        def __init__(self) -> None:
+            self.layer = "untouched"
+            self.visible = True
+
+        def set_background_layer(self, layer) -> None:  # type: ignore[no-untyped-def]
+            self.layer = layer
+
+        def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return self.visible
+
+    class BackdropStub:
+        def __init__(self) -> None:
+            self.applied: list[object] = []
+            self.removed: list[object] = []
+
+        def apply(self, window, _tint) -> None:  # type: ignore[no-untyped-def]
+            self.applied.append(window)
+
+        def remove(self, window) -> None:  # type: ignore[no-untyped-def]
+            self.removed.append(window)
+
+    class AnimatorStub:
+        def __init__(self) -> None:
+            self.before_show = "untouched"
+            self.after_show = "untouched"
+            self.before_hide = "untouched"
+
+        def set_before_show(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.before_show = callback
+
+        def set_after_show(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.after_show = callback
+
+        def set_before_hide(self, callback) -> None:  # type: ignore[no-untyped-def]
+            self.before_hide = callback
+
+    blur_bg = object()
+    backdrop = BackdropStub()
+    window = PetWindow.__new__(PetWindow)
+    window.theme_settings = ThemeSettings(visual_effect_mode=VisualEffectMode.MACOS_VISUAL_EFFECT)
+    window.input_card = CardStub()
+    window.input_blur_background = blur_bg
+    window.input_native_backdrop = backdrop
+    window.input_bar = None
+    window.input_edit = None
+    window.input_bar_animator = AnimatorStub()
+
+    PetWindow._sync_input_bar_backdrop(window)
+
+    assert window.input_card.layer is None
+    assert window.input_bar_animator.before_show is None
+    assert window.input_bar_animator.after_show == window._apply_input_bar_native_backdrop
+    assert window.input_bar_animator.before_hide == window._remove_input_bar_native_backdrop
+    assert backdrop.applied == [window.input_card]
+
+    window.theme_settings = ThemeSettings(visual_effect_mode=VisualEffectMode.GAUSSIAN_BLUR)
+    PetWindow._sync_input_bar_backdrop(window)
+
+    assert window.input_card.layer is blur_bg
+    assert window.input_bar_animator.before_show == window._refresh_input_blur_background
+    assert window.input_bar_animator.after_show is None
+    assert window.input_bar_animator.before_hide is None
+    assert backdrop.removed == [window.input_card]
 
 
 def test_local_rect_to_global_keeps_size_and_uses_main_window_origin() -> None:
