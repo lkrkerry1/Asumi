@@ -150,7 +150,6 @@ class MacOSVisualEffectBackdrop:
 
             import objc  # pyobjc-core
             from AppKit import (
-                NSColor,
                 NSView,
                 NSVisualEffectBlendingModeBehindWindow,
                 NSVisualEffectMaterialUnderWindowBackground,
@@ -180,8 +179,6 @@ class MacOSVisualEffectBackdrop:
             # ── Content Swap ──
             # 创建一个新的透明容器，替换 NSWindow 的 contentView，
             # 然后把 Qt 的 root_view 和 NSVisualEffectView 都加入新容器。
-            from Foundation import NSMakeRect
-
             frame_w = float(window.width())
             frame_h = float(window.height())
             container_frame = NSMakeRect(0.0, 0.0, frame_w, frame_h)
@@ -233,28 +230,27 @@ class MacOSVisualEffectBackdrop:
 
     def remove(self, window: QWidget) -> None:
         del window
+        # 移除 effect view
         if self._effect_view is not None:
             try:
                 self._effect_view.removeFromSuperview()
             except Exception:  # noqa: BLE001
                 pass
-            finally:
-                self._effect_view = None
-        # 恢复原始 contentView，并重新挂回 Qt 的 root_view
+        # 恢复原始 contentView（将 root_view 从容器移回）
         try:
             if self._container is not None and self._original_content_view is not None:
                 ns_window = self._container.window()
-                if ns_window is not None:
-                    if self._root_view is not None:
-                        self._root_view.removeFromSuperview()
-                        self._original_content_view.addSubview_(self._root_view)
+                if ns_window is not None and self._root_view is not None:
+                    self._root_view.removeFromSuperview()
+                    self._original_content_view.addSubview_(self._root_view)
                     ns_window.setContentView_(self._original_content_view)
         except Exception:  # noqa: BLE001
             pass
-        finally:
-            self._container = None
-            self._original_content_view = None
-            self._root_view = None
+        # 始终清空所有状态
+        self._effect_view = None
+        self._container = None
+        self._original_content_view = None
+        self._root_view = None
 
     def supports_native_blur(self) -> bool:
         return True

@@ -3820,24 +3820,18 @@ class PetWindow(QWidget):
         return backdrop, needs_bg, before_show
 
     def _sync_input_bar_backdrop(self) -> None:
-        """外观效果模式 / 主题改变时，重建整个输入栏外观管线。
-
-        所有模式对称统一处理：
-        - backdrop 的 remove / apply
-        - InputBlurBackground 背景层的显隐
-        - InputBarAnimator 的 before_show 回调（仅高斯模糊需要截图）
-        """
+        """外观效果模式 / 主题改变时，重建整个输入栏外观管线。"""
         backdrop, needs_bg, before_show = self._backdrop_for_input_bar()
         window = getattr(self, "input_window", None)
         if window is None:
             return
 
-        # 模式未变则跳过，避免频繁删除/创建导致白色闪烁
         if type(window._backdrop) is type(backdrop):  # noqa: SLF001
             return
 
-        # 模式真正变化：隐藏 → 同步 → 应用新 → 显示
-        # hide + processEvents 确保 NSWindow 在 remove 前已不可见，避免中间态白框
+        # 用户可见时才需要过渡动画。窗口始终不手动 apply —
+        # 由 show() → showEvent → backdrop.apply(window) 接管，
+        # 保证 winId 有效（hidden 时 winId==0 会 crash PyObjC/ctypes）。
         visible = window.isVisible()
         if visible:
             window.hide()
@@ -3850,7 +3844,7 @@ class PetWindow(QWidget):
 
         window._backdrop = backdrop  # noqa: SLF001
 
-        # 控制软件模糊背景层显隐
+        # 同步软件模糊背景层和 InputBarAnimator 回调
         bg = getattr(self, "input_blur_background", None)
         window._background_layer = bg if needs_bg else None  # noqa: SLF001
         if bg is not None:
@@ -3862,15 +3856,11 @@ class PetWindow(QWidget):
             else:
                 bg.hide()
 
-        # 同步 InputBarAnimator 的 before_show 回调
         animator = getattr(self, "input_bar_animator", None)
         if animator is not None:
             animator.set_before_show(before_show)
 
-        # 重新应用新 backdrop 并显示
         if visible:
-            tint = self._card_tint()
-            backdrop.apply(window, tint)
             window.show()
 
     # ── 角色切换 ─────────────────────────────────────────────────────
