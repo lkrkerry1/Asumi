@@ -3756,8 +3756,7 @@ class PetWindow(QWidget):
             self.tray_icon.setIcon(_build_status_tray_icon(self.theme_settings.primary_color))
 
     def _apply_app_chrome_stylesheet(self) -> None:
-        # 全局美化下拉弹窗与滚动条：这些是独立顶层控件，对话框级样式传播不到，
-        # 且 app 用 Fusion 风格后系统原生外观失效，只能在 QApplication 级统一设置。
+        # 全局美化滚动条与菜单等独立顶层控件。
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(build_app_chrome_stylesheet(self.theme_settings))

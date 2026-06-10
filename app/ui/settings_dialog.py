@@ -7,11 +7,10 @@ from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QSize, QStringListModel, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QBrush, QColor, QPainterPath, QPalette, QRegion
+from PySide6.QtCore import QObject, QStringListModel, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QComboBox,
     QCompleter,
@@ -26,9 +25,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListView,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QMenu,
     QPushButton,
@@ -134,17 +130,13 @@ from app.voice.tts import (
 from app.ui.tts_bundle_dialog import TTSBundleDownloadDialog
 from app.ui.theme import (
     DEFAULT_THEME_SETTINGS,
-    SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME,
-    SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME,
     THEME_COLOR_FIELDS,
     ThemeSettings,
-    build_app_chrome_stylesheet,
     build_color_button_stylesheet,
     build_settings_dialog_stylesheet,
     normalize_hex_color,
     mix,
     parse_ai_theme_response,
-    rgba,
 )
 from app.ui.window_backdrop import VisualEffectMode
 from app.voice.tts_bundle import default_provider_bundle_work_dir, is_provider_bundle_work_dir
@@ -153,17 +145,6 @@ from sdk.types import SettingsPanelContribution, ToolsTabContribution
 
 MEMORY_READING_TEXT = "正在读取长期记忆..."
 MEMORY_DEPENDENCY_LOADING_TEXT = "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。"
-SETTINGS_COMBO_POPUP_ITEM_HEIGHT = 28
-SETTINGS_COMBO_POPUP_PADDING = 0
-
-
-def _prepare_combo_popup_view(combo: QComboBox) -> None:
-    # 仍给内置 view 标记对象名，避免 Qt 在补全/辅助绘制路径里回落到默认样式。
-    view = QListView(combo)
-    view.setFrameShape(QFrame.Shape.NoFrame)
-    view.setLineWidth(0)
-    view.setObjectName(SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME)
-    combo.setView(view)
 
 
 def _prepare_popup_menu(menu: QMenu) -> None:
@@ -174,88 +155,6 @@ def _prepare_popup_menu(menu: QMenu) -> None:
         | Qt.WindowType.NoDropShadowWindowHint
     )
     menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-
-
-def _apply_combo_popup_palette(widget: QWidget, settings: ThemeSettings) -> None:
-    """给自绘下拉/补全弹层显式同步调色板，避免沿用旧的全局主题色。"""
-    theme = settings.normalized()
-    background = QColor(theme.input_background_color)
-    text = QColor(theme.text_color)
-    selected = QColor(theme.primary_color)
-    palette = widget.palette()
-    for role in (
-        QPalette.ColorRole.Window,
-        QPalette.ColorRole.Base,
-        QPalette.ColorRole.AlternateBase,
-    ):
-        palette.setColor(role, background)
-    palette.setColor(QPalette.ColorRole.Text, text)
-    palette.setColor(QPalette.ColorRole.WindowText, text)
-    palette.setColor(QPalette.ColorRole.Highlight, selected)
-    palette.setColor(QPalette.ColorRole.HighlightedText, text)
-    widget.setPalette(palette)
-    widget.setAutoFillBackground(True)
-    widget.setStyleSheet(_combo_popup_stylesheet(theme))
-    viewport = getattr(widget, "viewport", lambda: None)()
-    if isinstance(viewport, QWidget):
-        viewport.setPalette(palette)
-        viewport.setAutoFillBackground(True)
-
-
-def _combo_popup_stylesheet(settings: ThemeSettings) -> str:
-    theme = settings.normalized()
-    return f"""
-QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME} {{
-    background: {rgba(theme.input_background_color, 246)};
-    border: none;
-    border-radius: 7px;
-    padding: 0;
-}}
-QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME},
-QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME},
-QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} {{
-    background: {rgba(theme.input_background_color, 246)};
-    border: none;
-    border-radius: 7px;
-    color: {theme.text_color};
-    outline: 0;
-    padding: 0;
-    selection-background-color: {rgba(theme.primary_color, 72)};
-    selection-color: {theme.text_color};
-}}
-QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport,
-QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport,
-QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME} QWidget#qt_scrollarea_viewport {{
-    background: {rgba(theme.input_background_color, 246)};
-}}
-QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item,
-QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item,
-QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item {{
-    min-height: 22px;
-    padding: 3px 8px;
-    border: 1px solid transparent;
-    border-radius: 5px;
-}}
-QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover,
-QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover,
-QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:hover {{
-    background: {rgba(theme.primary_color, 34)};
-    border: 1px solid {rgba(theme.primary_color, 58)};
-}}
-QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
-QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
-QAbstractItemView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active,
-QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
-QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
-QListView#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active,
-QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected,
-QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:active,
-QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}::item:selected:!active {{
-    background: {rgba(theme.primary_color, 72)};
-    border: 1px solid {rgba(theme.primary_color, 118)};
-    color: {theme.text_color};
-}}
-"""
 
 
 class ApiConnectionTestWorker(QObject):
@@ -300,97 +199,7 @@ class ApiModelListProbeWorker(QObject):
             self.finished.emit()
 
 
-class SettingsComboBox(QComboBox):
-    """设置页下拉框，使用自绘无边框弹层避开 Qt 原生矩形容器。"""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        _prepare_combo_popup_view(self)
-        self._popup_frame: QFrame | None = None
-        self._popup_list: QListWidget | None = None
-        self._popup_theme = DEFAULT_THEME_SETTINGS
-
-    def set_popup_theme(self, settings: ThemeSettings) -> None:
-        self._popup_theme = settings.normalized()
-        if self._popup_frame is not None:
-            _apply_combo_popup_palette(self._popup_frame, self._popup_theme)
-        if self._popup_list is not None:
-            _apply_combo_popup_palette(self._popup_list, self._popup_theme)
-
-    def showPopup(self) -> None:  # noqa: N802 - Qt 虚函数命名。
-        if not self.isEnabled() or self.count() <= 0:
-            return
-        popup, popup_list = self._ensure_popup()
-        self.set_popup_theme(self._popup_theme)
-        popup_list.clear()
-        for index in range(self.count()):
-            item = QListWidgetItem(self.itemText(index))
-            item.setData(Qt.ItemDataRole.UserRole, index)
-            item.setSizeHint(QSize(0, SETTINGS_COMBO_POPUP_ITEM_HEIGHT))
-            popup_list.addItem(item)
-        if self.currentIndex() >= 0:
-            popup_list.setCurrentRow(self.currentIndex())
-
-        visible_rows = min(max(self.count(), 1), 10)
-        popup_height = (
-            SETTINGS_COMBO_POPUP_ITEM_HEIGHT * visible_rows
-            + SETTINGS_COMBO_POPUP_PADDING
-        )
-        popup_list.setFixedHeight(popup_height)
-        bottom_left = self.mapToGlobal(self.rect().bottomLeft())
-        popup.setGeometry(bottom_left.x(), bottom_left.y(), self.width(), popup_height)
-        path = QPainterPath()
-        path.addRoundedRect(0, 0, self.width(), popup_height, 7, 7)
-        popup.setMask(QRegion(path.toFillPolygon().toPolygon()))
-        popup.show()
-        popup.raise_()
-        popup_list.setFocus(Qt.FocusReason.PopupFocusReason)
-
-    def hidePopup(self) -> None:  # noqa: N802 - Qt 虚函数命名。
-        if self._popup_frame is not None:
-            self._popup_frame.hide()
-
-    def _ensure_popup(self) -> tuple[QFrame, QListWidget]:
-        if self._popup_frame is None or self._popup_list is None:
-            popup = QFrame(
-                self,
-                Qt.WindowType.Popup
-                | Qt.WindowType.FramelessWindowHint
-                | Qt.WindowType.NoDropShadowWindowHint,
-            )
-            popup.setObjectName(SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME)
-            popup.setFrameShape(QFrame.Shape.NoFrame)
-            popup.setLineWidth(0)
-
-            popup_list = QListWidget(popup)
-            popup_list.setObjectName(SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME)
-            popup_list.setFrameShape(QFrame.Shape.NoFrame)
-            popup_list.setLineWidth(0)
-            popup_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-            popup_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-            popup_list.itemClicked.connect(self._select_popup_item)
-            popup_list.itemActivated.connect(self._select_popup_item)
-            _apply_combo_popup_palette(popup, self._popup_theme)
-            _apply_combo_popup_palette(popup_list, self._popup_theme)
-
-            layout = QVBoxLayout()
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.addWidget(popup_list)
-            popup.setLayout(layout)
-            self._popup_frame = popup
-            self._popup_list = popup_list
-        return self._popup_frame, self._popup_list
-
-    def _select_popup_item(self, item: QListWidgetItem) -> None:
-        index = int(item.data(Qt.ItemDataRole.UserRole))
-        if 0 <= index < self.count():
-            self.setCurrentIndex(index)
-            if self.isEditable():
-                self.setEditText(self.itemText(index))
-        self.hidePopup()
-
-
-class ModelComboBox(SettingsComboBox):
+class ModelComboBox(QComboBox):
     """可编辑模型选择框，保留 QLineEdit 风格的 text/setText 兼容接口。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -398,22 +207,11 @@ class ModelComboBox(SettingsComboBox):
         self._model_names: list[str] = []
         self._completion_model = QStringListModel(self)
         completer = QCompleter(self._completion_model, self)
-        completion_popup = QListView(self)
-        completion_popup.setFrameShape(QFrame.Shape.NoFrame)
-        completion_popup.setLineWidth(0)
-        completion_popup.setObjectName(SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME)
-        completer.setPopup(completion_popup)
         completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self._completion_popup = completion_popup
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.setCompleter(completer)
-        self.set_popup_theme(DEFAULT_THEME_SETTINGS)
-
-    def set_popup_theme(self, settings: ThemeSettings) -> None:
-        super().set_popup_theme(settings)
-        _apply_combo_popup_palette(self._completion_popup, self._popup_theme)
 
     def setText(self, text: str) -> None:
         self.setEditText(text)
@@ -422,7 +220,6 @@ class ModelComboBox(SettingsComboBox):
         return self.currentText()
 
     def set_model_names(self, model_names: list[str]) -> None:
-        self.hidePopup()
         current_text = self.currentText().strip()
         self._model_names = list(model_names)
         self.blockSignals(True)
@@ -821,7 +618,7 @@ class SettingsDialog(QDialog):
         current_character: CharacterProfile | None,
     ) -> QWidget:
         tab = QWidget(self)
-        self.character_combo = SettingsComboBox(tab)
+        self.character_combo = QComboBox(tab)
         self.character_empty_label = QLabel("尚未导入角色", tab)
         self._refresh_character_combo(
             current_character.id if current_character is not None else None
@@ -920,7 +717,7 @@ class SettingsDialog(QDialog):
         self.theme_text_edit = self.theme_color_edits["text_color"]
         self.theme_text_button = self.theme_color_buttons["text_color"]
         # 外观效果模式下拉框
-        self.theme_visual_effect_combo = SettingsComboBox(tab)
+        self.theme_visual_effect_combo = QComboBox(tab)
         for mode_id in VisualEffectMode.available_modes():
             label = {
                 VisualEffectMode.SOLID: "纯色块",
@@ -1140,7 +937,7 @@ class SettingsDialog(QDialog):
         self.tts_enabled_check = QCheckBox("启用 TTS 语音", tab)
         self.tts_enabled_check.setChecked(settings.enabled)
 
-        self.tts_provider_combo = SettingsComboBox(tab)
+        self.tts_provider_combo = QComboBox(tab)
         self.tts_provider_combo.addItem("GPT-SoVITS 整合包（GPU）", TTS_PROVIDER_GPT_SOVITS)
         self.tts_provider_combo.addItem("Genie TTS 整合包（CPU）", TTS_PROVIDER_GENIE)
         self.tts_provider_combo.addItem("自定义 GPT-SoVITS（macOS/Linux）", TTS_PROVIDER_CUSTOM_GPT_SOVITS)
@@ -2139,9 +1936,6 @@ class SettingsDialog(QDialog):
         theme = settings.normalized()
         self.theme_settings = theme
         self.setStyleSheet(build_settings_dialog_stylesheet(theme))
-        self._apply_app_chrome_stylesheet()
-        for combo in self.findChildren(SettingsComboBox):
-            combo.set_popup_theme(theme)
         inline_styles = {
             "theme_status_label": f"color: {theme.muted_text_color};",
             "memory_status_label": f"color: {theme.muted_text_color};",
@@ -2153,12 +1947,6 @@ class SettingsDialog(QDialog):
             widget = getattr(self, attr, None)
             if isinstance(widget, QLabel):
                 widget.setStyleSheet(style)
-
-    def _apply_app_chrome_stylesheet(self) -> None:
-        # QComboBox 弹出列表是独立顶层控件，对话框级样式不会稳定传播到弹层。
-        app = QApplication.instance()
-        if app is not None:
-            app.setStyleSheet(build_app_chrome_stylesheet(self.theme_settings))
 
     def _choose_theme_color(self, edit: QLineEdit) -> None:
         current_color = QColor(normalize_hex_color(edit.text(), DEFAULT_THEME_SETTINGS.primary_color))

@@ -19,10 +19,7 @@ from app.llm.chat_reply import ChatSegment
 from app.ui.portrait_utils import portrait_kind_key, should_crossfade_portrait
 from app.ui.theme import (
     DEFAULT_THEME_SETTINGS,
-    SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME,
-    SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME,
     ThemeSettings,
-    build_app_chrome_stylesheet,
     build_message_box_stylesheet,
     build_pet_window_stylesheet,
 )
@@ -1459,23 +1456,17 @@ priority: 10
 
 def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QTabWidget")):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QComboBox", "QTabWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
-    from app.ui.settings_dialog import (
-        SETTINGS_COMBO_POPUP_ITEM_HEIGHT,
-        SETTINGS_COMBO_POPUP_PADDING,
-        SettingsComboBox,
-        SettingsDialog,
-    )
+    from app.ui.settings_dialog import SettingsDialog
 
-    Qt = qtcore.Qt
     QApplication = qtwidgets.QApplication
-    QFrame = qtwidgets.QFrame
+    QComboBox = qtwidgets.QComboBox
     QTabWidget = qtwidgets.QTabWidget
     app = QApplication.instance() or QApplication([])
+    app_stylesheet_before = app.styleSheet()
     root = _ui_runtime_root("grouped_settings_tabs")
     dialog = SettingsDialog(
         api_settings=ApiSettings(
@@ -1505,13 +1496,14 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     assert dialog.height() >= 640
     assert "QWidget#settingsScrollViewport" in dialog.styleSheet()
     assert "QWidget#settingsPluginTab" in dialog.styleSheet()
+    assert "combobox-popup: 0;" in dialog.styleSheet()
     assert "QComboBox::drop-down" in dialog.styleSheet()
     assert "QComboBox::down-arrow" in dialog.styleSheet()
     assert "QComboBox QAbstractItemView" in dialog.styleSheet()
-    assert f"QFrame#{SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME}" in dialog.styleSheet()
-    assert f"QListWidget#{SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME}" in dialog.styleSheet()
     assert "QComboBox QAbstractItemView::item:selected" in dialog.styleSheet()
     assert "QComboBox QAbstractItemView::item:selected:!active" in dialog.styleSheet()
+    assert "QComboBoxPrivateContainer" not in dialog.styleSheet()
+    assert "settingsComboPopup" not in dialog.styleSheet()
     assert "QSpinBox::up-button" in dialog.styleSheet()
     assert "QSpinBox::down-button" in dialog.styleSheet()
     assert "QLineEdit:disabled" in dialog.styleSheet()
@@ -1519,43 +1511,18 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     assert "QComboBox:disabled" in dialog.styleSheet()
     assert "QSpinBox::up-button:disabled" in dialog.styleSheet()
     assert "QGroupBox QWidget" not in dialog.styleSheet()
-    assert dialog.character_combo.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
-    assert dialog.model_edit.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
-    assert dialog.model_edit.completer().popup().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
-    assert dialog.tts_provider_combo.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
-    assert isinstance(dialog.theme_visual_effect_combo, SettingsComboBox)
-    assert dialog.theme_visual_effect_combo.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
-    assert app.styleSheet() == build_app_chrome_stylesheet(dialog.theme_settings)
+    assert type(dialog.character_combo) is QComboBox
+    assert isinstance(dialog.model_edit, QComboBox)
+    assert type(dialog.tts_provider_combo) is QComboBox
+    assert type(dialog.theme_visual_effect_combo) is QComboBox
+    assert not hasattr(dialog.character_combo, "_popup_frame")
+    assert not hasattr(dialog.model_edit, "_popup_frame")
+    assert app.styleSheet() == app_stylesheet_before
 
+    combo_bottom = dialog.character_combo.mapToGlobal(dialog.character_combo.rect().bottomLeft()).y()
     dialog.character_combo.showPopup()
     app.processEvents()
-    popup_container = dialog.character_combo._popup_frame
-    popup_list = dialog.character_combo._popup_list
-    assert popup_container is not None
-    assert popup_list is not None
-    assert popup_container.objectName() == SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME
-    assert popup_container.frameShape() == QFrame.Shape.NoFrame
-    dialog.character_combo.hidePopup()
-
-    dialog.theme_visual_effect_combo.showPopup()
-    app.processEvents()
-    effect_popup_container = dialog.theme_visual_effect_combo._popup_frame
-    effect_popup_list = dialog.theme_visual_effect_combo._popup_list
-    assert effect_popup_container is not None
-    assert effect_popup_list is not None
-    assert effect_popup_container.objectName() == SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME
-    assert effect_popup_list.objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
-    expected_effect_popup_height = (
-        SETTINGS_COMBO_POPUP_ITEM_HEIGHT * dialog.theme_visual_effect_combo.count()
-        + SETTINGS_COMBO_POPUP_PADDING
-    )
-    assert effect_popup_container.height() == expected_effect_popup_height
-    assert effect_popup_list.height() == expected_effect_popup_height
-    assert effect_popup_list.item(0).sizeHint().height() == SETTINGS_COMBO_POPUP_ITEM_HEIGHT
-    dialog.theme_visual_effect_combo.hidePopup()
-    assert bool(popup_container.windowFlags() & Qt.WindowType.FramelessWindowHint)
-    assert bool(popup_container.windowFlags() & Qt.WindowType.NoDropShadowWindowHint)
-    assert popup_list.objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
+    assert dialog.character_combo.view().window().geometry().top() >= combo_bottom
     dialog.character_combo.hidePopup()
 
     dialog.deleteLater()
@@ -2344,11 +2311,7 @@ def test_settings_dialog_model_probe_populates_candidates_and_selects_first(monk
 
     assert dialog.model_edit.currentText() == "z-model"
     assert [dialog.model_edit.itemText(index) for index in range(dialog.model_edit.count())] == ["z-model", "a-model"]
-    dialog.model_edit.showPopup()
-    app.processEvents()
-    assert dialog.model_edit._popup_list is not None
-    assert dialog.model_edit._popup_list.count() == 2
-    dialog.model_edit.hidePopup()
+    assert not hasattr(dialog.model_edit, "_popup_list")
     assert infos and "2" in infos[0]
     dialog.deleteLater()
     app.processEvents()
@@ -2386,21 +2349,18 @@ def test_settings_dialog_model_popups_follow_current_theme_stylesheet() -> None:
     )
 
     dialog.model_edit.set_model_names(["alpha-model", "beta-model"])
-    dialog.model_edit.showPopup()
-    app.processEvents()
-    popup_list = dialog.model_edit._popup_list
-    completion_popup = dialog.model_edit.completer().popup()
+    stylesheet = dialog.styleSheet()
 
-    assert popup_list is not None
-    assert rgba("#102030", 246) in popup_list.styleSheet()
-    assert rgba(themed.primary_color, 34) in popup_list.styleSheet()
-    assert rgba(themed.primary_color, 72) in popup_list.styleSheet()
-    assert "#ddeeff" in popup_list.styleSheet()
-    assert rgba("#102030", 246) in completion_popup.styleSheet()
-    assert rgba(themed.primary_color, 72) in completion_popup.styleSheet()
-    assert "#ddeeff" in completion_popup.styleSheet()
+    assert "QComboBox QAbstractItemView" in stylesheet
+    assert rgba("#102030", 246) in stylesheet
+    assert rgba(themed.primary_color, 43) in stylesheet
+    assert "#ddeeff" in stylesheet
+    assert [dialog.model_edit.itemText(index) for index in range(dialog.model_edit.count())] == [
+        "alpha-model",
+        "beta-model",
+    ]
+    assert not hasattr(dialog.model_edit, "_popup_list")
 
-    dialog.model_edit.hidePopup()
     dialog.deleteLater()
     app.processEvents()
 
