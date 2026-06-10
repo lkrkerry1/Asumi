@@ -661,7 +661,7 @@ class PetWindow(QWidget):
         # 输入栏独立为可激活的卡片子窗口：默认视觉模式从主题读取，
         # 支持纯色/高斯模糊/Windows亚克力/macOS毛玻璃四种效果。
         self.input_blur_background = InputBlurBackground(corner_radius=22.0)
-        input_backdrop, needs_bg = self._backdrop_for_input_bar()
+        input_backdrop, needs_bg, input_before_show = self._backdrop_for_input_bar()
         self.input_window = AcrylicCardWindow(
             self.input_bar,
             activatable=True,
@@ -675,7 +675,7 @@ class PetWindow(QWidget):
             self._input_bar_pinned,
             self._cursor_in_pet_region,
             parent=self,
-            before_show=self._refresh_input_blur_background,
+            before_show=input_before_show,
         )
         # 气泡无操作自动隐藏控制器：说完话后倒计时，悬停桌宠暂停，超时淡出，点击桌宠唤回。
         self.bubble_settings = self.settings_service.load_bubble_settings()
@@ -1199,21 +1199,11 @@ class PetWindow(QWidget):
         return QRect(self.mapToGlobal(rect.topLeft()), rect.size())
 
     def _refresh_input_blur_background(self) -> None:
-        """输入栏现身前刷新软件模糊背景：截输入栏正后方那块桌面，模糊后铺到背景层。
+        """输入栏现身前刷新软件模糊背景：截输入栏正后方桌面，模糊后铺到背景层。
 
-        仅在当前视觉效果模式为高斯模糊（SoftwareBlurBackdrop 路径）时执行截图/模糊。
-        其他模式（纯色/macOS毛玻璃/Windows亚克力）不需要软件截图背景层，
-        反而会因为 hide() 破坏原生 NSWindow 的 Content Swap 状态导致毛玻璃永久失效。
+        此回调仅在高斯模糊模式下才会被绑定到 InputBarAnimator，其他模式不需要截图。
+        调用前已确保 input_window 在当前实际区域正上方，截图后再显示。
         """
-        # 非高斯模糊模式：不需要软件截图模糊，直接返回。
-        # 注意：不要在这里调用 hide()，否则 macOS 的 MacOSVisualEffectBackdrop
-        # Content Swap 会被销毁，且 apply() 的幂等检查会阻止重建。
-        mode = VisualEffectMode.validate(
-            getattr(self.theme_settings, "visual_effect_mode", VisualEffectMode.DEFAULT)
-        )
-        if mode != VisualEffectMode.GAUSSIAN_BLUR:
-            return
-
         background = getattr(self, "input_blur_background", None)
         input_rect = getattr(self, "_input_local_rect", None)
         if background is None or input_rect is None:
@@ -3804,20 +3794,40 @@ class PetWindow(QWidget):
         )
         return overlay
 
-    # ── 输入栏视觉效果模式 ────────────────────────────────────────────
+    # ── 输入栏视觉效果（对称统一管线）────────────────────────────────
 
     def _backdrop_for_input_bar(self) -> tuple:
-        """根据当前主题的 visual_effect_mode 返回 (backdrop, needs_bg_layer)。"""
+        """根据当前主题的 visual_effect_mode 返回 (backdrop, needs_bg_layer, before_show_callback)。
+
+        三种输出对称映射到四个视觉模式：
+        - SOLID:              FallbackTintBackdrop  + 无 bg 层 + 无回调
+        - GAUSSIAN_BLUR:      SoftwareBlurBackdrop  + InputBlurBackground 层 + 截图回调
+        - WINDOWS_ACRYLIC:    WindowsAcrylicBackdrop + 无 bg 层 + 无回调
+        - MACOS_VISUAL_EFFECT: MacOSVisualEffectBackdrop + 无 bg 层 + 无回调
+        """
         mode = VisualEffectMode.validate(
             getattr(self.theme_settings, "visual_effect_mode", VisualEffectMode.DEFAULT)
         )
-        needs_bg = (mode == VisualEffectMode.GAUSSIAN_BLUR)
         backdrop = create_window_backdrop(mode=mode)
-        return backdrop, needs_bg
+
+        if mode == VisualEffectMode.GAUSSIAN_BLUR:
+            needs_bg = True
+            before_show: Callable[[], None] | None = self._refresh_input_blur_background
+        else:
+            needs_bg = False
+            before_show = None
+
+        return backdrop, needs_bg, before_show
 
     def _sync_input_bar_backdrop(self) -> None:
-        """外观效果模式改变时，重建输入栏背景实现。"""
-        backdrop, needs_bg = self._backdrop_for_input_bar()
+        """外观效果模式 / 主题改变时，重建整个输入栏外观管线。
+
+        所有模式对称统一处理：
+        - backdrop 的 remove / apply
+        - InputBlurBackground 背景层的显隐
+        - InputBarAnimator 的 before_show 回调（仅高斯模糊需要截图）
+        """
+        backdrop, needs_bg, before_show = self._backdrop_for_input_bar()
         window = getattr(self, "input_window", None)
         if window is None:
             return
@@ -3851,6 +3861,11 @@ class PetWindow(QWidget):
                 bg.show()
             else:
                 bg.hide()
+
+        # 同步 InputBarAnimator 的 before_show 回调
+        animator = getattr(self, "input_bar_animator", None)
+        if animator is not None:
+            animator.set_before_show(before_show)
 
         # 重新应用新 backdrop 并显示
         if visible:
