@@ -3758,12 +3758,17 @@ class PetWindow(QWidget):
         self.bubble_height = next_bubble_height
         self.control_panel_vertical_offset = next_offset
         self.input_bar_offset = next_input_offset
-        # 用户在设置面板修改布局时清除自适应高度，使新 bubble_height 立即生效。
-        self._auto_fit_bubble_height = None
+        # 用户设置值作为气泡高度下限：
+        # - 若新设置 >= 当前自适应高度，清除自适应，使用用户值；
+        # - 若新设置 < 当前自适应高度，保留自适应状态不触发视觉变更，
+        #   等用户拖到超过自适应高度时再接管，避免拖动时错位。
+        if self._auto_fit_bubble_height is not None and next_bubble_height >= self._auto_fit_bubble_height:
+            self._auto_fit_bubble_height = None
+        effective_h = self._auto_fit_bubble_height if self._auto_fit_bubble_height is not None else self.bubble_height
         self.stage_size = _stage_size_for_layout(
             self.portrait_scale_percent,
             self.control_panel_width,
-            self.bubble_height,
+            effective_h,
             self.input_bar_offset,
         )
         self.portrait_controller.set_stage_size(self.stage_size)
