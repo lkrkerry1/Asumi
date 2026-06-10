@@ -399,6 +399,9 @@ class PetWindow(QWidget):
         self.input_bar_offset = self._load_input_bar_offset()
         # 自适应文本气泡高度（None = 使用用户设置的 bubble_height）
         self._auto_fit_bubble_height: int | None = None
+        # 程序主动调用 _resize_stage_anchor_bottom 时置 True，
+        # 防止 setGeometry 触发的 moveEvent 用旧 rect 重定位子窗口（产生一闪）。
+        self._repositioning_stage: bool = False
         (
             self.subtitle_typing_interval_ms,
             self.reply_segment_pause_ms,
@@ -727,7 +730,10 @@ class PetWindow(QWidget):
 
     def moveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().moveEvent(event)
-        self._reposition_child_windows()
+        # _repositioning_stage 为 True 时由 resizeEvent → _layout_stage 统一重定位，
+        # 此处跳过，避免 moveEvent 先于 resizeEvent 触发时用旧 rect 产生一闪。
+        if not self._repositioning_stage:
+            self._reposition_child_windows()
         # macOS 上拖动导致 Qt.Tool 子窗口层级丢失，需要重新 raise
         if sys.platform == "darwin":
             self._raise_foreground_controls()
@@ -1166,12 +1172,19 @@ class PetWindow(QWidget):
         """调整舞台尺寸，以底边为锚点向上增长（立绘屏幕位置保持不变）。
 
         直接 resize() 锚点在左上角，高度增加时底边下移导致立绘一起下移。
-        改为同步修正窗口 y 坐标：Δy = -(new_h - old_h)，底边固定。
+        改为 setGeometry 同步修正 y 坐标：Δy = -(new_h - old_h)，底边固定。
+        setGeometry 会同时触发 moveEvent 和 resizeEvent；用 _repositioning_stage
+        标记屏蔽 moveEvent 中的重定位，统一交由 resizeEvent → _layout_stage 处理，
+        避免 moveEvent 先触发时子窗口用旧坐标产生一闪。
         """
         new_w, new_h = new_size
         delta_h = new_h - self.height()
         pos = self.pos()
-        self.setGeometry(pos.x(), pos.y() - delta_h, new_w, new_h)
+        self._repositioning_stage = True
+        try:
+            self.setGeometry(pos.x(), pos.y() - delta_h, new_w, new_h)
+        finally:
+            self._repositioning_stage = False
 
     def _fit_bubble_for_label_height(self, label_h: int) -> None:
         """打字机溢出回调：按标签实际高度逐行扩展气泡（不持久化、不超上限）。"""
@@ -3720,7 +3733,6 @@ class PetWindow(QWidget):
         self.portrait_controller.set_stage_size(self.stage_size)
         self.portrait_controller.set_portrait_scale_percent(self.portrait_scale_percent)
         self.portrait_controller.apply_current()
-        self._resize_stage_anchor_bottom(self.stage_size)
 
     def _apply_control_panel_layout(
         self,
