@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QColorDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -200,7 +201,33 @@ class ApiModelListProbeWorker(QObject):
             self.finished.emit()
 
 
-class ModelComboBox(QComboBox):
+class _NoWheelMixin:
+    """禁止未获焦时响应滚轮，防止滚动设置页时意外改值。"""
+
+    def wheelEvent(self, event):  # type: ignore[no-untyped-def]
+        if self.hasFocus():  # type: ignore[attr-defined]
+            super().wheelEvent(event)  # type: ignore[misc]
+        else:
+            event.ignore()
+
+
+class _NoWheelSpinBox(_NoWheelMixin, QSpinBox):
+    pass
+
+
+class _NoWheelDoubleSpinBox(_NoWheelMixin, QDoubleSpinBox):
+    pass
+
+
+class _NoWheelComboBox(_NoWheelMixin, QComboBox):
+    pass
+
+
+class _NoWheelSlider(_NoWheelMixin, QSlider):
+    pass
+
+
+class ModelComboBox(_NoWheelMixin, QComboBox):
     """可编辑模型选择框，保留 QLineEdit 风格的 text/setText 兼容接口。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -619,7 +646,7 @@ class SettingsDialog(QDialog):
         current_character: CharacterProfile | None,
     ) -> QWidget:
         tab = QWidget(self)
-        self.character_combo = QComboBox(tab)
+        self.character_combo = _NoWheelComboBox(tab)
         self.character_empty_label = QLabel("尚未导入角色", tab)
         self._refresh_character_combo(
             current_character.id if current_character is not None else None
@@ -718,7 +745,7 @@ class SettingsDialog(QDialog):
         self.theme_text_edit = self.theme_color_edits["text_color"]
         self.theme_text_button = self.theme_color_buttons["text_color"]
         # 外观效果模式下拉框
-        self.theme_visual_effect_combo = QComboBox(tab)
+        self.theme_visual_effect_combo = _NoWheelComboBox(tab)
         for mode_id in VisualEffectMode.available_modes():
             label = {
                 VisualEffectMode.SOLID: "纯色块",
@@ -765,7 +792,7 @@ class SettingsDialog(QDialog):
 
     def _build_portrait_scale_control(self, parent: QWidget) -> QWidget:
         container = QWidget(parent)
-        self.portrait_scale_slider = QSlider(Qt.Orientation.Horizontal, container)
+        self.portrait_scale_slider = _NoWheelSlider(Qt.Orientation.Horizontal, container)
         self.portrait_scale_slider.setRange(
             PORTRAIT_SCALE_MIN_PERCENT,
             PORTRAIT_SCALE_MAX_PERCENT,
@@ -776,7 +803,7 @@ class SettingsDialog(QDialog):
         self.portrait_scale_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.portrait_scale_slider.setValue(self.portrait_scale_percent)
 
-        self.portrait_scale_spin = QSpinBox(container)
+        self.portrait_scale_spin = _NoWheelSpinBox(container)
         self.portrait_scale_spin.setRange(
             PORTRAIT_SCALE_MIN_PERCENT,
             PORTRAIT_SCALE_MAX_PERCENT,
@@ -812,13 +839,13 @@ class SettingsDialog(QDialog):
     ) -> QWidget:
         """构造一行「滑块 + 数值框」联动控件，并把两个子控件挂到 self 的指定属性名上。"""
         container = QWidget(parent)
-        slider = QSlider(Qt.Orientation.Horizontal, container)
+        slider = _NoWheelSlider(Qt.Orientation.Horizontal, container)
         slider.setRange(minimum, maximum)
         slider.setSingleStep(single_step)
         slider.setPageStep(single_step * 2)
         slider.setValue(value)
 
-        spin = QSpinBox(container)
+        spin = _NoWheelSpinBox(container)
         spin.setRange(minimum, maximum)
         spin.setSingleStep(single_step)
         if suffix:
@@ -904,7 +931,7 @@ class SettingsDialog(QDialog):
         self.model_edit.setText(settings.model)
         self.model_edit.setPlaceholderText("gpt-4.1-mini")
 
-        self.api_timeout_spin = QSpinBox(tab)
+        self.api_timeout_spin = _NoWheelSpinBox(tab)
         self.api_timeout_spin.setRange(1, 600)
         self.api_timeout_spin.setSuffix(" 秒")
         self.api_timeout_spin.setValue(settings.timeout_seconds)
@@ -938,7 +965,7 @@ class SettingsDialog(QDialog):
         self.tts_enabled_check = QCheckBox("启用 TTS 语音", tab)
         self.tts_enabled_check.setChecked(settings.enabled)
 
-        self.tts_provider_combo = QComboBox(tab)
+        self.tts_provider_combo = _NoWheelComboBox(tab)
         self.tts_provider_combo.addItem("GPT-SoVITS 整合包（GPU）", TTS_PROVIDER_GPT_SOVITS)
         self.tts_provider_combo.addItem("Genie TTS 整合包（CPU）", TTS_PROVIDER_GENIE)
         self.tts_provider_combo.addItem("自定义 GPT-SoVITS（macOS/Linux）", TTS_PROVIDER_CUSTOM_GPT_SOVITS)
@@ -964,7 +991,7 @@ class SettingsDialog(QDialog):
         self.ref_lang_edit = QLineEdit(settings.ref_lang, tab)
         self.text_lang_edit = QLineEdit(settings.text_lang, tab)
 
-        self.tts_timeout_spin = QSpinBox(tab)
+        self.tts_timeout_spin = _NoWheelSpinBox(tab)
         self.tts_timeout_spin.setRange(1, 600)
         self.tts_timeout_spin.setSuffix(" 秒")
         self.tts_timeout_spin.setValue(settings.timeout_seconds)
@@ -1006,7 +1033,7 @@ class SettingsDialog(QDialog):
             proactive_care_settings.screen_context_enabled
         )
 
-        self.proactive_check_interval_spin = QSpinBox(tab)
+        self.proactive_check_interval_spin = _NoWheelSpinBox(tab)
         self.proactive_check_interval_spin.setRange(
             PROACTIVE_MIN_CHECK_INTERVAL_MINUTES,
             PROACTIVE_MAX_CHECK_INTERVAL_MINUTES,
@@ -1016,7 +1043,7 @@ class SettingsDialog(QDialog):
             proactive_care_settings.normalized().check_interval_minutes
         )
 
-        self.proactive_cooldown_spin = QSpinBox(tab)
+        self.proactive_cooldown_spin = _NoWheelSpinBox(tab)
         self.proactive_cooldown_spin.setRange(
             PROACTIVE_MIN_COOLDOWN_MINUTES,
             PROACTIVE_MAX_COOLDOWN_MINUTES,
@@ -1026,7 +1053,7 @@ class SettingsDialog(QDialog):
             proactive_care_settings.normalized().cooldown_minutes
         )
 
-        self.proactive_batch_limit_spin = QSpinBox(tab)
+        self.proactive_batch_limit_spin = _NoWheelSpinBox(tab)
         self.proactive_batch_limit_spin.setRange(
             PROACTIVE_MIN_SCREEN_CONTEXT_BATCH_LIMIT,
             PROACTIVE_MAX_SCREEN_CONTEXT_BATCH_LIMIT,
@@ -1245,7 +1272,7 @@ class SettingsDialog(QDialog):
         self.debug_file_enabled_check = QCheckBox("输出文件运行日志", tab)
         self.debug_file_enabled_check.setChecked(debug_settings.file_enabled)
 
-        self.subtitle_typing_interval_spin = QSpinBox(tab)
+        self.subtitle_typing_interval_spin = _NoWheelSpinBox(tab)
         self.subtitle_typing_interval_spin.setRange(
             SUBTITLE_TYPING_INTERVAL_MIN_MS,
             SUBTITLE_TYPING_INTERVAL_MAX_MS,
@@ -1253,7 +1280,7 @@ class SettingsDialog(QDialog):
         self.subtitle_typing_interval_spin.setSuffix(" 毫秒")
         self.subtitle_typing_interval_spin.setValue(self.subtitle_typing_interval_ms)
 
-        self.reply_segment_pause_spin = QSpinBox(tab)
+        self.reply_segment_pause_spin = _NoWheelSpinBox(tab)
         self.reply_segment_pause_spin.setRange(
             REPLY_SEGMENT_PAUSE_MIN_MS,
             REPLY_SEGMENT_PAUSE_MAX_MS,
@@ -1263,7 +1290,7 @@ class SettingsDialog(QDialog):
 
         self.bubble_auto_hide_check = QCheckBox("气泡无操作后自动隐藏", tab)
         self.bubble_auto_hide_check.setChecked(bubble_settings.auto_hide_enabled)
-        self.bubble_auto_hide_delay_spin = QSpinBox(tab)
+        self.bubble_auto_hide_delay_spin = _NoWheelSpinBox(tab)
         self.bubble_auto_hide_delay_spin.setRange(
             BUBBLE_AUTO_HIDE_MIN_DELAY_SECONDS,
             BUBBLE_AUTO_HIDE_MAX_DELAY_SECONDS,
