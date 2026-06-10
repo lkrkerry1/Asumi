@@ -1464,7 +1464,12 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QTabWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
-    from app.ui.settings_dialog import SettingsDialog
+    from app.ui.settings_dialog import (
+        SETTINGS_COMBO_POPUP_ITEM_HEIGHT,
+        SETTINGS_COMBO_POPUP_PADDING,
+        SettingsComboBox,
+        SettingsDialog,
+    )
 
     Qt = qtcore.Qt
     QApplication = qtwidgets.QApplication
@@ -1518,6 +1523,8 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     assert dialog.model_edit.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
     assert dialog.model_edit.completer().popup().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
     assert dialog.tts_provider_combo.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
+    assert isinstance(dialog.theme_visual_effect_combo, SettingsComboBox)
+    assert dialog.theme_visual_effect_combo.view().objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
     assert app.styleSheet() == build_app_chrome_stylesheet(dialog.theme_settings)
 
     dialog.character_combo.showPopup()
@@ -1528,6 +1535,24 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     assert popup_list is not None
     assert popup_container.objectName() == SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME
     assert popup_container.frameShape() == QFrame.Shape.NoFrame
+    dialog.character_combo.hidePopup()
+
+    dialog.theme_visual_effect_combo.showPopup()
+    app.processEvents()
+    effect_popup_container = dialog.theme_visual_effect_combo._popup_frame
+    effect_popup_list = dialog.theme_visual_effect_combo._popup_list
+    assert effect_popup_container is not None
+    assert effect_popup_list is not None
+    assert effect_popup_container.objectName() == SETTINGS_COMBO_POPUP_CONTAINER_OBJECT_NAME
+    assert effect_popup_list.objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
+    expected_effect_popup_height = (
+        SETTINGS_COMBO_POPUP_ITEM_HEIGHT * dialog.theme_visual_effect_combo.count()
+        + SETTINGS_COMBO_POPUP_PADDING
+    )
+    assert effect_popup_container.height() == expected_effect_popup_height
+    assert effect_popup_list.height() == expected_effect_popup_height
+    assert effect_popup_list.item(0).sizeHint().height() == SETTINGS_COMBO_POPUP_ITEM_HEIGHT
+    dialog.theme_visual_effect_combo.hidePopup()
     assert bool(popup_container.windowFlags() & Qt.WindowType.FramelessWindowHint)
     assert bool(popup_container.windowFlags() & Qt.WindowType.NoDropShadowWindowHint)
     assert popup_list.objectName() == SETTINGS_COMBO_POPUP_VIEW_OBJECT_NAME
@@ -2325,6 +2350,57 @@ def test_settings_dialog_model_probe_populates_candidates_and_selects_first(monk
     assert dialog.model_edit._popup_list.count() == 2
     dialog.model_edit.hidePopup()
     assert infos and "2" in infos[0]
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_model_popups_follow_current_theme_stylesheet() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+    from app.ui.theme import rgba
+
+    themed = ThemeSettings(
+        input_background_color="#102030",
+        panel_background_color="#203040",
+        text_color="#ddeeff",
+    )
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("api_model_popup_theme")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        theme_settings=themed,
+    )
+
+    dialog.model_edit.set_model_names(["alpha-model", "beta-model"])
+    dialog.model_edit.showPopup()
+    app.processEvents()
+    popup_list = dialog.model_edit._popup_list
+    completion_popup = dialog.model_edit.completer().popup()
+
+    assert popup_list is not None
+    assert rgba("#102030", 246) in popup_list.styleSheet()
+    assert rgba(themed.primary_color, 34) in popup_list.styleSheet()
+    assert rgba(themed.primary_color, 72) in popup_list.styleSheet()
+    assert "#ddeeff" in popup_list.styleSheet()
+    assert rgba("#102030", 246) in completion_popup.styleSheet()
+    assert rgba(themed.primary_color, 72) in completion_popup.styleSheet()
+    assert "#ddeeff" in completion_popup.styleSheet()
+
+    dialog.model_edit.hidePopup()
     dialog.deleteLater()
     app.processEvents()
 
@@ -7179,6 +7255,83 @@ def test_pet_input_stylesheet_reduces_white_overlay() -> None:
     # 普通态/聚焦态白底 alpha 应明显低于原始厚白（96/132），靠背后强模糊提供玻璃质感。
     assert ", 55)" in normal_block
     assert ", 90)" in focus_block
+
+
+def test_pet_input_stylesheet_has_solid_visual_effect_state() -> None:
+    stylesheet = build_pet_window_stylesheet(DEFAULT_THEME_SETTINGS)
+
+    assert '#inputBar[visualEffectMode="solid"]' in stylesheet
+    assert '#petInput[visualEffectMode="solid"]' in stylesheet
+    assert '#petInput[visualEffectMode="solid"]:focus' in stylesheet
+
+
+def test_pet_window_applies_visual_effect_dynamic_property() -> None:
+    _qt_app_or_skip()
+    from PySide6.QtWidgets import QFrame, QLineEdit
+
+    from app.ui.pet_window import PetWindow
+    from app.ui.window_backdrop import VisualEffectMode
+
+    window = PetWindow.__new__(PetWindow)
+    window.input_bar = QFrame()
+    window.input_edit = QLineEdit(window.input_bar)
+
+    PetWindow._apply_input_bar_visual_effect_property(window, VisualEffectMode.SOLID)
+
+    assert window.input_bar.property("visualEffectMode") == VisualEffectMode.SOLID
+    assert window.input_edit.property("visualEffectMode") == VisualEffectMode.SOLID
+
+    window.input_bar.deleteLater()
+
+
+def test_pet_window_removes_old_backdrop_before_hiding_visible_input_window(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+    from app.ui.theme import ThemeSettings
+    from app.ui.window_backdrop import VisualEffectMode
+
+    events: list[tuple[str, bool]] = []
+
+    class OldBackdrop:
+        def remove(self, window) -> None:  # type: ignore[no-untyped-def]
+            events.append(("remove", window.hidden))
+
+    class InputWindowStub:
+        def __init__(self) -> None:
+            self.hidden = False
+            self._backdrop = OldBackdrop()
+            self._background_layer = None
+
+        def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return True
+
+        def hide(self) -> None:
+            self.hidden = True
+            events.append(("hide", self.hidden))
+
+        def show(self) -> None:
+            events.append(("show", self.hidden))
+
+    input_window = InputWindowStub()
+    window = PetWindow.__new__(PetWindow)
+    window.theme_settings = ThemeSettings(visual_effect_mode=VisualEffectMode.SOLID)
+    window.input_window = input_window
+    window.input_blur_background = None
+    window.input_bar_animator = None
+    monkeypatch.setattr(
+        pet_window_module.QApplication,
+        "processEvents",
+        lambda *args, **_kwargs: events.append(("process", input_window.hidden)),
+    )
+
+    PetWindow._sync_input_bar_backdrop(window)
+
+    assert events == [
+        ("remove", False),
+        ("hide", True),
+        ("process", True),
+        ("show", True),
+    ]
 
 
 def test_local_rect_to_global_keeps_size_and_uses_main_window_origin() -> None:

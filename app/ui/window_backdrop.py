@@ -200,6 +200,7 @@ class WindowsAcrylicBackdrop:
     _ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
     _ACCENT_DISABLED = 0
     _DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    _DWMWCP_DONOTROUND = 1
     _DWMWCP_ROUND = 2
 
     def __init__(self, *, rounded: bool) -> None:
@@ -216,7 +217,10 @@ class WindowsAcrylicBackdrop:
 
     def remove(self, window: QWidget) -> None:
         try:
-            self._set_accent(int(window.winId()), self._ACCENT_DISABLED, QColor(0, 0, 0, 0))
+            hwnd = int(window.winId())
+            self._set_accent(hwnd, self._ACCENT_DISABLED, QColor(0, 0, 0, 0))
+            if self._rounded:
+                self._set_corner_preference(hwnd, self._DWMWCP_DONOTROUND)
         except Exception as exc:
             debug_log("UI", "Windows 亚克力背景移除失败", {"error": str(exc)})
 
@@ -255,8 +259,11 @@ class WindowsAcrylicBackdrop:
         ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.pointer(data))
 
     def _set_round_corners(self, hwnd: int) -> None:
+        self._set_corner_preference(hwnd, self._DWMWCP_ROUND)
+
+    def _set_corner_preference(self, hwnd: int, preference_value: int) -> None:
         import ctypes
-        preference = ctypes.c_int(self._DWMWCP_ROUND)
+        preference = ctypes.c_int(preference_value)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
             hwnd, self._DWMWA_WINDOW_CORNER_PREFERENCE,
             ctypes.byref(preference), ctypes.sizeof(preference),
