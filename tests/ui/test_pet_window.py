@@ -1495,6 +1495,113 @@ def test_pet_window_backchannel_audio_uses_prepared_tts() -> None:
     assert window.subtitle_controller.texts == ["……欢迎回来。"]
     assert ("backchannel_tts_requested", {"template": "greeting", "tone": "中性"}) in window.logged
 
+    # 接话音频播完不立即补合成:对话中补合成会抢占回复分段的串行合成队列,
+    # 统一推迟到 reply_completed 空闲时机。
+    played_handle = window._active_backchannel_audio
+    prepared_before = list(window.tts_provider.prepared)
+    window._handle_backchannel_audio_finished(played_handle)
+    assert window.tts_provider.prepared == prepared_before
+    assert window._active_backchannel_audio is None
+
+
+def test_pet_window_backchannel_unready_audio_plays_subtitle_only() -> None:
+    """缓存里音频未合成完(audio_path=None)时只显示字幕,不在对话中触发补合成,
+    且未就绪句柄留在缓存中等待合成完成。"""
+    from app.backchannel.models import (
+        BackchannelManifest,
+        BackchannelTemplate,
+        BackchannelVariant,
+    )
+    from app.backchannel.resolver import BackchannelChoice
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.prepared: list[str] = []
+            self.spoken: list[str] = []
+
+        def prepare(self, text: str, tone: str | None = None) -> TTSPreparedAudio:
+            self.prepared.append(text)
+            return TTSPreparedAudio(text=text, tone=tone)
+
+        def speak_prepared(self, handle, on_started=None, on_finished=None):  # type: ignore[no-untyped-def]
+            self.spoken.append(handle.text)
+
+    class WindowStub:
+        _backchannel_tts_wanted = PetWindow._backchannel_tts_wanted
+        _backchannel_tts_active = PetWindow._backchannel_tts_active
+        _backchannel_audio_key = PetWindow._backchannel_audio_key
+        _play_backchannel_audio = PetWindow._play_backchannel_audio
+
+        def __init__(self) -> None:
+            self.backchannel_settings = BackchannelSettings(enabled=True, tts_enabled=True)
+            self.tts_provider = ProviderStub()
+            template = BackchannelTemplate(
+                id="greeting",
+                tone="中性",
+                portrait="高兴满足",
+                variants=(BackchannelVariant(ja="……おかえり。", zh="……欢迎回来。"),),
+                intent="greeting_return",
+                emotion="neutral",
+            )
+            self.choice = BackchannelChoice(template, template.variants[0])
+            # 合成尚未完成的句柄(audio_path 为 None)
+            unready = TTSPreparedAudio(text="……おかえり。", tone="中性")
+            self._backchannel_prepared_audio = {
+                ("greeting", "中性", "……おかえり。"): unready
+            }
+
+    window = WindowStub()
+    window._play_backchannel_audio(window.choice)
+
+    assert window.tts_provider.spoken == []      # 未就绪不播
+    assert window.tts_provider.prepared == []    # 对话中不补合成
+    assert len(window._backchannel_prepared_audio) == 1  # 句柄留在缓存继续等合成
+
+
+def test_pet_window_reply_arrival_discards_unready_backchannel_prepares() -> None:
+    """正式回复开始时,未合成完的接话请求让位(discard),已就绪音频保留。"""
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.discarded: list[str] = []
+
+        def discard_prepared(self, handle: TTSPreparedAudio) -> None:
+            self.discarded.append(handle.text)
+
+    class ControllerStub:
+        def cancel(self) -> None:
+            pass
+
+    class WindowStub:
+        _cancel_backchannel = PetWindow._cancel_backchannel
+        _discard_unready_backchannel_audio = PetWindow._discard_unready_backchannel_audio
+        _discard_active_backchannel_audio = PetWindow._discard_active_backchannel_audio
+
+        def __init__(self) -> None:
+            self.tts_provider = ProviderStub()
+            self.backchannel_controller = ControllerStub()
+            self._active_backchannel_audio = None
+            ready = TTSPreparedAudio(text="ready", tone="中性", audio_path=Path("ok.wav"))
+            unready = TTSPreparedAudio(text="unready", tone="中性")
+            failed = TTSPreparedAudio(text="failed", tone="中性")
+            failed.failed = True
+            self._backchannel_prepared_audio = {
+                ("a", "中性", "ready"): ready,
+                ("b", "中性", "unready"): unready,
+                ("c", "中性", "failed"): failed,
+            }
+
+    window = WindowStub()
+    window._cancel_backchannel()
+
+    assert sorted(window.tts_provider.discarded) == ["failed", "unready"]
+    remaining = list(window._backchannel_prepared_audio.values())
+    assert len(remaining) == 1 and remaining[0].text == "ready"
+
 
 def test_pet_window_backchannel_audio_waits_for_tts_service_ready() -> None:
     """服务未就绪时预生成被门控跳过,预热成功回调后补做(避免首批 HTTP 静默失败)。"""

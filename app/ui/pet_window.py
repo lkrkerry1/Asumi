@@ -1022,6 +1022,34 @@ class PetWindow(QWidget):
         if controller is not None:
             controller.cancel()
         self._discard_active_backchannel_audio()
+        # 正式回复开始:未合成完的接话预生成请求让位,把串行合成队列
+        # 让给回复分段;已就绪的音频保留备用,不浪费。
+        self._discard_unready_backchannel_audio()
+
+    def _discard_unready_backchannel_audio(self) -> None:
+        prepared = getattr(self, "_backchannel_prepared_audio", None)
+        if not prepared:
+            return
+        provider = getattr(self, "tts_provider", None)
+        discard_prepared = getattr(provider, "discard_prepared", None)
+        removed = 0
+        for key in list(prepared.keys()):
+            handle = prepared[key]
+            if handle.audio_path is not None and not handle.failed:
+                continue
+            prepared.pop(key, None)
+            removed += 1
+            if callable(discard_prepared):
+                try:
+                    discard_prepared(handle)
+                except Exception as exc:  # noqa: BLE001
+                    debug_log("Backchannel", "让位丢弃接话预生成失败", {"error": str(exc)})
+        if removed:
+            debug_log(
+                "Backchannel",
+                "回复开始,未就绪的接话合成请求已让位",
+                {"removed": removed, "kept_ready": len(prepared)},
+            )
 
     def _load_backchannel_manifest_for(self, profile: CharacterProfile) -> None:
         """加载当前角色的接话清单;缺失/非法即停用该功能(角色级 opt-out)。"""
@@ -1158,17 +1186,19 @@ class PetWindow(QWidget):
             return
         prepared = getattr(self, "_backchannel_prepared_audio", {})
         key = self._backchannel_audio_key(choice)
-        handle = prepared.pop(key, None)
-        if handle is None:
-            self._prepare_backchannel_audio_cache()
-            handle = prepared.pop(key, None)
-        if handle is None:
+        handle = prepared.get(key)
+        # 只播已就绪的音频;未就绪/缺失一律仅字幕,不在对话中触发补合成——
+        # provider 的合成队列是串行 FIFO,此刻塞入接话合成会让正式回复
+        # 分段的合成(及由其 on_started 驱动的字幕)整体延后。
+        # 补合成统一安排在空闲时机(回复完成/预热成功/清单加载)。
+        if handle is None or handle.audio_path is None or handle.failed:
             debug_log(
                 "Backchannel",
                 "接话音频尚未预生成完成,本次仅显示字幕",
                 {"template": choice.template.id, "text": choice.variant.ja},
             )
             return
+        prepared.pop(key, None)
         self._active_backchannel_audio = handle
         try:
             self.tts_provider.speak_prepared(
@@ -1190,7 +1220,8 @@ class PetWindow(QWidget):
     def _handle_backchannel_audio_finished(self, handle: TTSPreparedAudio) -> None:
         if getattr(self, "_active_backchannel_audio", None) is handle:
             self._active_backchannel_audio = None
-        self._prepare_backchannel_audio_cache()
+        # 此刻正式回复往往即将到达/正在播放,不立即补合成(避免抢占回复
+        # 分段的串行合成队列);补合成在回复完成(reply_completed)时进行。
 
     def _discard_active_backchannel_audio(self) -> None:
         handle = getattr(self, "_active_backchannel_audio", None)
@@ -1624,6 +1655,11 @@ class PetWindow(QWidget):
             controller = getattr(self, "bubble_auto_hide", None)
             if controller is not None:
                 controller.notify_settled()
+            # 空闲时机:补合成本轮消耗/让位掉的接话音频(对话中绝不补,
+            # 避免抢占回复分段的串行合成队列)。
+            refill_backchannel_audio = getattr(self, "_prepare_backchannel_audio_cache", None)
+            if callable(refill_backchannel_audio):
+                refill_backchannel_audio()
 
     def _mark_user_activity(self) -> None:
         self.last_user_activity_at = time.perf_counter()
