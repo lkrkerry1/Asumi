@@ -479,9 +479,13 @@ def test_tts_bundle_recommends_gptsovits_for_capable_nvidia(monkeypatch: pytest.
 
 
 def test_list_nvidia_gpus_swallows_which_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    """shutil.which 抛异常时（如测试伪造 win32 平台导致 _winapi 缺失）应按未检测到 GPU 处理，而非崩溃。"""
+    """复刻 CI 场景：伪造 win32 但宿主非 Windows，shutil.which 抛异常时应按未检测到 GPU 处理，而非崩溃。"""
+
+    # 伪造为 Windows，使 GPT-SoVITS 整合包在任意宿主上都判定为兼容，从而让推荐逻辑真正走到 GPU 探测。
+    monkeypatch.setattr(tts_bundle.sys, "platform", "win32")
 
     def _boom(_name: str):  # type: ignore[no-untyped-def]
+        # 模拟非 Windows 宿主上 shutil.which 因 _winapi 缺失抛出的 AttributeError
         raise AttributeError("'NoneType' object has no attribute 'NeedCurrentDirectoryForExePath'")
 
     monkeypatch.setattr(tts_bundle.shutil, "which", _boom)
