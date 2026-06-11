@@ -60,9 +60,9 @@ _PROGRAM_INFO_MESSAGES = {
 }
 _PROGRAM_MESSAGE_LABELS = {
     ("API", "准备发送聊天补全请求"): "发送请求",
-    ("API", "准备发送原生工具聊天补全请求"): "发送请求",
-    ("API", "模型原始文本返回"): "收到回复",
-    ("API", "原生工具模型返回"): "收到回复",
+    ("API", "准备发送原生工具聊天补全请求"): "发送请求（带工具）",
+    ("API", "模型原始文本返回"): "收到回复：文本",
+    ("API", "原生工具模型返回"): "收到回复：工具调用",
 }
 _PROGRAM_TTS_MESSAGE_LABELS = {
     "发送 GPT-SoVITS 请求": "送入 TTS：GPT-SoVITS",
@@ -93,6 +93,10 @@ _SEMANTIC_PROGRESS_MERGE_KEY = "semantic-token-progress"
 # 记录各 provider 最近一次 EOS 的 token 数，用于丢弃 tqdm 收尾时重复的最终帧，
 # 避免"预测完成（EOS）"行被一条停在中途百分比的旧进度覆盖
 _LAST_EOS_TOKEN_COUNTS: dict[str, int] = {}
+# 各 provider 最近一次语义 token 推理速度，供 EOS 完成行展示
+_LAST_SPEED_BY_PROVIDER: dict[str, str] = {}
+_SERVER_PROCESS_RE = re.compile(r"\[(\d+)\]")
+_UVICORN_URL_RE = re.compile(r"https?://[^\s)]+")
 _MAX_DETAIL_TEXT_CHARS = 180
 _MAX_DETAIL_ITEMS = 8
 _MAX_DETAIL_KEYS = 16
@@ -207,6 +211,7 @@ def get_gui_log_buffer() -> GuiLogBuffer:
 def clear_gui_logs() -> None:
     _GLOBAL_GUI_LOG_BUFFER.clear()
     _LAST_EOS_TOKEN_COUNTS.clear()
+    _LAST_SPEED_BY_PROVIDER.clear()
 
 
 def record_debug_log_for_gui(
@@ -234,7 +239,7 @@ def record_debug_log_for_gui(
         scope=scope,
         level=level,
         category=category_text,
-        message=_compact_debug_message(category_text, message_text),
+        message=_compact_debug_message(category_text, message_text, data),
         detail=detail,
         text_preview=_tts_text_preview(category_text, data),
     )
@@ -319,15 +324,50 @@ def _should_record(scope: str, category: str, message: str, level: str) -> bool:
     return message in _PROGRAM_INFO_MESSAGES or (category, message) in _PROGRAM_MESSAGE_LABELS
 
 
-def _compact_debug_message(category: str, message: str) -> str:
+def _compact_debug_message(category: str, message: str, data: Any | None = None) -> str:
     if category.lower() == "tts":
         label = _PROGRAM_TTS_MESSAGE_LABELS.get(message)
         if label:
             return label
     label = _PROGRAM_MESSAGE_LABELS.get((category, message))
     if label:
+        if message == "原生工具模型返回":
+            tool_calls = data.get("tool_calls") if isinstance(data, dict) else None
+            if isinstance(tool_calls, list):
+                if tool_calls:
+                    tool_names = _extract_tool_names(data)
+                    return f"收到回复：工具调用：{tool_names}" if tool_names else "收到回复：工具调用"
+                else:
+                    # tool_calls 为空列表说明模型实际只返回了文本内容
+                    return "收到回复：文本"
         return label
     return _compact_message(message)
+
+
+def _extract_tool_names(data: Any | None) -> str:
+    """从 tool_calls 数据中提取工具函数名，用于日志展示。
+
+    支持内部自定义格式（call["name"]）和 OpenAI 标准格式（call["function"]["name"]）。
+    """
+    if not isinstance(data, dict):
+        return ""
+    tool_calls = data.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return ""
+    names: list[str] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        # 内部格式：{"name": "tool_name", "type": "tool_call", ...}
+        # OpenAI 格式：{"function": {"name": "tool_name"}, ...}
+        name = call.get("name") or (call.get("function") or {}).get("name")
+        if name:
+            names.append(str(name))
+    if not names:
+        return ""
+    if len(names) > 3:
+        return "、".join(names[:3]) + f" 等 {len(names)} 个"
+    return "、".join(names)
 
 
 def _compact_message(message: str) -> str:
@@ -365,22 +405,23 @@ def _compact_tts_service_message(line: str, provider: str) -> tuple[str, str]:
             start = int(eos_match.group("start"))
             end = int(eos_match.group("end"))
             _LAST_EOS_TOKEN_COUNTS[provider] = end
+            speed = _LAST_SPEED_BY_PROVIDER.pop(provider, "")
+            speed_part = f"，{speed} it/s" if speed else ""
             return (
-                f"语义 token 预测完成：EOS（{start} → {end}）",
+                f"语义 token 预测完成：EOS（{start} → {end}{speed_part}）",
                 _SEMANTIC_PROGRESS_MERGE_KEY,
             )
         return "语义 token 预测完成（EOS）", _SEMANTIC_PROGRESS_MERGE_KEY
-    if "Set seed to" in line:
-        return "设置随机种子", ""
-    if "分桶处理模式已开启" in line:
-        return "分桶处理已开启", ""
+    if "Set seed to" in line or "分桶处理模式已开启" in line:
+        return "", ""  # 内部初始化操作，不展示
 
     progress_message = _semantic_progress_message(line, provider)
     if progress_message is not None:
         return progress_message, _SEMANTIC_PROGRESS_MERGE_KEY
 
     if line.startswith("INFO:"):
-        return _compact_message(line.removeprefix("INFO:").strip()), ""
+        content = line.removeprefix("INFO:").strip()
+        return _compact_message(_translate_info_line(content)), ""
     if line.startswith(("ERROR:", "WARNING:")):
         return _compact_message(line), ""
     if any(marker in line.lower() for marker in ("error", "warning", "started", "server", "http")):
@@ -408,7 +449,9 @@ def _semantic_progress_message(line: str, provider: str) -> str | None:
     if current is not None and total is not None:
         extras.append(f"{current}/{total}")
     if speed_match is not None:
-        extras.append(f"{speed_match.group('speed')} it/s")
+        speed_str = speed_match.group("speed")
+        _LAST_SPEED_BY_PROVIDER[provider] = speed_str  # 缓存速度，供 EOS 完成行展示
+        extras.append(f"{speed_str} it/s")
     extras_text = f"（{'，'.join(extras)}）" if extras else ""
 
     if percent_match is not None:
@@ -427,6 +470,32 @@ def _summarize_service_text_line(line: str) -> str:
     if not text:
         return "收到合成文本"
     return f"收到合成文本（{len(text)} 字）"
+
+
+def _translate_info_line(line: str) -> str:
+    """将 uvicorn/服务常见英文 INFO 行翻译为中文，无匹配时原样返回。"""
+    lower = line.lower()
+    if "started server process" in lower:
+        m = _SERVER_PROCESS_RE.search(line)
+        pid = m.group(1) if m else ""
+        return f"已启动服务进程 [{pid}]" if pid else "已启动服务进程"
+    if "waiting for application startup" in lower:
+        return "等待应用启动…"
+    if "application startup complete" in lower:
+        return "应用启动完成"
+    if "uvicorn running on" in lower:
+        m = _UVICORN_URL_RE.search(line)
+        url = m.group(0) if m else ""
+        return f"服务已就绪：{url}" if url else "服务已就绪"
+    if "waiting for application shutdown" in lower:
+        return "等待应用关闭…"
+    if "application shutdown complete" in lower:
+        return "应用关闭完成"
+    if "finished server process" in lower:
+        return "服务进程已结束"
+    if "shutting down" in lower:
+        return "服务正在关闭"
+    return line
 
 
 def _tts_text_preview(category: str, data: Any | None) -> str:

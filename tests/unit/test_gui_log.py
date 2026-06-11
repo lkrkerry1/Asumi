@@ -73,9 +73,50 @@ def test_gui_log_compacts_software_request_and_reply_events() -> None:
     records = get_gui_log_buffer().snapshot(scope=GUI_LOG_SCOPE_PROGRAM)
 
     assert [(record.level, record.message) for record in records] == [
-        ("info", "发送请求"),
-        ("info", "收到回复"),
+        ("info", "发送请求（带工具）"),
+        ("info", "收到回复：工具调用"),  # 无 tool_calls 字段时不追加工具名
         ("info", "后台启动服务已创建"),
+    ]
+
+
+def test_gui_log_tool_call_reply_includes_tool_names() -> None:
+    # 内部自定义格式：call["name"] 直接存工具名
+    record_debug_log_for_gui(
+        "API",
+        "原生工具模型返回",
+        {
+            "content": {"type": "text", "chars": 0},
+            "tool_calls": [
+                {"type": "tool_call", "id": "call_abc", "name": "observe_screen", "argument_keys": []},
+                {"type": "tool_call", "id": "call_def", "name": "get_current_time", "argument_keys": []},
+            ],
+        },
+    )
+
+    records = get_gui_log_buffer().snapshot(scope=GUI_LOG_SCOPE_PROGRAM)
+    assert records[0].message == "收到回复：工具调用：observe_screen、get_current_time"
+
+
+def test_gui_log_native_tool_reply_with_empty_tool_calls_shows_as_text() -> None:
+    # tool_calls 为空列表时模型实际只返回了文本，不应标为"工具调用"
+    record_debug_log_for_gui(
+        "API",
+        "原生工具模型返回",
+        {"content": {"type": "text", "chars": 598}, "tool_calls": []},
+    )
+
+    records = get_gui_log_buffer().snapshot(scope=GUI_LOG_SCOPE_PROGRAM)
+    assert records[0].message == "收到回复：文本"
+
+
+def test_gui_log_plain_request_label_has_no_tool_marker() -> None:
+    record_debug_log_for_gui("API", "准备发送聊天补全请求", {"model": "gemini"})
+    record_debug_log_for_gui("API", "模型原始文本返回", {"content": "hello"})
+
+    records = get_gui_log_buffer().snapshot(scope=GUI_LOG_SCOPE_PROGRAM)
+    assert [(r.level, r.message) for r in records] == [
+        ("info", "发送请求"),
+        ("info", "收到回复：文本"),
     ]
 
 
@@ -151,8 +192,9 @@ def test_tts_service_eos_replaces_progress_and_drops_trailing_frame() -> None:
 
     records = get_gui_log_buffer().snapshot(scope=GUI_LOG_SCOPE_TTS)
 
+    # EOS 完成行应携带最近一次进度行记录的推理速度
     assert [record.message for record in records] == [
-        "语义 token 预测完成：EOS（128 → 363）",
+        "语义 token 预测完成：EOS（128 → 363，105.23 it/s）",
     ]
 
 

@@ -546,8 +546,11 @@ def _detail_summary(detail: str) -> str:
     return " · ".join(pairs)
 
 
-def _record_collapse_key(record: GuiLogRecord) -> tuple[str, str, str, str, str]:
+def _record_collapse_key(record: GuiLogRecord) -> tuple:
     # 含 text_preview：文本不同的"开始播放"等记录不应折叠成一条
+    # 合成文本记录内容各异，用 record_id 保证每条独立展示，避免同字数文本被误折叠为 ×N
+    if record.message.startswith("收到合成文本"):
+        return (record.scope, record.level, record.category, record.message, record.text_preview, record.record_id)
     return (record.scope, record.level, record.category, record.message, record.text_preview)
 
 
