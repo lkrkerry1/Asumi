@@ -1615,7 +1615,7 @@ class PetWindow(QWidget):
         self.input_edit.clear()
         self._log_interaction_stage("input_cleared")
         self._collapse_auto_fit_bubble_height()
-        self.subtitle_controller.cancel_reply_flow("......")
+        self._show_waiting_reply_placeholder()
         self._log_interaction_stage("placeholder_reply_shown")
 
         visual_observation_jobs: list[VisualObservationJob] = []
@@ -1679,6 +1679,20 @@ class PetWindow(QWidget):
             ]
         self._log_interaction_stage("user_message_recorded")
         self._start_chat_worker(request_messages)
+
+    def _show_waiting_reply_placeholder(self) -> None:
+        """显示模型回复等待动效，并阻止自动隐藏在等待期间藏起气泡。"""
+        controller = getattr(self, "bubble_auto_hide", None)
+        if controller is not None:
+            controller.notify_speaking()
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        if subtitle_controller is None:
+            return
+        start_waiting_indicator = getattr(subtitle_controller, "start_waiting_indicator", None)
+        if callable(start_waiting_indicator):
+            start_waiting_indicator()
+            return
+        subtitle_controller.cancel_reply_flow("...")
 
     def _start_chat_worker(self, request_messages: list[dict[str, Any]]) -> None:
         visual_observation_jobs = getattr(self, "pending_visual_observation_jobs", [])

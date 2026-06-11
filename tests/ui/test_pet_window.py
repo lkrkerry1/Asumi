@@ -6217,6 +6217,7 @@ class _DummyButton:
 class _DummySubtitleController:
     def __init__(self) -> None:
         self.cancelled_with: list[str | None] = []
+        self.waiting_started = 0
         self.active = False
         self.segments = []
         self.shown_immediately: list[str] = []
@@ -6226,6 +6227,9 @@ class _DummySubtitleController:
 
     def cancel_reply_flow(self, placeholder_text: str | None = None) -> None:
         self.cancelled_with.append(placeholder_text)
+
+    def start_waiting_indicator(self) -> None:
+        self.waiting_started += 1
 
     def show_segments(self, segments):  # type: ignore[no-untyped-def]
         self.segments.append(segments)
@@ -6246,6 +6250,14 @@ class _DummySubtitleController:
         self.display_speeds.append((typing_interval_ms, segment_pause_ms))
 
 
+class _DummyBubbleAutoHide:
+    def __init__(self) -> None:
+        self.speaking_count = 0
+
+    def notify_speaking(self) -> None:
+        self.speaking_count += 1
+
+
 def test_manual_screenshot_empty_input_sends_default_text() -> None:
     window, requests, history = _build_minimal_manual_screenshot_window("")
 
@@ -6256,6 +6268,9 @@ def test_manual_screenshot_empty_input_sends_default_text() -> None:
     assert isinstance(content, list)
     assert content[0]["text"].startswith("请根据我框选的截图继续对话。")
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,manual"
+    assert window.subtitle_controller.waiting_started == 1
+    assert window.subtitle_controller.cancelled_with == []
+    assert window.bubble_auto_hide.speaking_count == 1
     assert window.pending_manual_screen_observation is None
     assert history
     assert "data:image/jpeg;base64" not in history[0][1]
@@ -7051,6 +7066,7 @@ def _build_minimal_manual_screenshot_window(text: str):
 
     class MinimalManualScreenshotWindow:
         send_message = PetWindow.send_message
+        _show_waiting_reply_placeholder = PetWindow._show_waiting_reply_placeholder
         _record_user_message = PetWindow._record_user_message
 
     window = MinimalManualScreenshotWindow()
@@ -7069,6 +7085,7 @@ def _build_minimal_manual_screenshot_window(text: str):
     window.messages = []
     window.active_interaction_id = ""
     window.subtitle_controller = _DummySubtitleController()
+    window.bubble_auto_hide = _DummyBubbleAutoHide()
     window._mark_user_activity = lambda: None
     window._begin_interaction = lambda _source: setattr(window, "active_interaction_id", "test")
     window._log_interaction_stage = lambda *_args, **_kwargs: None
@@ -7705,6 +7722,110 @@ def test_subtitle_controller_show_text_immediately_does_not_use_tts() -> None:
         "speech_text_shown_immediately",
         {"text": "第一段。 第二段。"},
     )
+
+
+def test_subtitle_waiting_indicator_animates_and_stops_on_text() -> None:
+    from app.ui.subtitle_controller import SubtitleController
+    from app.voice import VoicePlaybackController
+
+    class DummyLabel:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def clear(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class DummyTTS:
+        def discard_prepared(self, _handle):  # type: ignore[no-untyped-def]
+            pass
+
+    _qt_app_or_skip()
+    label = DummyLabel()
+    controller = SubtitleController(
+        label,  # type: ignore[arg-type]
+        VoicePlaybackController(DummyTTS(), lambda *_args, **_kwargs: None),
+        "zh",
+        lambda *_args, **_kwargs: None,
+        lambda _segment: None,
+        lambda: None,
+        lambda: True,
+    )
+
+    controller.start_waiting_indicator()
+    assert label.text == "."
+    assert controller.is_reply_sequence_active()
+
+    frames = []
+    for _ in range(8):
+        controller._show_next_waiting_indicator_frame()
+        frames.append(label.text)
+
+    assert frames == ["..", "...", "....", ".....", "......", ".....", "......", "....."]
+
+    controller.show_text_immediately("回复到了")
+
+    assert not controller.waiting_indicator_active
+    assert not controller.waiting_indicator_timer.isActive()
+    assert label.text == "回复到了"
+
+
+def test_subtitle_waiting_indicator_continues_until_tts_starts() -> None:
+    from app.ui.subtitle_controller import SubtitleController
+    from app.voice import VoicePlaybackController
+
+    class DummyLabel:
+        def __init__(self) -> None:
+            self.text = ""
+
+        def clear(self) -> None:
+            self.text = ""
+
+        def setText(self, text: str) -> None:
+            self.text = text
+
+    class DelayedTTS:
+        def __init__(self) -> None:
+            self.on_started = None
+            self.on_finished = None
+
+        def speak(self, _text, _tone, on_finished=None, on_started=None):  # type: ignore[no-untyped-def]
+            self.on_started = on_started
+            self.on_finished = on_finished
+
+        def discard_prepared(self, _handle):  # type: ignore[no-untyped-def]
+            pass
+
+    _qt_app_or_skip()
+    label = DummyLabel()
+    tts = DelayedTTS()
+    controller = SubtitleController(
+        label,  # type: ignore[arg-type]
+        VoicePlaybackController(tts, lambda *_args, **_kwargs: None),
+        "zh",
+        lambda *_args, **_kwargs: None,
+        lambda _segment: None,
+        lambda: None,
+        lambda: True,
+    )
+
+    controller.start_waiting_indicator()
+    controller._show_next_waiting_indicator_frame()
+    controller.show_segments([ChatSegment("第一段回复", "中性", "第一段回复")])
+
+    assert controller.waiting_indicator_active
+    assert label.text == ".."
+    assert controller.current_segment is not None
+    assert tts.on_started is not None
+
+    tts.on_started()
+
+    assert not controller.waiting_indicator_active
+    assert not controller.waiting_indicator_timer.isActive()
+    assert controller.speech_text == "第一段回复"
+    controller.cancel_reply_flow()
 
 
 def test_send_message_injects_runtime_event_context_before_user_message() -> None:
