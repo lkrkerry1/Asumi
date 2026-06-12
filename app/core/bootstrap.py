@@ -29,7 +29,7 @@ from app.voice.tts import (
 )
 from app.storage.paths import StoragePaths
 from app.storage.visual_observation import VisualObservationStore
-from app.core.plugin_manager import SakuraPluginManager
+from app.plugins.manager import PluginManager
 
 
 PORTRAIT_SCALE_MIN_PERCENT = 50
@@ -57,7 +57,7 @@ class DeferredStartupServices:
     tts_provider: TTSProvider
     tool_registry: ToolRegistry
     extension_registry: ExtensionRegistry
-    plugin_manager: SakuraPluginManager
+    plugin_manager: PluginManager
     mcp_settings: MCPRuntimeSettings
     mcp_tool_provider: MCPToolProvider | None
     errors: tuple[str, ...] = ()
@@ -135,7 +135,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
     )
     extension_registry = ExtensionRegistry()
     extension_registry.apply_tools(tool_registry)
-    plugin_manager = SakuraPluginManager(base_dir=base_dir)
+    plugin_manager = PluginManager(base_dir=base_dir)
     mcp_settings = settings_service.load_mcp_runtime_settings()
     agent_runtime = AgentRuntime(
         api_client=api_client,
@@ -242,7 +242,7 @@ def build_deferred_services(base_dir: Path, context: AppContext) -> DeferredStar
     tool_registry.set_free_access_enabled(context.tool_registry.free_access_enabled)
     extension_registry = ExtensionRegistry()
     extension_registry.apply_tools(tool_registry)
-    plugin_manager = SakuraPluginManager(base_dir=base_dir)
+    plugin_manager = PluginManager(base_dir=base_dir)
     try:
         plugin_manager.load_from_config(tool_registry)
     except Exception as exc:  # noqa: BLE001

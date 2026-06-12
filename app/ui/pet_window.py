@@ -82,6 +82,14 @@ from app.llm.context_trimming import trim_messages_for_model
 from app.core.chat_worker import ChatWorker, EventWorker
 from app.core.debug_log import debug_log, summarize_messages
 from app.core.interaction import clear_interaction_id, set_interaction_id
+from app.plugins.manager import (
+    PLUGIN_EVENT_AI_MESSAGE,
+    PLUGIN_EVENT_APP_START,
+    PLUGIN_EVENT_CHARACTER_LOADED,
+    PLUGIN_EVENT_TTS_END,
+    PLUGIN_EVENT_TTS_START,
+    PLUGIN_EVENT_USER_MESSAGE,
+)
 from app.ui.state import PetUiStateStore
 from app.config.settings_service import BubbleSettings, StartupSettings
 from app.platforms.launch_at_login import (
@@ -568,6 +576,8 @@ class PetWindow(QWidget):
             self._log_interaction_stage,
             lambda: str(getattr(getattr(self.tts_provider, "settings", None), "text_lang", "ja")),
             self._show_tts_error,
+            self._emit_tts_start_plugin_event,
+            self._emit_tts_end_plugin_event,
         )
         self._connect_tts_error_signal(self.tts_provider)
         self.subtitle_controller = SubtitleController(
@@ -843,6 +853,24 @@ class PetWindow(QWidget):
             # 无上次关闭记录（首启 / 上次异常退出）时只落盘，不注入空洞的「已启动」提示。
             inject=carryover is not None,
         )
+        self._emit_plugin_event(
+            PLUGIN_EVENT_APP_START,
+            {
+                "character_id": self.character_profile.id,
+                "character_name": self.character_profile.display_name,
+                "carryover": carryover or {},
+            },
+            source="startup",
+        )
+        self._emit_plugin_event(
+            PLUGIN_EVENT_CHARACTER_LOADED,
+            {
+                "character_id": self.character_profile.id,
+                "character_name": self.character_profile.display_name,
+                "previous_character_id": "",
+            },
+            source="startup",
+        )
 
     def _emit_app_closed_event(self) -> None:
         """关闭前落盘 app.closed（供下次启动衔接）。退出链路可能多次触发，做一次性保护。"""
@@ -855,6 +883,50 @@ class PetWindow(QWidget):
             metadata={"interrupted_reply": self.worker_thread is not None},
             inject=False,
         )
+
+    def _emit_plugin_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        source: str = "pet_window",
+    ) -> None:
+        manager = getattr(self, "plugin_manager", None)
+        emit_event = getattr(manager, "emit_event", None)
+        if not callable(emit_event):
+            return
+        try:
+            emit_event(event_type, payload or {}, source=source)
+        except Exception as exc:  # noqa: BLE001
+            debug_log(
+                "PluginManager",
+                "插件事件派发失败",
+                {"event_type": event_type, "error": str(exc)},
+            )
+
+    def _emit_tts_start_plugin_event(self, segment: ChatSegment, sequence_id: int) -> None:
+        self._emit_plugin_event(
+            PLUGIN_EVENT_TTS_START,
+            self._tts_plugin_payload(segment, sequence_id),
+            source="tts",
+        )
+
+    def _emit_tts_end_plugin_event(self, segment: ChatSegment, sequence_id: int) -> None:
+        self._emit_plugin_event(
+            PLUGIN_EVENT_TTS_END,
+            self._tts_plugin_payload(segment, sequence_id),
+            source="tts",
+        )
+
+    def _tts_plugin_payload(self, segment: ChatSegment, sequence_id: int) -> dict[str, Any]:
+        return {
+            "sequence_id": sequence_id,
+            "text": segment.text,
+            "translation": segment.translation,
+            "tone": segment.tone,
+            "portrait": segment.portrait,
+            "character_id": self.character_profile.id,
+        }
 
     @Slot()
     def close_tts_tools(self) -> None:
@@ -1840,6 +1912,15 @@ class PetWindow(QWidget):
         self.messages.append({"role": "assistant", "content": reply.text})
         self._record_assistant_reply_history(reply, _debug=result._debug)
         self._log_interaction_stage("assistant_message_recorded")
+        self._emit_plugin_event(
+            PLUGIN_EVENT_AI_MESSAGE,
+            {
+                "text": reply.text,
+                "segments": [_segment_plugin_payload(segment) for segment in reply.segments],
+                "character_id": self.character_profile.id,
+            },
+            source="agent",
+        )
         self._show_reply_segments(reply.segments)
         self._apply_pending_action_from_result(result)
 
@@ -2024,6 +2105,16 @@ class PetWindow(QWidget):
     def _record_user_message(self, text: str) -> None:
         self.messages.append({"role": "user", "content": text})
         self._record_history("user", text)
+        emit_plugin_event = getattr(self, "_emit_plugin_event", None)
+        if callable(emit_plugin_event):
+            emit_plugin_event(
+                PLUGIN_EVENT_USER_MESSAGE,
+                {
+                    "text": text,
+                    "character_id": self.character_profile.id,
+                },
+                source="user",
+            )
 
     @Slot()
     def confirm_pending_action(self) -> None:
@@ -4115,6 +4206,15 @@ class PetWindow(QWidget):
             self.messages = []
             self._collapse_auto_fit_bubble_height()
             self.subtitle_controller.cancel_reply_flow(profile.initial_message)
+            self._emit_plugin_event(
+                PLUGIN_EVENT_CHARACTER_LOADED,
+                {
+                    "character_id": profile.id,
+                    "character_name": profile.display_name,
+                    "previous_character_id": previous_character_id,
+                },
+                source="character",
+            )
 
     def _create_history_store(self, profile: CharacterProfile) -> ChatHistoryStore:
         # 路径与旧历史迁移统一走 bootstrap 的公开 helper，避免两处实现漂移
@@ -4161,6 +4261,15 @@ def _build_screen_observation_failed_result(message: str) -> AgentResult:
             ]
         )
     )
+
+
+def _segment_plugin_payload(segment: ChatSegment) -> dict[str, str]:
+    return {
+        "text": segment.text,
+        "translation": segment.translation,
+        "tone": segment.tone,
+        "portrait": segment.portrait,
+    }
 
 
 def _first_screen_observation_request(result: AgentResult) -> AgentAction | None:

@@ -1484,7 +1484,7 @@ def test_pet_window_unlocks_after_deferred_services_are_applied(monkeypatch) -> 
     from app.agent.memory import MemoryStore
     from app.core.bootstrap import DeferredStartupServices, build_initial_app_context
     from app.core.extensions import ExtensionRegistry
-    from app.core.plugin_manager import SakuraPluginManager
+    from app.plugins.manager import PluginManager
     from app.ui.pet_window import PetWindow
     from app.voice.tts import NullTTSProvider
 
@@ -1507,7 +1507,7 @@ def test_pet_window_unlocks_after_deferred_services_are_applied(monkeypatch) -> 
         tts_provider=tts_provider,
         tool_registry=context.tool_registry,
         extension_registry=ExtensionRegistry(),
-        plugin_manager=SakuraPluginManager(base_dir=root),
+        plugin_manager=PluginManager(base_dir=root),
         mcp_settings=context.mcp_settings,
         mcp_tool_provider=None,
         errors=("TTS 配置无效，已禁用：参考音频不存在",),
@@ -1645,8 +1645,8 @@ def test_settings_dialog_adds_plugin_settings_panel() -> None:
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QLabel", "QListWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
+    from app.plugins.models import SettingsPanelContribution
     from app.ui.settings_dialog import SettingsDialog
-    from sdk.types import SettingsPanelContribution
 
     QApplication = qtwidgets.QApplication
     QLabel = qtwidgets.QLabel
@@ -1709,6 +1709,8 @@ version: 1.0.0
 entry: plugin:DemoPlugin
 enabled: true
 priority: 10
+permissions:
+  - settings_panel
 """.strip(),
         encoding="utf-8",
     )
@@ -1887,8 +1889,8 @@ def test_pet_window_syncs_plugin_chat_ui_widgets() -> None:
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QHBoxLayout", "QLineEdit", "QPushButton")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
+    from app.plugins.models import ChatUIWidgetContribution
     from app.ui.pet_window import PetWindow
-    from sdk.types import ChatUIWidgetContribution
 
     QApplication = qtwidgets.QApplication
     QFrame = qtwidgets.QFrame

@@ -23,7 +23,7 @@ def test_build_initial_app_context_skips_deferred_runtime_services(
         lambda _settings, **_kwargs: calls.append("tts"),
     )
     monkeypatch.setattr(
-        bootstrap.SakuraPluginManager,
+        bootstrap.PluginManager,
         "load_from_config",
         lambda _self, _registry: calls.append("plugins"),
     )
@@ -83,7 +83,7 @@ def test_build_deferred_services_loads_injectable_runtime_services(
         registry.register(Tool(name="mcp_demo", description="mcp", group="mcp"))
         return mcp_provider
 
-    monkeypatch.setattr(bootstrap.SakuraPluginManager, "load_from_config", fake_load_plugins)
+    monkeypatch.setattr(bootstrap.PluginManager, "load_from_config", fake_load_plugins)
     monkeypatch.setattr(bootstrap, "register_mcp_tools_from_config", fake_register_mcp)
 
     services = bootstrap.build_deferred_services(root, context)
@@ -128,7 +128,7 @@ def test_build_deferred_services_creates_genie_tts_provider(
 
     import app.voice.factory as tts_factory
     monkeypatch.setattr(tts_factory, "GenieTTSProvider", fake_genie_provider)
-    monkeypatch.setattr(bootstrap.SakuraPluginManager, "load_from_config", lambda *_args: None)
+    monkeypatch.setattr(bootstrap.PluginManager, "load_from_config", lambda *_args: None)
     monkeypatch.setattr(bootstrap, "register_mcp_tools_from_config", lambda *_args, **_kwargs: None)
 
     services = bootstrap.build_deferred_services(root, context)
@@ -160,7 +160,7 @@ tts:
 """.strip(),
         encoding="utf-8",
     )
-    monkeypatch.setattr(bootstrap.SakuraPluginManager, "load_from_config", lambda *_args: None)
+    monkeypatch.setattr(bootstrap.PluginManager, "load_from_config", lambda *_args: None)
     monkeypatch.setattr(bootstrap, "register_mcp_tools_from_config", lambda *_args, **_kwargs: None)
 
     context = bootstrap.build_initial_app_context(root)

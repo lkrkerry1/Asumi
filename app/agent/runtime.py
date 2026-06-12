@@ -50,7 +50,7 @@ from app.llm.prompt_templates import (
     build_event_system_prompt,
     build_proactive_check_tool_system_prompt,
 )
-from sdk.types import PromptPatchContribution
+from app.plugins.models import PromptPatchContribution
 
 
 

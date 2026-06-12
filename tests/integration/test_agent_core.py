@@ -33,7 +33,6 @@ from app.agent.screen_tools import (
 from app.agent.tool_registry import Tool, ToolExecutionResult, ToolRegistry
 from app.config.settings_service import AppSettingsService
 from app.config.yaml_config import load_yaml_mapping
-from app.core.plugin_manager import SakuraPluginManager
 from app.llm.api_client import (
     ApiSettings,
     ApiRequestError,
@@ -42,6 +41,7 @@ from app.llm.api_client import (
     is_vision_unsupported_error,
     messages_contain_image,
 )
+from app.plugins.manager import PluginManager
 from app.llm.context_trimming import MAX_MODEL_CONTEXT_MESSAGES, trim_messages_for_model
 from app.llm.prompt_templates import (
     build_event_system_prompt,
@@ -1314,7 +1314,7 @@ def test_builtin_registry_excludes_internal_browser_tools() -> None:
 
 def test_playwright_plugin_registers_native_browser_tools() -> None:
     registry = create_builtin_tool_registry(Path(__file__).resolve().parents[2])
-    manager = SakuraPluginManager(Path(__file__).resolve().parents[2])
+    manager = PluginManager(Path(__file__).resolve().parents[2])
 
     manager.load_from_config(registry)
     names = {tool.name for tool in registry.all()}
@@ -1435,7 +1435,7 @@ def test_playwright_search_web_registry_keeps_default_limit(monkeypatch: pytest.
     monkeypatch.setattr(browser, "_ensure_browser", lambda: Page())
 
     registry = ToolRegistry()
-    manager = SakuraPluginManager(Path(__file__).resolve().parents[2])
+    manager = PluginManager(Path(__file__).resolve().parents[2])
     manager.load_from_config(registry)
     try:
         result = registry.execute("playwright_search_web", {"query": "二阶堂真红 百科"})

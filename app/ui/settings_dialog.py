@@ -97,7 +97,7 @@ from app.ui.theme import (
 )
 from app.ui.window_backdrop import VisualEffectMode
 from app.voice.tts_bundle import default_provider_bundle_work_dir, is_provider_bundle_work_dir
-from sdk.types import SettingsPanelContribution, ToolsTabContribution
+from app.plugins.models import SettingsPanelContribution, ToolsTabContribution
 
 
 MEMORY_READING_TEXT = "正在读取长期记忆..."
