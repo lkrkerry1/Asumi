@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-import base64
-import mimetypes
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QStringListModel, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QAction, QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
-    QComboBox,
-    QCompleter,
     QDialog,
     QDialogButtonBox,
     QColorDialog,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -26,14 +21,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
     QListWidgetItem,
     QMessageBox,
     QMenu,
     QPushButton,
     QScrollArea,
     QSlider,
-    QSpinBox,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -48,8 +41,6 @@ from app.core.debug_log import debug_log
 from app.storage.paths import StoragePaths
 from app.config.character_archive import (
     CharacterArchiveError,
-    export_character_archive,
-    export_character_voice_archive,
     import_character_archive,
     import_character_voice_archive,
 )
@@ -64,12 +55,7 @@ from app.platforms.launch_at_login import (
     is_launch_at_login_supported,
     launch_at_login_platform_text,
 )
-from app.llm.api_client import (
-    ApiSettings,
-    OpenAICompatibleClient,
-    STRUCTURED_JSON_RESPONSE_FORMAT,
-)
-from app.llm.prompts.recipes import build_theme_color_system_prompt
+from app.llm.api_client import ApiSettings
 from app.plugins.discovery import PluginDiscovery, save_plugin_enabled_overrides
 from app.plugins.models import PluginSpec
 from app.config.character_loader import (
@@ -123,8 +109,6 @@ from app.agent.proactive_care import (
 from app.voice.tts import (
     DEFAULT_GENIE_TTS_API_URL,
     DEFAULT_GPT_SOVITS_API_URL,
-    GenieTTSProvider,
-    GPTSoVITSTTSProvider,
     TTS_PROVIDER_CUSTOM_GPT_SOVITS,
     TTS_PROVIDER_GENIE,
     TTS_PROVIDER_GPT_SOVITS,
@@ -141,7 +125,6 @@ from app.ui.theme import (
     merge_theme_with_character,
     normalize_hex_color,
     mix,
-    parse_ai_theme_response,
 )
 from app.ui.window_backdrop import VisualEffectMode
 from app.voice.tts_bundle import default_provider_bundle_work_dir, is_provider_bundle_work_dir
@@ -162,311 +145,26 @@ def _prepare_popup_menu(menu: QMenu) -> None:
     menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
 
-class ApiConnectionTestWorker(QObject):
-    succeeded = Signal(str)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, settings: ApiSettings) -> None:
-        super().__init__()
-        self.settings = settings
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            message = OpenAICompatibleClient(self.settings).test_connection()
-        except Exception as exc:  # UI 边界统一转成可读错误。
-            self.failed.emit(str(exc))
-        else:
-            self.succeeded.emit(message)
-        finally:
-            self.finished.emit()
-
-
-class ApiModelListProbeWorker(QObject):
-    succeeded = Signal(list)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, settings: ApiSettings) -> None:
-        super().__init__()
-        self.settings = settings
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            models = OpenAICompatibleClient(self.settings).list_models()
-        except Exception as exc:  # UI 边界统一转成可读错误。
-            self.failed.emit(str(exc))
-        else:
-            self.succeeded.emit(models)
-        finally:
-            self.finished.emit()
-
-
-class _NoWheelMixin:
-    """禁止未获焦时响应滚轮，防止滚动设置页时意外改值。"""
-
-    def wheelEvent(self, event):  # type: ignore[no-untyped-def]
-        if self.hasFocus():  # type: ignore[attr-defined]
-            super().wheelEvent(event)  # type: ignore[misc]
-        else:
-            event.ignore()
-
-
-class _NoWheelSpinBox(_NoWheelMixin, QSpinBox):
-    pass
-
-
-class _NoWheelDoubleSpinBox(_NoWheelMixin, QDoubleSpinBox):
-    pass
-
-
-class _NoWheelComboBox(QComboBox):
-    """仅弹出列表打开时响应滚轮，避免未展开时滚动意外切换选项。"""
-
-    def wheelEvent(self, event):  # type: ignore[no-untyped-def]
-        if self.view().isVisible():
-            super().wheelEvent(event)
-        else:
-            event.ignore()
-
-
-class _NoWheelSlider(_NoWheelMixin, QSlider):
-    pass
-
-
-class _ClickOnlyListWidget(QListWidget):
-    """左侧分类导航列表：仅响应左键单击切换页面。
-
-    禁用按住左键拖动时随鼠标连续切换当前项（默认 QListWidget 行为会误切页），
-    同时屏蔽右键（不选中、不弹上下文菜单），避免误触。
-    """
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-
-    def mousePressEvent(self, event):  # type: ignore[no-untyped-def]
-        # 仅左键触发选中/切换，右键与中键直接忽略
-        if event.button() != Qt.MouseButton.LeftButton:
-            event.ignore()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):  # type: ignore[no-untyped-def]
-        # 按住左键拖动时不连续切换；无按键的悬停仍走默认逻辑以保留 hover 高亮
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            event.ignore()
-            return
-        super().mouseMoveEvent(event)
-
-
-class ModelComboBox(_NoWheelComboBox):
-    """可编辑模型选择框，保留 QLineEdit 风格的 text/setText 兼容接口。"""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._model_names: list[str] = []
-        self._completion_model = QStringListModel(self)
-        completer = QCompleter(self._completion_model, self)
-        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self.setEditable(True)
-        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.setCompleter(completer)
-
-    def setText(self, text: str) -> None:
-        self.setEditText(text)
-
-    def text(self) -> str:
-        return self.currentText()
-
-    def set_model_names(self, model_names: list[str]) -> None:
-        current_text = self.currentText().strip()
-        self._model_names = list(model_names)
-        self.blockSignals(True)
-        self.clear()
-        self.addItems(self._model_names)
-        self._completion_model.setStringList(self._model_names)
-        if current_text:
-            self.setEditText(current_text)
-        elif self._model_names:
-            self.setCurrentIndex(0)
-        self.blockSignals(False)
-
-
-class TTSTestWorker(QObject):
-    succeeded = Signal(object, str)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
-        super().__init__()
-        self.settings = settings
-
-    @Slot()
-    def run(self) -> None:
-        provider = None
-        should_close_provider = True
-        try:
-            provider = (
-                GenieTTSProvider(self.settings)
-                if self.settings.provider == TTS_PROVIDER_GENIE
-                else GPTSoVITSTTSProvider(self.settings)
-            )
-            ok, message = provider.ensure_ready()
-            if ok:
-                should_close_provider = False
-                self.succeeded.emit(provider.settings, message)
-            else:
-                self.failed.emit(message)
-        except Exception as exc:  # UI 边界统一转成可读错误。
-            self.failed.emit(str(exc))
-        finally:
-            if should_close_provider and provider is not None:
-                close = getattr(provider, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception as exc:  # noqa: BLE001
-                        debug_log("TTS", "TTS 检测失败后清理 Provider 失败", {"error": str(exc)})
-            self.finished.emit()
-
-
-class MemoryListWorker(QObject):
-    succeeded = Signal(list)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, memory_store: MemoryStore, limit: int = 200) -> None:
-        super().__init__()
-        self.memory_store = memory_store
-        self.limit = limit
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            memories = self.memory_store.list_memories(limit=self.limit)
-        except Exception as exc:  # UI 边界统一转成可读错误。
-            self.failed.emit(str(exc))
-        else:
-            self.succeeded.emit(memories)
-        finally:
-            self.finished.emit()
-
-
-class MemoryModelImportWorker(QObject):
-    succeeded = Signal(object)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, memory_store: MemoryStore, archive_path: Path) -> None:
-        super().__init__()
-        self.memory_store = memory_store
-        self.archive_path = archive_path
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            result = self.memory_store.import_embedding_model_archive(self.archive_path)
-        except Exception as exc:  # UI 边界统一转成可读错误。
-            self.failed.emit(str(exc))
-        else:
-            self.succeeded.emit(result)
-        finally:
-            self.finished.emit()
-
-
-class ThemeAiWorker(QObject):
-    succeeded = Signal(object)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, settings: ApiSettings, profile: CharacterProfile, *, ai_enabled: bool) -> None:
-        super().__init__()
-        self.settings = settings
-        self.profile = profile
-        self.ai_enabled = ai_enabled
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            data_url = _image_file_to_data_url(self.profile.default_portrait_path)
-            content = OpenAICompatibleClient(self.settings).complete_raw(
-                build_theme_color_system_prompt(self.profile.display_name),
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "请根据这张角色默认立绘生成 Sakura 桌宠 UI 主题配色。只返回完整 JSON 对象，不要输出 Markdown 或解释。",
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": data_url,
-                                    "detail": "low",
-                                },
-                            },
-                        ],
-                    }
-                ],
-                temperature=0.2,
-                # thinking 模型不兼容 json_object，依赖 prompt 约束 JSON 输出
-                max_tokens=2000,
-            )
-            self.succeeded.emit(parse_ai_theme_response(content, ai_enabled=self.ai_enabled))
-        except Exception as exc:  # noqa: BLE001 - UI 边界统一转成可读错误。
-            self.failed.emit(str(exc))
-        finally:
-            self.finished.emit()
-
-
-class CharacterArchiveExportWorker(QObject):
-    succeeded = Signal(str)
-    failed = Signal(str)
-    finished = Signal()
-
-    def __init__(self, profile: CharacterProfile, output_path: Path, export_kind: Literal["full", "card", "voice"]) -> None:
-        super().__init__()
-        self.profile = profile
-        self.output_path = output_path
-        self.export_kind = export_kind
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            if self.export_kind in ("full", "voice") and not _has_exportable_voice_model(self.profile):
-                raise CharacterArchiveError("当前角色没有完整语音模型，请导出单角色包。")
-            if self.export_kind == "voice":
-                export_character_voice_archive(self.profile, self.output_path)
-            else:
-                export_character_archive(
-                    self.profile,
-                    self.output_path,
-                    include_voice=self.export_kind == "full",
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-        else:
-            self.succeeded.emit(str(self.output_path))
-        finally:
-            self.finished.emit()
-
-
-def _has_exportable_voice_model(profile: CharacterProfile | None) -> bool:
-    """判断角色是否带有可随包导出的完整语音模型。"""
-
-    if profile is None or profile.voice is None:
-        return False
-    return (
-        profile.voice.gpt_model_path is not None
-        and profile.voice.gpt_model_path.is_file()
-        and profile.voice.sovits_model_path is not None
-        and profile.voice.sovits_model_path.is_file()
-    )
+# 后台 Worker 与通用控件已拆至 app/ui/settings/*；re-export 保持旧引用路径可用
+from app.ui.settings.workers import (
+    ApiConnectionTestWorker,
+    ApiModelListProbeWorker,
+    CharacterArchiveExportWorker,
+    MemoryListWorker,
+    MemoryModelImportWorker,
+    ThemeAiWorker,
+    TTSTestWorker,
+    _has_exportable_voice_model,
+)
+from app.ui.settings.widgets import (
+    ModelComboBox,
+    _ClickOnlyListWidget,
+    _NoWheelComboBox,
+    _NoWheelDoubleSpinBox,
+    _NoWheelMixin,
+    _NoWheelSlider,
+    _NoWheelSpinBox,
+)
 
 
 class SettingsDialog(QDialog):
@@ -2819,7 +2517,7 @@ class SettingsDialog(QDialog):
         self._set_tts_test_busy(True)
 
         thread = QThread()
-        worker = TTSTestWorker(settings)
+        worker = TTSTestWorker(settings, base_dir=self.base_dir)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._handle_tts_test_success)
@@ -3401,15 +3099,6 @@ def _optional_path(value: str, base_dir: Path) -> Path | None:
     if path.is_absolute():
         return path
     return base_dir / path
-
-
-def _image_file_to_data_url(path: Path) -> str:
-    data = path.read_bytes()
-    mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
-    if not mime_type.startswith("image/"):
-        mime_type = "image/png"
-    encoded = base64.b64encode(data).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
 
 
 def _compact_memory_id(memory_id: str) -> str:

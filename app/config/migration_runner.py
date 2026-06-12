@@ -41,12 +41,21 @@ class MigrationContext:
     backup_dir: Path
 
     def backup_file(self, path: Path) -> None:
-        """把文件备份到本步骤的备份目录（按文件名平铺）；源不存在时忽略。"""
+        """把文件备份到本步骤目录；源不存在时忽略。
+
+        base_dir 内文件按相对路径保留目录结构，避免不同数据目录里的同名
+        文件互相覆盖；外部文件回退为按文件名备份。
+        """
         source = Path(path)
         if not source.is_file():
             return
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, self.backup_dir / source.name)
+        try:
+            relative_path = source.resolve().relative_to(self.base_dir.resolve())
+        except (OSError, ValueError):
+            relative_path = Path(source.name)
+        target = self.backup_dir / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
 
 @dataclass(frozen=True)

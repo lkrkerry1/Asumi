@@ -3364,6 +3364,7 @@ def test_settings_dialog_exports_character_archive_in_background(monkeypatch) ->
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     import app.ui.settings_dialog as settings_dialog_module
+    import app.ui.settings.workers as settings_workers
     from app.config.character_loader import CharacterRegistry
     from app.ui.settings_dialog import SettingsDialog
 
@@ -3406,7 +3407,7 @@ def test_settings_dialog_exports_character_archive_in_background(monkeypatch) ->
         lambda *_args, **_kwargs: (str(output_path), ""),
     )
     monkeypatch.setattr(
-        settings_dialog_module,
+        settings_workers,
         "export_character_archive",
         fake_export_character_archive,
     )
@@ -5748,7 +5749,8 @@ def test_theme_ai_worker_sends_portrait_image_and_prompt(monkeypatch) -> None:  
             calls["kwargs"] = kwargs
             return _theme_json()
 
-    monkeypatch.setattr(settings_dialog, "OpenAICompatibleClient", FakeClient)
+    import app.ui.settings.workers as settings_workers
+    monkeypatch.setattr(settings_workers, "OpenAICompatibleClient", FakeClient)
     events: list[ThemeSettings] = []
     worker = settings_dialog.ThemeAiWorker(
         ApiSettings("https://api.example.com/v1", "test-key", "test-model"),
@@ -7510,6 +7512,7 @@ def test_tts_test_worker_keeps_provider_after_success(monkeypatch) -> None:  # t
     import app.ui.settings_dialog as settings_dialog
 
     closed: list[bool] = []
+    created: list[tuple[GPTSoVITSTTSSettings, Path | None, bool]] = []
 
     class FakeProvider:
         def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
@@ -7521,12 +7524,26 @@ def test_tts_test_worker_keeps_provider_after_success(monkeypatch) -> None:  # t
         def close(self) -> None:
             closed.append(True)
 
-    monkeypatch.setattr(settings_dialog, "GPTSoVITSTTSProvider", FakeProvider)
+    import app.ui.settings.workers as settings_workers
+    base_dir = Path("runtime-root")
 
-    worker = settings_dialog.TTSTestWorker(_minimal_tts_settings())
+    def fake_create_tts_provider(
+        settings: GPTSoVITSTTSSettings,
+        *,
+        base_dir: Path | None = None,
+        adopt_existing_service: bool = True,
+    ) -> FakeProvider:
+        created.append((settings, base_dir, adopt_existing_service))
+        return FakeProvider(settings)
+
+    monkeypatch.setattr(settings_workers, "create_tts_provider", fake_create_tts_provider)
+
+    worker = settings_dialog.TTSTestWorker(_minimal_tts_settings(), base_dir=base_dir)
     worker.run()
 
     assert closed == []
+    assert created and created[0][1] == base_dir
+    assert created[0][2] is False
 
 
 def test_tts_test_worker_closes_provider_after_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -7535,6 +7552,7 @@ def test_tts_test_worker_closes_provider_after_failure(monkeypatch) -> None:  # 
     import app.ui.settings_dialog as settings_dialog
 
     events: list[str] = []
+    created: list[tuple[GPTSoVITSTTSSettings, Path | None, bool]] = []
 
     class FakeProvider:
         def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
@@ -7546,14 +7564,28 @@ def test_tts_test_worker_closes_provider_after_failure(monkeypatch) -> None:  # 
         def close(self) -> None:
             events.append("closed")
 
-    monkeypatch.setattr(settings_dialog, "GPTSoVITSTTSProvider", FakeProvider)
+    import app.ui.settings.workers as settings_workers
+    base_dir = Path("runtime-root")
 
-    worker = settings_dialog.TTSTestWorker(_minimal_tts_settings())
+    def fake_create_tts_provider(
+        settings: GPTSoVITSTTSSettings,
+        *,
+        base_dir: Path | None = None,
+        adopt_existing_service: bool = True,
+    ) -> FakeProvider:
+        created.append((settings, base_dir, adopt_existing_service))
+        return FakeProvider(settings)
+
+    monkeypatch.setattr(settings_workers, "create_tts_provider", fake_create_tts_provider)
+
+    worker = settings_dialog.TTSTestWorker(_minimal_tts_settings(), base_dir=base_dir)
     worker.failed.connect(lambda _message: events.append("failed"))
     worker.finished.connect(lambda: events.append("finished"))
     worker.run()
 
     assert events == ["failed", "closed", "finished"]
+    assert created and created[0][1] == base_dir
+    assert created[0][2] is False
 
 
 def _minimal_settings_window(pet_window_cls, settings_service, api_client, memory_store):  # type: ignore[no-untyped-def]

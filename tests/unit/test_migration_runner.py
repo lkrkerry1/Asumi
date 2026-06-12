@@ -199,6 +199,31 @@ class TestV1ToV2:
         assert not variant.exists()
         assert variant.with_name(variant.name + ".migrated").is_file()
 
+    def test_variant_backups_keep_source_directories(self) -> None:
+        base = _make_base("merge_backup_dirs")
+        _write_character(base, "N.A.V.I.")
+        paths = StoragePaths(base)
+        for directory in (paths.chat_history_dir, paths.runtime_events_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "N.A.V.I..jsonl").write_text(
+                _jsonl_line("2026-03-01T00:00:00", f"{directory.name}-new"),
+                encoding="utf-8",
+            )
+            (directory / "N.A.V.I.jsonl").write_text(
+                _jsonl_line("2026-01-01T00:00:00", f"{directory.name}-old"),
+                encoding="utf-8",
+            )
+
+        report = MigrationRunner(base).run()
+
+        assert not report.failed
+        backed_up = {
+            path.relative_to(paths.migration_backup_dir).as_posix()
+            for path in paths.migration_backup_dir.rglob("N.A.V.I.jsonl")
+        }
+        assert any("/chat_history/N.A.V.I.jsonl" in path for path in backed_up)
+        assert any("/runtime_events/N.A.V.I.jsonl" in path for path in backed_up)
+
     def test_two_registered_characters_not_merged(self) -> None:
         base = _make_base("two_registered")
         _write_character(base, "N.A.V.I.", dir_name="navi_dot")
