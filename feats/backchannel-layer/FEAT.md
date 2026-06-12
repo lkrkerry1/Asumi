@@ -145,6 +145,20 @@ fallback 用 `intent: "fallback"` 的普通条目表达(兜底池可多句轮换
 
 **代码锚点**:character_loader.py(仿 `CharacterVoice` 加载 `BackchannelManifest`)、app/storage/paths.py(新路径)、tts.py `prepare()`(合成复用)、app/agent/tools/builtin/provider.py(propose 工具)、app/agent/memory.py(候选模式参照)。
 
-## 10. 与流式输出的关系
+## 10. v2 混合分类设计(2026-06-12 定稿)
+
+"牛头不对马嘴"拆成三个病:(a) 无关键词全落 fallback(覆盖率,最大头)→ embedding;(b) 关键词误命中 → 已由阈值收紧与 greeting 完整性判定治理;(c) 意图对但语气错 → 情感打分制。
+
+**EmotionScorer(PR1,治语气)**:维持规则路线(MiniLM 为英文模型,中文情绪线索在表层特征),从"首个信号命中即采用"升级为**累计打分**:词典命中分(去子串重叠,最长匹配优先——"不开心"压住"开心")+ emoji/颜文字,argmax 过阈值才输出,否则回退 v1 的意图缺省映射(question→confused 等,保持兼容)。词典 `app/backchannel/data/emotion_lexicon.json`,自建起步词表(license 干净);格式兼容将来由大连理工情感词汇本体(⚠️ 学术免费、商用需授权,开源分发前须核实)裁剪生成的替换文件。
+
+**EmbeddingIntentScorer(PR2,治覆盖率)**:复用记忆系统已加载的 all-MiniLM-L6-v2——经 AppContext 注入线程安全 `encode_fn`,记忆未就绪则为 None,hybrid 自动降级 rules。原型库 `app/backchannel/data/intent_prototypes.json`(每意图 10~30 句**用户例句**,通用资产不进角色包),编码缓存到 `data/cache/backchannel/prototypes.npy`(key=模型名+例句 hash)。匹配用每意图 top-3 例句相似度均值(kNN 抗噪)。**校准**:`confidence = f(top1_sim, margin)`,margin=top1 与 top2 意图差;模糊输入(margin 小)给 ~0.5,被 resolver 的 `MIN_DIRECT_CONFIDENCE=0.55` 门拦下落 fallback——该门在 v1 规则下是空门(BASE=0.65 恒过),为 embedding 预留。
+
+**HybridClassifier(PR3,融合)**:① 硬规则短路(greeting 完整性/报错栈/强情绪)→ ② `score(intent) = 0.6·sim_calibrated + 0.4·rule_norm`,emotion 由 EmotionScorer 独立给,compat 矩阵否决荒谬组合 → ③ 低置信 → fallback。**线程**:encode 10-30ms+首次 warmup,hybrid 模式下 classify 进常驻 worker(QThreadPool),回主线程 display,token/cancel 语义照搬;闲置的 `timeout_ms` 启用为分类超时→降级规则。`BACKCHANNEL_MODES` 加 `hybrid`。
+
+**评测集(PR0,迭代基础设施)**:debug.enabled 时记 `(输入, 标签, 选中模板)` 到 `data/backchannel_eval.jsonl`(默认关),攒 50-100 条真实样本人工标注,脱敏后进 tests/data/ 做回归集——没有它,调权重永远靠感觉。
+
+落地顺序:PR0/PR1 先行(零依赖、立竿见影),PR2 独立可测,PR3 收口。
+
+## 11. 与流式输出的关系
 
 真正降低(而非掩盖)延迟的是流式输出——分段 JSON 协议天然适合收到一个完整 segment 就先播。但流式与工具循环、JSON 修复重试的改造量大得多。接话层是低成本互补方案,二者不互斥;若未来实现流式,接话窗口缩短但机制不变。
