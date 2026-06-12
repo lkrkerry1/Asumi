@@ -134,10 +134,9 @@ from app.ui.subtitle_controller import (
     SPEECH_TYPING_INTERVAL_MS,
     normalize_subtitle_display_speed,
 )
+from app.voice.factory import create_tts_provider
 from app.voice.tts import (
-    TTS_PROVIDER_GENIE,
-    GenieTTSProvider,
-    GPTSoVITSTTSProvider,
+    DEFAULT_GPT_SOVITS_API_URL,
     GPTSoVITSTTSSettings,
     NullTTSProvider,
     TTSConfigError,
@@ -3508,10 +3507,11 @@ class PetWindow(QWidget):
             debug_log("PetWindow", "设置保存后 TTS 保持关闭")
             return NullTTSProvider()
         try:
-            provider = (
-                GenieTTSProvider(settings, adopt_existing_service=False)
-                if settings.provider == TTS_PROVIDER_GENIE
-                else GPTSoVITSTTSProvider(settings, adopt_existing_service=False)
+            # 统一走工厂；补传 base_dir 修正旧实现缓存目录回退 __file__ 推算的问题
+            provider = create_tts_provider(
+                settings,
+                base_dir=self.base_dir,
+                adopt_existing_service=False,
             )
             debug_log(
                 "PetWindow",
@@ -3567,7 +3567,7 @@ class PetWindow(QWidget):
             return GPTSoVITSTTSSettings.from_character_profile(
                 character_profile=self.character_profile,
                 enabled=False,
-                api_url="http://127.0.0.1:9880/tts",
+                api_url=DEFAULT_GPT_SOVITS_API_URL,
                 ref_lang=self.character_profile.voice.ref_lang,
                 text_lang=self.character_profile.voice.text_lang,
                 timeout_seconds=60,
@@ -3575,7 +3575,7 @@ class PetWindow(QWidget):
             )
         return GPTSoVITSTTSSettings(
             enabled=False,
-            api_url="http://127.0.0.1:9880/tts",
+            api_url=DEFAULT_GPT_SOVITS_API_URL,
             ref_audio_path=self.base_dir / "ref" / "VO01_2210.ogg",
             ref_text_path=self.base_dir / "ref" / "text.txt",
             ref_text="",

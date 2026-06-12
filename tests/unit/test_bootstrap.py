@@ -15,10 +15,12 @@ def test_build_initial_app_context_skips_deferred_runtime_services(
     root = _build_startup_root()
     calls: list[str] = []
 
+    import app.voice.factory as tts_factory
+
     monkeypatch.setattr(
-        bootstrap,
+        tts_factory,
         "GPTSoVITSTTSProvider",
-        lambda _settings: calls.append("tts"),
+        lambda _settings, **_kwargs: calls.append("tts"),
     )
     monkeypatch.setattr(
         bootstrap.SakuraPluginManager,
@@ -67,11 +69,12 @@ def test_build_deferred_services_loads_injectable_runtime_services(
             timeout_seconds=1,
         ),
     )
-    def fake_gpt_provider(_settings, *, base_dir: Path | None = None):  # type: ignore[no-untyped-def]
+    def fake_gpt_provider(_settings, *, base_dir: Path | None = None, **_kwargs):  # type: ignore[no-untyped-def]
         provider_base_dirs.append(base_dir)
         return tts_provider
 
-    monkeypatch.setattr(bootstrap, "GPTSoVITSTTSProvider", fake_gpt_provider)
+    import app.voice.factory as tts_factory
+    monkeypatch.setattr(tts_factory, "GPTSoVITSTTSProvider", fake_gpt_provider)
 
     def fake_load_plugins(self, registry):  # type: ignore[no-untyped-def]
         registry.register(Tool(name="plugin_demo", description="plugin"))
@@ -119,11 +122,12 @@ def test_build_deferred_services_creates_genie_tts_provider(
             timeout_seconds=1,
         ),
     )
-    def fake_genie_provider(_settings, *, base_dir: Path | None = None):  # type: ignore[no-untyped-def]
+    def fake_genie_provider(_settings, *, base_dir: Path | None = None, **_kwargs):  # type: ignore[no-untyped-def]
         provider_base_dirs.append(base_dir)
         return genie_provider
 
-    monkeypatch.setattr(bootstrap, "GenieTTSProvider", fake_genie_provider)
+    import app.voice.factory as tts_factory
+    monkeypatch.setattr(tts_factory, "GenieTTSProvider", fake_genie_provider)
     monkeypatch.setattr(bootstrap.SakuraPluginManager, "load_from_config", lambda *_args: None)
     monkeypatch.setattr(bootstrap, "register_mcp_tools_from_config", lambda *_args, **_kwargs: None)
 

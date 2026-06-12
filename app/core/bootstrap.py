@@ -20,10 +20,8 @@ from app.config.character_loader import (
 from app.storage.chat_history import ChatHistoryStore
 from app.agent.runtime_events import RuntimeEventLog
 from app.core.debug_log import debug_log
+from app.voice.factory import create_tts_provider
 from app.voice.tts import (
-    TTS_PROVIDER_GENIE,
-    GenieTTSProvider,
-    GPTSoVITSTTSProvider,
     NullTTSProvider,
     TTSConfigError,
     TTSProvider,
@@ -225,14 +223,8 @@ def build_deferred_services(base_dir: Path, context: AppContext) -> DeferredStar
         tts_settings = settings_service.load_tts_settings(
             character_profile=character_profile,
         )
-        if not tts_settings.enabled:
-            tts_provider = NullTTSProvider()
-        elif tts_settings.provider == TTS_PROVIDER_GENIE:
-            tts_provider = GenieTTSProvider(tts_settings, base_dir=base_dir)
-        else:
-            tts_provider = GPTSoVITSTTSProvider(tts_settings, base_dir=base_dir)
+        tts_provider = create_tts_provider(tts_settings, base_dir=base_dir)
     except TTSConfigError as exc:
-        debug_log("TTS", "配置无效，已禁用 TTS", {"error": str(exc)})
         debug_log("TTS", "配置无效，已禁用 TTS", {"error": str(exc)})
         errors.append(f"TTS 配置无效，已禁用：{exc}")
         tts_provider = NullTTSProvider()
