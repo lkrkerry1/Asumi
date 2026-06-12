@@ -354,6 +354,7 @@ def test_memory_store_reuses_runtime_when_api_settings_unchanged() -> None:
     assert store._memory is sentinel
 
 
+@pytest.mark.allow_memory_preload
 def test_memory_store_preload_only_creates_runtime_once() -> None:
     class CountingMemoryStore(MemoryStore):
         def __init__(self) -> None:
