@@ -88,8 +88,10 @@ from app.config.settings_service import BackchannelSettings, BubbleSettings, Sta
 from app.backchannel.audio_cache import BackchannelAudioCache, voice_fingerprint
 from app.backchannel.classifier import RuleClassifier
 from app.backchannel.controller import BackchannelController
+from app.backchannel.hybrid_classifier import HybridBackchannelClassifier
 from app.backchannel.manifest import BackchannelManifestError, load_backchannel_manifest
-from app.backchannel.models import BackchannelManifest
+from app.backchannel.eval_log import BackchannelEvalLogger
+from app.backchannel.models import BackchannelLabel, BackchannelManifest
 from app.backchannel.resolver import BackchannelChoice
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
@@ -717,10 +719,14 @@ class PetWindow(QWidget):
         self.backchannel_manifest: BackchannelManifest | None = None
         self._backchannel_prepared_audio: dict[tuple[str, str, str], TTSPreparedAudio] = {}
         self._active_backchannel_audio: TTSPreparedAudio | None = None
+        self.backchannel_eval_logger = BackchannelEvalLogger(
+            self.base_dir, enabled=self.debug_log_settings.enabled
+        )
         self.backchannel_controller = BackchannelController(
-            RuleClassifier(),
+            self._create_backchannel_classifier(self.backchannel_settings),
             self._display_backchannel,
             settings=self.backchannel_settings,
+            on_classified=self._log_backchannel_classification,
             parent=self,
         )
         self._load_backchannel_manifest_for(self.character_profile)
@@ -992,12 +998,34 @@ class PetWindow(QWidget):
         self.backchannel_settings = settings.normalized()
         controller = getattr(self, "backchannel_controller", None)
         if controller is not None:
+            set_classifier = getattr(controller, "set_classifier", None)
+            if callable(set_classifier):
+                set_classifier(self._create_backchannel_classifier(self.backchannel_settings))
             controller.set_settings(self.backchannel_settings)
         if not self._backchannel_tts_wanted():
             # 配置层面不需要接话语音才丢弃缓存;服务暂未就绪不算"不需要"。
             self._discard_backchannel_audio_cache()
             return
         self._prepare_backchannel_audio_cache()
+
+    def _create_backchannel_classifier(
+        self,
+        settings: BackchannelSettings,
+    ) -> RuleClassifier | HybridBackchannelClassifier:
+        normalized = settings.normalized()
+        if normalized.mode == "hybrid":
+            return HybridBackchannelClassifier.from_model_cache(self.base_dir)
+        return RuleClassifier()
+
+    def _log_backchannel_classification(
+        self,
+        text: str,
+        label: "BackchannelLabel | None",
+        choice: "BackchannelChoice | None",
+    ) -> None:
+        logger = getattr(self, "backchannel_eval_logger", None)
+        if logger is not None:
+            logger.log(text, label, choice, mode=self.backchannel_settings.normalized().mode)
 
     def _drag_anchor_from_event(
         self,
@@ -3784,6 +3812,9 @@ class PetWindow(QWidget):
         mcp_restart_required = dialog.result_mcp_settings != self.mcp_settings
         self.mcp_settings = dialog.result_mcp_settings
         self.debug_log_settings = dialog.result_debug_log_settings
+        eval_logger = getattr(self, "backchannel_eval_logger", None)
+        if eval_logger is not None:
+            eval_logger.set_enabled(self.debug_log_settings.enabled)
         self.startup_settings = result_startup_settings
         self._sync_proactive_care_timer()
         discard_backchannel_audio_cache = getattr(
