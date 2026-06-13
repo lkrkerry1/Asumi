@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import inspect
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -55,6 +56,14 @@ _EVENT_HOOKS: dict[str, tuple[str, str]] = {
     PLUGIN_EVENT_TTS_END: ("on_tts_end", PERMISSION_EVENT_TTS),
     PLUGIN_EVENT_CHARACTER_LOADED: ("on_character_loaded", PERMISSION_EVENT_CHARACTER),
 }
+
+_LEGACY_SDK_DEFAULT_PERMISSIONS = (
+    PERMISSION_TOOL,
+    PERMISSION_TOOLS_TAB,
+    PERMISSION_SETTINGS_PANEL,
+    PERMISSION_CHAT_UI,
+    PERMISSION_PROMPT_PATCH,
+)
 
 
 @dataclass
@@ -110,21 +119,38 @@ class PluginManager:
         result = PluginLoadResult(spec=spec)
         plugin: PluginBase | None = None
         try:
+            _clear_legacy_registered_tools()
             plugin = _import_plugin(self.base_dir, spec)
             manifest = _build_manifest(plugin, spec)
+            if not manifest.permissions and _is_legacy_sdk_plugin(plugin):
+                manifest = replace(manifest, permissions=_LEGACY_SDK_DEFAULT_PERMISSIONS)
+                debug_log(
+                    "PluginManager",
+                    "旧 SDK 插件缺少权限声明，已按兼容权限加载",
+                    {"entry": spec.entry, "plugin_id": manifest.plugin_id},
+                )
             _validate_manifest(manifest)
             result.manifest = manifest
 
             capability_registry = PluginCapabilityRegistry()
             context = _build_plugin_context(self.base_dir, manifest)
-            plugin.initialize(capability_registry, context)
+            _initialize_plugin(plugin, capability_registry, context)
+            legacy_tool_contributions = _consume_legacy_registered_tool_contributions()
+            all_tool_contributions = [
+                *capability_registry.tools,
+                *legacy_tool_contributions,
+            ]
 
-            _validate_capability_permissions(capability_registry, manifest.permissions)
-            _validate_tool_contributions(capability_registry.tools, known_tool_names)
+            _validate_capability_permissions(
+                capability_registry,
+                manifest.permissions,
+                extra_tools=legacy_tool_contributions,
+            )
+            _validate_tool_contributions(all_tool_contributions, known_tool_names)
 
             capabilities = PluginCapabilities(
                 plugin_id=manifest.plugin_id,
-                tools=list(capability_registry.tools),
+                tools=list(all_tool_contributions),
                 settings_panels=list(capability_registry.settings_panels),
                 tools_tabs=list(capability_registry.tools_tabs),
                 chat_ui_widgets=list(capability_registry.chat_ui_widgets),
@@ -161,6 +187,8 @@ class PluginManager:
                 "插件加载失败",
                 {"entry": spec.entry, "plugin_id": spec.plugin_id, "error": str(exc)},
             )
+        finally:
+            _clear_legacy_registered_tools()
         return result
 
     def emit_event(
@@ -380,10 +408,12 @@ def _validate_manifest(manifest: PluginManifest) -> None:
 def _validate_capability_permissions(
     registry: PluginCapabilityRegistry,
     permissions: tuple[str, ...],
+    *,
+    extra_tools: list[ToolContribution] | None = None,
 ) -> None:
     permission_set = set(permissions)
     checks = (
-        (registry.tools, PERMISSION_TOOL, "工具"),
+        ([*registry.tools, *(extra_tools or [])], PERMISSION_TOOL, "工具"),
         (registry.tools_tabs, PERMISSION_TOOLS_TAB, "工具页"),
         (registry.settings_panels, PERMISSION_SETTINGS_PANEL, "设置面板"),
         (registry.chat_ui_widgets, PERMISSION_CHAT_UI, "聊天 UI"),
@@ -424,6 +454,40 @@ def _build_plugin_context(base_dir: Path, manifest: PluginManifest) -> PluginCon
     )
 
 
+def _initialize_plugin(
+    plugin: PluginBase,
+    register: PluginCapabilityRegistry,
+    context: PluginContext,
+) -> None:
+    """初始化插件，同时兼容旧 SDK 的三参数 initialize。"""
+
+    initialize = plugin.initialize
+    try:
+        parameters = list(inspect.signature(initialize).parameters.values())
+    except (TypeError, ValueError):
+        initialize(register, context)
+        return
+    has_varargs = any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters)
+    if has_varargs or len(parameters) >= 3:
+        from sdk.plugin_host_context import PluginHostContext
+
+        initialize(  # type: ignore[misc]
+            register,
+            context.plugin_root,
+            PluginHostContext(base_dir=context.base_dir),
+        )
+        return
+    initialize(register, context)
+
+
+def _is_legacy_sdk_plugin(plugin: PluginBase) -> bool:
+    try:
+        from sdk.plugin import PluginBase as SDKPluginBase
+    except Exception:
+        return False
+    return isinstance(plugin, SDKPluginBase)
+
+
 def _validate_tool_contributions(
     tools: list[ToolContribution],
     known_tool_names: set[str],
@@ -444,13 +508,109 @@ def _contribution_to_app_tool(contribution: ToolContribution) -> Tool:
         name=contribution.name,
         description=contribution.description,
         parameters=contribution.parameters,
-        handler=contribution.handler,
+        handler=_normalize_tool_handler(contribution.handler),
         requires_confirmation=contribution.requires_confirmation,
         group=contribution.group,
         risk=contribution.risk,
         capability=contribution.capability,
         source="plugin",
     )
+
+
+def _normalize_tool_handler(handler: Any) -> Any:
+    """兼容 handler(args) 与 handler(**kwargs) 两种插件写法。"""
+
+    if handler is None or not callable(handler):
+        return None
+    try:
+        parameters = list(inspect.signature(handler).parameters.values())
+    except (TypeError, ValueError):
+        return lambda arguments: handler(arguments)
+    if not parameters:
+        return lambda _arguments: handler()
+    if len(parameters) == 1:
+        parameter = parameters[0]
+        annotation = parameter.annotation
+        if (
+            parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+            and (
+                parameter.name in {"args", "arguments"}
+                or annotation in {dict, dict[str, Any]}
+            )
+        ):
+            return lambda arguments: handler(arguments)
+
+    def wrapped(arguments: dict[str, Any]) -> Any:
+        if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+            return handler(**arguments)
+        kwargs = {
+            parameter.name: arguments[parameter.name]
+            for parameter in parameters
+            if parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+            and parameter.name in arguments
+        }
+        return handler(**kwargs)
+
+    return wrapped
+
+
+def _clear_legacy_registered_tools() -> None:
+    module = sys.modules.get("sdk.tool_registry")
+    clear = getattr(module, "clear_registered_tools", None) if module is not None else None
+    if callable(clear):
+        clear()
+
+
+def _consume_legacy_registered_tool_contributions() -> list[ToolContribution]:
+    module = sys.modules.get("sdk.tool_registry")
+    registered_tools = getattr(module, "registered_tools", None) if module is not None else None
+    if not callable(registered_tools):
+        return []
+    contributions: list[ToolContribution] = []
+    for registered in registered_tools():
+        parameters = getattr(registered, "parameters", {})
+        if not isinstance(parameters, dict):
+            parameters = {}
+        contributions.append(
+            ToolContribution(
+                name=str(getattr(registered, "name", "")),
+                description=str(getattr(registered, "description", "")),
+                parameters=parameters,
+                handler=_legacy_tool_handler(getattr(registered, "func", None), parameters),
+                group=str(getattr(registered, "group", "default")),
+                risk=str(getattr(registered, "risk", "low")),
+                requires_confirmation=bool(getattr(registered, "requires_confirmation", False)),
+            )
+        )
+    _clear_legacy_registered_tools()
+    return contributions
+
+
+def _legacy_tool_handler(func: Any, parameters: dict[str, Any]) -> Any:
+    if not callable(func):
+        return None
+
+    def handler(arguments: dict[str, Any]) -> Any:
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict):
+            return func(**arguments)
+        kwargs = {
+            name: arguments[name]
+            for name in properties
+            if name in arguments
+        }
+        return func(**kwargs)
+
+    return handler
 
 
 def _shutdown_quietly(plugin: PluginBase) -> None:
