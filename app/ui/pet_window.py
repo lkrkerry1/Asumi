@@ -3053,9 +3053,7 @@ class PetWindow(QWidget):
         # 作为普通窗口打开：可最小化、有独立任务栏按钮，不置顶。
         _configure_secondary_window(self.history_window)
         self.history_window.refresh()
-        self.history_window.show()
-        self.history_window.raise_()
-        self.history_window.activateWindow()
+        _present_secondary_window(self.history_window)
 
     @Slot()
     def show_runtime_log(self) -> None:
@@ -3068,9 +3066,7 @@ class PetWindow(QWidget):
         # 作为普通窗口打开：可最小化、有独立任务栏按钮、不置顶（与设置/历史窗口一致）。
         _configure_secondary_window(self.runtime_log_window)
         self.runtime_log_window.refresh(reset=True)
-        self.runtime_log_window.show()
-        self.runtime_log_window.raise_()
-        self.runtime_log_window.activateWindow()
+        _present_secondary_window(self.runtime_log_window)
 
     def _save_history_to_memory_and_clear(self) -> None:
         if self.memory_curation_thread is not None:
@@ -3208,9 +3204,7 @@ class PetWindow(QWidget):
                 input_bar_animator,
             )
         )
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
+        _present_secondary_window(dialog)
 
     def _on_settings_dialog_finished(
         self,
@@ -3413,16 +3407,7 @@ class PetWindow(QWidget):
 
     def _activate_settings_dialog(self, dialog: SettingsDialog) -> None:
         """重复打开设置时激活已有窗口，避免托盘菜单创建多个设置页。"""
-
-        show = getattr(dialog, "show", None)
-        if callable(show):
-            show()
-        raise_window = getattr(dialog, "raise_", None)
-        if callable(raise_window):
-            raise_window()
-        activate_window = getattr(dialog, "activateWindow", None)
-        if callable(activate_window):
-            activate_window()
+        _present_secondary_window(dialog)
 
     @Slot(bool)
     def _toggle_chinese_subtitles(self, checked: bool) -> None:
@@ -4506,6 +4491,35 @@ def _configure_secondary_window(window) -> None:  # type: ignore[no-untyped-def]
     # 清掉 WS_EX_TOOLWINDOW，确保最小化后能在任务栏单独点回来。
     if sys.platform == "win32":
         _force_windows_taskbar_button(window)
+
+
+def _present_secondary_window(window: QWidget) -> None:
+    """显示/恢复普通副窗口：若已最小化，则从最小化状态恢复后再激活。"""
+    is_minimized = getattr(window, "isMinimized", None)
+    show_normal = getattr(window, "showNormal", None)
+
+    if callable(is_minimized) and is_minimized() and callable(show_normal):
+        show_normal()
+    else:
+        show = getattr(window, "show", None)
+        if callable(show):
+            show()
+
+    # 双保险：清掉 WindowMinimized，并请求激活状态。
+    window_state = getattr(window, "windowState", None)
+    set_window_state = getattr(window, "setWindowState", None)
+    if callable(window_state) and callable(set_window_state):
+        state = window_state()
+        state = (state & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive
+        set_window_state(state)
+
+    raise_window = getattr(window, "raise_", None)
+    if callable(raise_window):
+        raise_window()
+
+    activate_window = getattr(window, "activateWindow", None)
+    if callable(activate_window):
+        activate_window()
 
 
 def _force_windows_taskbar_button(window) -> None:  # type: ignore[no-untyped-def]
