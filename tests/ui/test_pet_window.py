@@ -3776,6 +3776,35 @@ def test_tts_local_service_reuse_requires_same_runtime() -> None:
     )
 
 
+def test_tts_provider_rebuild_only_when_config_or_character_changed() -> None:
+    """配置与角色都未变时不重建 provider,避免在 TTS 探测期退休正被探测的 provider。"""
+    from app.ui.pet_window import _tts_provider_needs_rebuild
+
+    class ProviderStub:
+        def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
+            self.settings = settings
+
+    class OtherProviderStub:
+        def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
+            self.settings = settings
+
+    settings = replace(_minimal_tts_settings(), enabled=True)
+    old = ProviderStub(settings)
+
+    # 配置等价且角色未变:不重建。
+    assert not _tts_provider_needs_rebuild(old, ProviderStub(settings), character_changed=False)
+    # 角色变化:必须重建(新角色声线)。
+    assert _tts_provider_needs_rebuild(old, ProviderStub(settings), character_changed=True)
+    # TTS 配置变化:必须重建。
+    assert _tts_provider_needs_rebuild(
+        old,
+        ProviderStub(replace(settings, api_url="http://127.0.0.1:9881/tts")),
+        character_changed=False,
+    )
+    # provider 类型变化(如启停 TTS):必须重建。
+    assert _tts_provider_needs_rebuild(old, OtherProviderStub(settings), character_changed=False)
+
+
 def _process_events_until(app, predicate, timeout_ms: int = 1500):  # type: ignore[no-untyped-def]
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:

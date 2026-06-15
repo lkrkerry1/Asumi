@@ -3845,26 +3845,47 @@ class PetWindow(QWidget):
         )
         if callable(discard_backchannel_audio_cache):
             discard_backchannel_audio_cache()
-        disconnect_tts_error_signal = getattr(self, "_disconnect_tts_error_signal", None)
-        if callable(disconnect_tts_error_signal):
-            disconnect_tts_error_signal(self.tts_provider)
-        keep_local_tts_service = _should_keep_tts_local_service(
+        # 仅在 TTS 配置或角色变化时才重建 provider。无谓重建会在 TTS 服务
+        # 后台探测(warmup)期间退休/替换正被探测的旧 provider,后台 warmup
+        # 线程与主线程并发拆解同一 provider 引发原生闪退(切换接话语音等
+        # 不改 TTS 配置的保存场景尤其高发)。配置等价则保留现有 provider
+        # 及其在途 warmup。
+        character_changed = selected_profile.id != getattr(self.character_profile, "id", None)
+        if _tts_provider_needs_rebuild(
             self.tts_provider,
             new_tts_provider,
-        )
-        self._retire_tts_provider(
-            self.tts_provider,
-            keep_local_service=keep_local_tts_service,
-        )
-        self.tts_provider = new_tts_provider
-        self.voice_playback_controller.set_provider(new_tts_provider)
-        connect_tts_error_signal = getattr(self, "_connect_tts_error_signal", None)
-        if callable(connect_tts_error_signal):
-            connect_tts_error_signal(new_tts_provider)
-        self._warm_up_tts_playback(new_tts_provider)
-        start_tts_ready_warmup = getattr(self, "_start_tts_ready_warmup", None)
-        if callable(start_tts_ready_warmup):
-            start_tts_ready_warmup(new_tts_provider)
+            character_changed=character_changed,
+        ):
+            disconnect_tts_error_signal = getattr(self, "_disconnect_tts_error_signal", None)
+            if callable(disconnect_tts_error_signal):
+                disconnect_tts_error_signal(self.tts_provider)
+            keep_local_tts_service = _should_keep_tts_local_service(
+                self.tts_provider,
+                new_tts_provider,
+            )
+            self._retire_tts_provider(
+                self.tts_provider,
+                keep_local_service=keep_local_tts_service,
+            )
+            self.tts_provider = new_tts_provider
+            self.voice_playback_controller.set_provider(new_tts_provider)
+            connect_tts_error_signal = getattr(self, "_connect_tts_error_signal", None)
+            if callable(connect_tts_error_signal):
+                connect_tts_error_signal(new_tts_provider)
+            self._warm_up_tts_playback(new_tts_provider)
+            start_tts_ready_warmup = getattr(self, "_start_tts_ready_warmup", None)
+            if callable(start_tts_ready_warmup):
+                start_tts_ready_warmup(new_tts_provider)
+        else:
+            # 配置与角色均未变:丢弃刚建好的等价 provider(adopt=False,未启动
+            # 服务/播放器,close 为惰性安全操作),保留现有 provider 不动。
+            close_unused = getattr(new_tts_provider, "close", None)
+            if callable(close_unused):
+                try:
+                    close_unused()
+                except Exception as exc:  # noqa: BLE001
+                    debug_log("TTS", "丢弃未使用的等价 TTS Provider 失败", {"error": str(exc)})
+            debug_log("PetWindow", "TTS 配置与角色均未变,保留现有 Provider,跳过重建")
         self._apply_character(selected_profile)
         apply_backchannel_settings = getattr(self, "_apply_backchannel_settings", None)
         if callable(apply_backchannel_settings):
@@ -4926,6 +4947,29 @@ def _build_status_tray_icon(color_text: str) -> QIcon:
     painter.end()
 
     return QIcon(pixmap)
+
+
+def _tts_provider_needs_rebuild(
+    old_provider: TTSProvider,
+    new_provider: TTSProvider,
+    *,
+    character_changed: bool,
+) -> bool:
+    """保存设置时是否需要用 new_provider 替换 old_provider。
+
+    仅在角色变化、provider 类型变化(如启停 TTS)或 TTS 配置变化时才重建。
+    GPTSoVITSTTSSettings 为 frozen dataclass,其相等比较已覆盖声线/模型/
+    语气参考等全部字段,故"settings 相等"即"provider 等价"。
+
+    无谓重建会在 TTS 服务后台探测(warmup)期间退休正被探测的旧 provider,
+    后台线程与主线程并发拆解同一 provider 引发原生崩溃;配置等价时返回
+    False,保留现有 provider 及其在途 warmup,既避险又免去无谓 churn。
+    """
+    if character_changed:
+        return True
+    if type(old_provider) is not type(new_provider):
+        return True
+    return getattr(old_provider, "settings", None) != getattr(new_provider, "settings", None)
 
 
 def _should_keep_tts_local_service(old_provider: TTSProvider, new_provider: TTSProvider) -> bool:
