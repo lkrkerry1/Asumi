@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+# intent 契约版本。probe 产物与角色 manifest 通过它声明相容性;
+# 详见 app/backchannel/data/intent_schema.json 与 assets/backchannels/MANIFEST_GUIDE.md。
+INTENT_SCHEMA_VERSION = "2026-06-15.v5"
+
 # 硬约束:分类器输出标签集与模板键标签集必须是同一张表,
 # 否则会产生永远不可达的死条目(标签漂移在草案审查中已实际出现过)。
 INTENTS = (
