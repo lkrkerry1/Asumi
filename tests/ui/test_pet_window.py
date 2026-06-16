@@ -8355,6 +8355,9 @@ def test_set_busy_disables_manual_screenshot_button() -> None:
     class MinimalBusyWindow:
         _set_busy = PetWindow._set_busy
         _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _release_empty_input_focus_after_reply_waiting = (
+            PetWindow._release_empty_input_focus_after_reply_waiting
+        )
         _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
         _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
         _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
@@ -8389,6 +8392,88 @@ def test_set_busy_disables_manual_screenshot_button() -> None:
     assert window.input_edit.properties["replyWaiting"] is False
     assert window.send_button.properties["replyWaiting"] is False
     assert window.input_bar_animator.sync_count == 2
+
+
+def test_reply_waiting_end_releases_empty_input_focus() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class FocusedInput(_DummyEditableInput):
+        def __init__(self, text: str) -> None:
+            super().__init__(text)
+            self.focused = True
+            self.clear_focus_count = 0
+
+        def hasFocus(self) -> bool:
+            return self.focused
+
+        def clearFocus(self) -> None:
+            self.focused = False
+            self.clear_focus_count += 1
+
+    class MinimalReplyWaitingWindow:
+        _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _release_empty_input_focus_after_reply_waiting = (
+            PetWindow._release_empty_input_focus_after_reply_waiting
+        )
+        _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
+        _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
+        _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
+        _set_widget_dynamic_property = PetWindow._set_widget_dynamic_property
+
+    window = MinimalReplyWaitingWindow()
+    window.character_profile = type("CharacterProfile", (), {"display_name": "Sakura"})()
+    window.startup_initializing = False
+    window.input_edit = FocusedInput("")
+    window.send_button = _DummyButton()
+    window.input_bar_animator = _DummyInputBarAnimator()
+    window.reply_waiting_ui_active = True
+
+    window._set_reply_waiting_ui(False)
+
+    assert not window.input_edit.focused
+    assert window.input_edit.clear_focus_count == 1
+    assert window.input_bar_animator.sync_count == 1
+
+
+def test_reply_waiting_end_keeps_focus_when_next_input_exists() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class FocusedInput(_DummyEditableInput):
+        def __init__(self, text: str) -> None:
+            super().__init__(text)
+            self.focused = True
+            self.clear_focus_count = 0
+
+        def hasFocus(self) -> bool:
+            return self.focused
+
+        def clearFocus(self) -> None:
+            self.focused = False
+            self.clear_focus_count += 1
+
+    class MinimalReplyWaitingWindow:
+        _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _release_empty_input_focus_after_reply_waiting = (
+            PetWindow._release_empty_input_focus_after_reply_waiting
+        )
+        _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
+        _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
+        _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
+        _set_widget_dynamic_property = PetWindow._set_widget_dynamic_property
+
+    window = MinimalReplyWaitingWindow()
+    window.character_profile = type("CharacterProfile", (), {"display_name": "Sakura"})()
+    window.startup_initializing = False
+    window.input_edit = FocusedInput("下一句")
+    window.send_button = _DummyButton()
+    window.input_bar_animator = _DummyInputBarAnimator()
+    window.reply_waiting_ui_active = True
+
+    window._set_reply_waiting_ui(False)
+
+    assert window.input_edit.focused
+    assert window.input_edit.clear_focus_count == 0
+    assert window.input_bar_animator.sync_count == 1
 
 
 def test_input_bar_pinned_while_waiting_reply() -> None:

@@ -1985,6 +1985,7 @@ class PetWindow(QWidget):
         """切换回复等待期间的输入区状态：保留输入能力，只提示当前正在等待。"""
         if getattr(self, "startup_initializing", False):
             waiting = False
+        was_waiting = bool(getattr(self, "reply_waiting_ui_active", False))
         self.reply_waiting_ui_active = waiting
         if hasattr(self, "input_edit"):
             self.input_edit.setPlaceholderText(
@@ -1995,7 +1996,22 @@ class PetWindow(QWidget):
             self._set_widget_dynamic_property(self.input_edit, "replyWaiting", waiting)
         if hasattr(self, "send_button"):
             self._set_widget_dynamic_property(self.send_button, "replyWaiting", waiting)
+        if was_waiting and not waiting:
+            self._release_empty_input_focus_after_reply_waiting()
         self._sync_input_bar_waiting_visibility()
+
+    def _release_empty_input_focus_after_reply_waiting(self) -> None:
+        """回复等待结束后释放空输入框焦点，避免输入栏被焦点状态永久固定。"""
+        input_edit = getattr(self, "input_edit", None)
+        text = getattr(input_edit, "text", None)
+        if callable(text) and str(text()).strip():
+            return
+        has_focus = getattr(input_edit, "hasFocus", None)
+        if not callable(has_focus) or not has_focus():
+            return
+        clear_focus = getattr(input_edit, "clearFocus", None)
+        if callable(clear_focus):
+            clear_focus()
 
     def _sync_input_bar_waiting_visibility(self) -> None:
         animator = getattr(self, "input_bar_animator", None)
