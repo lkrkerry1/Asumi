@@ -57,10 +57,6 @@ def migrate_env_to_yaml(env_path: Path, api_yaml_path: Path, system_yaml_path: P
         "PROACTIVE_SCREEN_CONTEXT_ENABLED": ("screen_awareness", "screen_context_enabled"),
         "PROACTIVE_CHECK_INTERVAL_MINUTES": ("screen_awareness", "check_interval_minutes"),
         "PROACTIVE_COOLDOWN_MINUTES": ("screen_awareness", "cooldown_minutes"),
-        "PROACTIVE_SCREEN_CONTEXT_RESOLUTION_P": (
-            "screen_awareness",
-            "screen_context_resolution_p",
-        ),
         "AUTO_MEMORY_ENABLED": ("memory_curation", "enabled"),
         "AUTO_MEMORY_TRIGGER_TURNS": ("memory_curation", "trigger_turns"),
         "AUTO_MEMORY_BACKFILL_LIMIT": ("memory_curation", "backfill_limit"),

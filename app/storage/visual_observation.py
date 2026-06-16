@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from app.agent.screen_awareness import SCREEN_AWARENESS_IMAGE_DETAIL
 from app.core.cancellation import CancelChecker, OperationCancelled
 from app.storage.atomic import atomic_write_text
 
@@ -285,26 +286,41 @@ def _build_visual_summary_user_text(
 
 
 def _job_image_parts(job: VisualObservationJob) -> list[dict[str, Any]]:
-    image_urls: list[str] = []
+    image_urls: list[tuple[str, str]] = []
     if job.observation is not None:
         data_url = getattr(job.observation, "data_url", "")
         if isinstance(data_url, str) and data_url.startswith("data:image/"):
-            image_urls.append(data_url)
+            image_urls.append((data_url, "low"))
     for context in job.screen_contexts or []:
         data_url = context.get("data_url")
         if isinstance(data_url, str) and data_url.startswith("data:image/"):
-            image_urls.append(data_url)
+            image_urls.append(
+                (
+                    data_url,
+                    _normalize_image_detail(
+                        context.get("detail"),
+                        default=SCREEN_AWARENESS_IMAGE_DETAIL,
+                    ),
+                )
+            )
 
     return [
         {
             "type": "image_url",
             "image_url": {
                 "url": image_url,
-                "detail": "low",
+                "detail": detail,
             },
         }
-        for image_url in image_urls[:3]
+        for image_url, detail in image_urls[:3]
     ]
+
+
+def _normalize_image_detail(value: Any, *, default: str = "low") -> str:
+    detail = str(value or "").strip().lower()
+    if detail in {"low", "high", "original", "auto"}:
+        return detail
+    return default
 
 
 def _job_metadata(job: VisualObservationJob) -> dict[str, Any]:

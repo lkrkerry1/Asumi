@@ -930,6 +930,48 @@ def test_event_error_cleans_transient_progress_during_shutdown() -> None:
     assert window.active_event_type == ""
 
 
+def test_screen_awareness_event_error_ends_interaction() -> None:
+    """主动感知 API 失败时必须结束交互，否则 active_interaction_id 卡住会让后续主动感知永久停摆。"""
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _handle_event_error = PetWindow._handle_event_error
+        _clear_active_event = PetWindow._clear_active_event
+
+        def __init__(self) -> None:
+            self._shutdown_in_progress = False
+            self.messages = []
+            self.active_event = None
+            self.active_event_type = "screen_awareness_check"
+            self.active_reminder_id = None
+            self.active_reminder_text = ""
+            self.active_interaction_id = "interaction-3"
+            self.logged = []
+            self.ended = []
+
+        def _log_interaction_stage(self, *args):  # type: ignore[no-untyped-def]
+            self.logged.append(args)
+
+        def _consume_agent_result(self, _result):  # type: ignore[no-untyped-def]
+            raise AssertionError("静默主动感知失败不应进入回复展示")
+
+        def _mark_reminder_completed(self, _reminder_id):  # type: ignore[no-untyped-def]
+            raise AssertionError("本用例没有提醒 id")
+
+        def _end_interaction(self, outcome: str) -> None:
+            self.ended.append(outcome)
+            self.active_interaction_id = ""
+
+    window = MinimalWindow()
+
+    window._handle_event_error("API 请求超时。")
+
+    assert window.active_event_type == ""
+    # 关键断言：交互已结束，active_interaction_id 被清空，主动感知总闸不会被永久卡住
+    assert window.active_interaction_id == ""
+    assert window.ended == ["screen_awareness_error_silent"]
+
+
 def test_speaking_state_timeout_cancels_reply_and_ends_interaction() -> None:
     from app.ui.pet_window import PetWindow
     from app.ui.state import PetUiState
@@ -1875,7 +1917,6 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
             check_interval_minutes=20,
             cooldown_minutes=10,
             screen_context_batch_limit=6,
-            screen_context_resolution_p=1080,
         ),
     )
 
@@ -1883,17 +1924,16 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
     assert not dialog.proactive_check_interval_spin.isEnabled()
     assert not dialog.proactive_cooldown_spin.isEnabled()
     assert not dialog.proactive_batch_limit_spin.isEnabled()
-    assert not dialog.proactive_resolution_combo.isEnabled()
     assert not dialog.proactive_token_estimate_label.isEnabled()
-    assert dialog.proactive_resolution_combo.currentData() == 1080
-    assert "6 张约 12,240 tokens" in dialog.proactive_token_estimate_label.text()
+    assert "按原始屏幕" in dialog.proactive_token_estimate_label.text()
+    assert "高细节估算" in dialog.proactive_token_estimate_label.text()
+    assert "6 张约" in dialog.proactive_token_estimate_label.text()
 
     dialog.proactive_screen_context_enabled_check.setChecked(True)
     app.processEvents()
     assert dialog.proactive_check_interval_spin.isEnabled()
     assert dialog.proactive_cooldown_spin.isEnabled()
     assert dialog.proactive_batch_limit_spin.isEnabled()
-    assert dialog.proactive_resolution_combo.isEnabled()
     assert dialog.proactive_token_estimate_label.isEnabled()
 
     dialog.proactive_screen_context_enabled_check.setChecked(False)
@@ -1901,7 +1941,6 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
     assert not dialog.proactive_check_interval_spin.isEnabled()
     assert not dialog.proactive_cooldown_spin.isEnabled()
     assert not dialog.proactive_batch_limit_spin.isEnabled()
-    assert not dialog.proactive_resolution_combo.isEnabled()
     assert not dialog.proactive_token_estimate_label.isEnabled()
 
     dialog.deleteLater()
@@ -6466,7 +6505,6 @@ def test_screen_awareness_capture_uses_selected_resolution(monkeypatch) -> None:
         screen_context_enabled=True,
         check_interval_minutes=1,
         cooldown_minutes=2,
-        screen_context_resolution_p=1080,
     )
     monkeypatch.setattr(pet_window_module, "capture_screen_image", lambda _window: object())
     window._start_screen_observation_encode = lambda _captured, context: (
@@ -6475,8 +6513,8 @@ def test_screen_awareness_capture_uses_selected_resolution(monkeypatch) -> None:
 
     window._capture_screen_awareness_context(60)
 
-    assert contexts[0]["resolution_p"] == 1080
-    assert contexts[0]["max_edge"] == 1920
+    assert contexts[0]["preserve_original_resolution"] is True
+    assert contexts[0]["detail"] == "high"
 
 
 def test_proactive_care_event_includes_recent_conversation() -> None:
@@ -7866,7 +7904,6 @@ def _build_minimal_proactive_window(
     check_interval_minutes: int,
     cooldown_minutes: int,
     screen_context_batch_limit: int = 6,
-    screen_context_resolution_p: int = 720,
     events=None,  # type: ignore[no-untyped-def]
     history=None,  # type: ignore[no-untyped-def]
 ):
@@ -7895,7 +7932,6 @@ def _build_minimal_proactive_window(
         check_interval_minutes=check_interval_minutes,
         cooldown_minutes=cooldown_minutes,
         screen_context_batch_limit=screen_context_batch_limit,
-        screen_context_resolution_p=screen_context_resolution_p,
     )
     window.worker_thread = None
     window.active_reminder_id = None
@@ -7931,7 +7967,6 @@ def _build_minimal_screen_awareness_window(
     check_interval_minutes: int,
     cooldown_minutes: int,
     screen_context_batch_limit: int = 6,
-    screen_context_resolution_p: int = 720,
     events=None,  # type: ignore[no-untyped-def]
     history=None,  # type: ignore[no-untyped-def]
 ):
@@ -7959,7 +7994,6 @@ def _build_minimal_screen_awareness_window(
         check_interval_minutes=check_interval_minutes,
         cooldown_minutes=cooldown_minutes,
         screen_context_batch_limit=screen_context_batch_limit,
-        screen_context_resolution_p=screen_context_resolution_p,
     )
     window.worker_thread = None
     window.active_reminder_id = None

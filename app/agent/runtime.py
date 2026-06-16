@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from app.agent.actions import AgentAction, AgentEvent, AgentProgress, AgentResult, PendingToolAction
 from app.agent.memory import MemoryStore
+from app.agent.screen_awareness import SCREEN_AWARENESS_IMAGE_DETAIL
 from app.agent.screen_tools import (
     OBSERVE_SCREEN_TOOL_NAME,
     SCREEN_OBSERVATION_CAPABILITY,
@@ -1695,13 +1696,24 @@ def _build_screen_context_image_part(screen_context: dict[str, Any]) -> dict[str
     data_url = screen_context.get("data_url")
     if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
         return None
+    detail = _normalize_image_detail(
+        screen_context.get("detail"),
+        default=SCREEN_AWARENESS_IMAGE_DETAIL,
+    )
     return {
         "type": "image_url",
         "image_url": {
             "url": data_url,
-            "detail": "low",
+            "detail": detail,
         },
     }
+
+
+def _normalize_image_detail(value: Any, *, default: str = "low") -> str:
+    detail = str(value or "").strip().lower()
+    if detail in {"low", "high", "original", "auto"}:
+        return detail
+    return default
 
 
 def _format_event_for_model(event: AgentEvent) -> str:

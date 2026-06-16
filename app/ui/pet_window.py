@@ -104,10 +104,10 @@ from app.ui.history_window import HistoryWindow
 from app.ui.log_window import RuntimeLogWindow
 from app.agent.screen_awareness import (
     SCREEN_AWARENESS_CONTEXT_HISTORY_MARKER,
+    SCREEN_AWARENESS_IMAGE_DETAIL,
     SCREEN_AWARENESS_TIMER_DUE_GRACE_SECONDS,
     SCREEN_AWARENESS_TIMER_POLL_INTERVAL_MS,
     ScreenAwarenessSettings,
-    screen_context_max_edge_for_resolution_p,
 )
 from app.agent.screen_observation import (
     CapturedScreenImage,
@@ -408,9 +408,12 @@ class ScreenObservationEncodeWorker(QObject):
     def run(self) -> None:
         try:
             self._cancel_token.throw_if_cancelled()
+            max_edge = _screen_observation_max_edge_from_context(self.context)
+            if self.context.get("preserve_original_resolution") is True:
+                max_edge = max(1, self.captured.image.width(), self.captured.image.height())
             observation = build_screen_observation_from_image(
                 self.captured,
-                max_edge=_screen_observation_max_edge_from_context(self.context),
+                max_edge=max_edge,
             )
             self._cancel_token.throw_if_cancelled()
         except OperationCancelled:
@@ -2783,6 +2786,7 @@ class PetWindow(QWidget):
             "height": observation.height,
             "captured_at": observation.captured_at,
             "screen_name": observation.screen_name,
+            "detail": str(context_data.get("detail") or SCREEN_AWARENESS_IMAGE_DETAIL),
         }
         if not self.screen_awareness_contexts:
             self.screen_awareness_context_batch_started_at = float(captured_at_monotonic)
@@ -2852,12 +2856,10 @@ class PetWindow(QWidget):
     def _screen_awareness_context_allowed(self) -> bool:
         return self._current_screen_awareness_settings().allows_screen_context()
 
-    def _screen_awareness_encode_options(self) -> dict[str, int]:
-        settings = self._current_screen_awareness_settings().normalized()
-        resolution_p = settings.screen_context_resolution_p
+    def _screen_awareness_encode_options(self) -> dict[str, Any]:
         return {
-            "resolution_p": resolution_p,
-            "max_edge": screen_context_max_edge_for_resolution_p(resolution_p),
+            "preserve_original_resolution": True,
+            "detail": SCREEN_AWARENESS_IMAGE_DETAIL,
         }
 
     def _sync_screen_awareness_timer(self) -> None:
@@ -3224,6 +3226,9 @@ class PetWindow(QWidget):
             self._consume_agent_result(result)
         elif _is_screen_awareness_event_type(event_type):
             self._log_interaction_stage("screen_awareness_error_silent")
+            # 主动感知失败时静默结束本轮交互。若不结束，active_interaction_id 会一直占用，
+            # _can_run_proactive_care 会持续返回 False，导致此后不再触发任何主动感知。
+            self._end_interaction("screen_awareness_error_silent")
         if reminder_id is not None:
             self._mark_reminder_completed(reminder_id)
 

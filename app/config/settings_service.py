@@ -14,7 +14,6 @@ from app.agent.screen_awareness import (
     SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES,
     SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES,
     SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
-    SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION_P,
     ScreenAwarenessSettings,
 )
 from app.voice.tts_settings import (
@@ -349,25 +348,19 @@ class AppSettingsService:
                 screen_awareness.get("screen_context_batch_limit"),
                 SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
             ),
-            screen_context_resolution_p=_int_value(
-                screen_awareness.get("screen_context_resolution_p"),
-                SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_RESOLUTION_P,
-            ),
         )
 
     def save_screen_awareness_settings(self, settings: ScreenAwarenessSettings) -> None:
         normalized = settings.normalized()
-        self.save_system_values(
-            "screen_awareness",
-            {
-                "enabled": bool(normalized.enabled),
-                "screen_context_enabled": bool(normalized.screen_context_enabled),
-                "check_interval_minutes": int(normalized.check_interval_minutes),
-                "cooldown_minutes": int(normalized.cooldown_minutes),
-                "screen_context_batch_limit": int(normalized.screen_context_batch_limit),
-                "screen_context_resolution_p": int(normalized.screen_context_resolution_p),
-            },
-        )
+        data = load_yaml_mapping(self.system_config_path)
+        data["screen_awareness"] = {
+            "enabled": bool(normalized.enabled),
+            "screen_context_enabled": bool(normalized.screen_context_enabled),
+            "check_interval_minutes": int(normalized.check_interval_minutes),
+            "cooldown_minutes": int(normalized.cooldown_minutes),
+            "screen_context_batch_limit": int(normalized.screen_context_batch_limit),
+        }
+        save_yaml_mapping(self.system_config_path, data)
 
     def load_proactive_care_settings(self) -> ScreenAwarenessSettings:
         """兼容旧调用点；新代码请使用 load_screen_awareness_settings。"""

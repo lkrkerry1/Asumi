@@ -49,6 +49,8 @@ from app.llm.prompt_templates import (
 )
 from app.agent.screen_awareness import (
     ScreenAwarenessSettings,
+    estimate_screen_context_batch_tokens_for_size,
+    estimate_screen_context_image_tokens_for_size,
 )
 from app.agent.screen_observation import (
     SCREEN_OBSERVATION_HISTORY_MARKER,
@@ -190,7 +192,25 @@ def test_screen_awareness_settings_default_to_enabled() -> None:
     assert settings.check_interval_minutes == 2
     assert settings.cooldown_minutes == 10
     assert settings.screen_context_batch_limit == 6
-    assert settings.screen_context_resolution_p == 720
+
+
+def test_screen_awareness_token_estimate_uses_high_detail_rules() -> None:
+    assert estimate_screen_context_image_tokens_for_size(
+        1920,
+        1080,
+        model="gpt-4o",
+    ) == 1105
+    assert estimate_screen_context_image_tokens_for_size(
+        3840,
+        2160,
+        model="gpt-4o",
+    ) == 1105
+    assert estimate_screen_context_batch_tokens_for_size(
+        1920,
+        1080,
+        6,
+        model="gpt-4o",
+    ) == 6630
 
 
 def test_screen_awareness_settings_clamp_intervals() -> None:
@@ -203,7 +223,6 @@ def test_screen_awareness_settings_clamp_intervals() -> None:
             "check_interval_minutes": 999,
             "cooldown_minutes": 999,
             "screen_context_batch_limit": 999,
-            "screen_context_resolution_p": 1080,
         },
     )
 
@@ -214,7 +233,6 @@ def test_screen_awareness_settings_clamp_intervals() -> None:
     assert settings.check_interval_minutes == 120
     assert settings.cooldown_minutes == 120
     assert settings.screen_context_batch_limit == 20
-    assert settings.screen_context_resolution_p == 1080
 
 
 def test_screen_awareness_settings_min_intervals_are_one_minute() -> None:
@@ -253,15 +271,6 @@ def test_screen_awareness_settings_invalid_batch_limit_uses_default() -> None:
     assert settings.screen_context_batch_limit == 6
 
 
-def test_screen_awareness_settings_invalid_resolution_uses_default() -> None:
-    service = AppSettingsService(_runtime_root_path("screen_awareness_invalid_resolution"))
-    service.save_system_values("screen_awareness", {"screen_context_resolution_p": 999})
-
-    settings = service.load_screen_awareness_settings().normalized()
-
-    assert settings.screen_context_resolution_p == 720
-
-
 def test_screen_awareness_settings_save_writes_yaml() -> None:
     service = AppSettingsService(_runtime_root_path("screen_awareness_save_cooldown"))
 
@@ -272,7 +281,6 @@ def test_screen_awareness_settings_save_writes_yaml() -> None:
             check_interval_minutes=3,
             cooldown_minutes=7,
             screen_context_batch_limit=4,
-            screen_context_resolution_p=1080,
         )
     )
 
@@ -282,7 +290,6 @@ def test_screen_awareness_settings_save_writes_yaml() -> None:
     assert config["screen_awareness"]["check_interval_minutes"] == 3
     assert config["screen_awareness"]["cooldown_minutes"] == 7
     assert config["screen_awareness"]["screen_context_batch_limit"] == 4
-    assert config["screen_awareness"]["screen_context_resolution_p"] == 1080
 
 
 def test_screen_awareness_settings_save_normalizes_enabled_flag() -> None:
@@ -3041,6 +3048,7 @@ def test_proactive_check_event_attaches_screen_context_image() -> None:
     content = client.messages[0][0]["content"]
     assert isinstance(content, list)
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,abc123"
+    assert content[1]["image_url"]["detail"] == "high"
     assert "abc123" not in content[0]["text"]
     assert "image_attached" in content[0]["text"]
     assert "先理解屏幕画面本身" in client.prompts[0]
@@ -3081,6 +3089,8 @@ def test_proactive_check_event_attaches_screen_context_image_batch() -> None:
     assert isinstance(content, list)
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,first"
     assert content[2]["image_url"]["url"] == "data:image/jpeg;base64,second"
+    assert content[1]["image_url"]["detail"] == "high"
+    assert content[2]["image_url"]["detail"] == "high"
     assert "first" not in content[0]["text"]
     assert "second" not in content[0]["text"]
     assert "image_attached" in content[0]["text"]
@@ -3111,6 +3121,7 @@ def test_proactive_check_event_includes_recent_conversation_text() -> None:
 
     assert isinstance(content, list)
     assert content[1]["image_url"]["url"] == "data:image/jpeg;base64,screen"
+    assert content[1]["image_url"]["detail"] == "high"
     assert "recent_conversation" in content[0]["text"]
     assert "访问 GitHub 看看 Sakura 内容" in content[0]["text"]
     assert "我打开看看。" in content[0]["text"]
