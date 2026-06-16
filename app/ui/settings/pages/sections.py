@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QSplitter,
-    QStackedWidget,
     QTableWidget,
     QTextEdit,
     QVBoxLayout,
@@ -770,51 +769,21 @@ class PluginSettingsPage:
         detail_layout.addRow("介绍", owner.plugin_detail_description_label)
         layout.addWidget(detail_group)
 
-        settings_group = QGroupBox("内置详细设置", panel)
-        settings_layout = QVBoxLayout(settings_group)
-        settings_layout.setContentsMargins(14, 14, 14, 14)
-        settings_layout.setSpacing(10)
-        owner.plugin_settings_stack = QStackedWidget(settings_group)
-        owner.plugin_settings_empty_label = QLabel("暂无内置详细设置。", settings_group)
-        owner.plugin_settings_empty_label.setObjectName("pluginSettingsEmptyLabel")
-        owner.plugin_settings_empty_label.setWordWrap(True)
-        empty_page = QWidget(settings_group)
-        empty_layout = QVBoxLayout(empty_page)
-        empty_layout.setContentsMargins(0, 0, 0, 0)
-        empty_layout.addWidget(owner.plugin_settings_empty_label)
-        empty_layout.addStretch(1)
-        owner.plugin_settings_stack.addWidget(empty_page)
-        owner._plugin_settings_empty_page = empty_page
-        owner._plugin_settings_pages_by_id = {}
-
-        for plugin_id, contributions in self._group_settings_panels(settings_panel_contributions).items():
-            page = self._build_settings_page(plugin_id, contributions, owner.plugin_settings_stack)
-            owner._plugin_settings_pages_by_id[plugin_id] = page
-            owner.plugin_settings_stack.addWidget(page)
-
-        settings_layout.addWidget(owner.plugin_settings_stack)
-        layout.addWidget(settings_group, 1)
+        # 详细设置改为按钮触发的独立对话框：启停页保持聚焦，插件设置控件在独立窗口
+        # 里整宽展示并可滚动，避免嵌套挤压。这里只按 plugin_id 暂存贡献，按需构建。
+        owner._plugin_settings_contributions_by_id = self._group_settings_panels(
+            settings_panel_contributions
+        )
+        owner.plugin_open_settings_button = QPushButton("打开设置…", panel)
+        owner.plugin_open_settings_button.setObjectName("pluginOpenSettingsButton")
+        owner.plugin_open_settings_button.clicked.connect(owner._open_plugin_settings_dialog)
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.addWidget(owner.plugin_open_settings_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+        layout.addStretch(1)
         return panel
-
-    def _build_settings_page(
-        self,
-        plugin_id: str,
-        contributions: list[SettingsPanelContribution],
-        parent: QWidget,
-    ) -> QWidget:
-        page = QWidget(parent)
-        page.setObjectName(f"pluginSettingsPage_{plugin_id}")
-        form_layout = QFormLayout(page)
-        form_layout.setContentsMargins(0, 0, 0, 0)
-        form_layout.setSpacing(10)
-        for contribution in sorted(contributions, key=lambda item: item.order):
-            try:
-                widget = contribution.build(page)
-            except Exception as exc:  # noqa: BLE001
-                widget = QLabel(f"{contribution.title} 设置加载失败：{exc}", page)
-                widget.setWordWrap(True)
-            form_layout.addRow(contribution.title, widget)
-        return page
 
     @staticmethod
     def _group_settings_panels(

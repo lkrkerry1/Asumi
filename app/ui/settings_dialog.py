@@ -469,7 +469,8 @@ class SettingsDialog(QDialog):
             self.plugin_detail_meta_label.setText("当前没有发现可管理的插件。")
             self.plugin_detail_permissions_label.setText("无")
             self.plugin_detail_description_label.setText("插件目录为空，或尚未配置插件清单。")
-            self._show_plugin_settings_empty("暂无可管理插件。")
+            self._current_plugin_id = ""
+            self._update_plugin_settings_button(enabled=False, tooltip="暂无可管理插件。")
             return
 
         if row is None or row < 0 or row >= len(self.plugin_specs):
@@ -500,29 +501,87 @@ class SettingsDialog(QDialog):
         )
         self.plugin_detail_description_label.setText(spec.description or "暂无介绍。")
 
-        pages_by_id = getattr(self, "_plugin_settings_pages_by_id", {})
-        page = pages_by_id.get(spec.plugin_id)
-        if page is None and len(pages_by_id) == 1:
-            page = pages_by_id.get("__unscoped__")
-        if page is not None and hasattr(self, "plugin_settings_stack"):
-            self.plugin_settings_stack.setCurrentWidget(page)
-            return
-
-        if not spec.enabled and selected_enabled:
-            text = "已选择启用此插件。保存并重启 Sakura 后，内置详细设置会在下次启动后显示。"
+        self._current_plugin_id = spec.plugin_id
+        if self._plugin_settings_for(spec.plugin_id):
+            self._update_plugin_settings_button(enabled=True, tooltip="")
         elif not spec.enabled:
-            text = "此插件当前未启用。启用并保存重启后，才会加载内置详细设置。"
-        elif spec.enabled and not selected_enabled:
-            text = "此插件将在保存并重启 Sakura 后禁用；当前没有可显示的内置详细设置。"
+            self._update_plugin_settings_button(
+                enabled=False,
+                tooltip="此插件未启用；启用并保存重启 Sakura 后才会加载内置详细设置。",
+            )
         else:
-            text = "暂无内置详细设置。"
-        self._show_plugin_settings_empty(text)
+            self._update_plugin_settings_button(enabled=False, tooltip="此插件没有内置详细设置。")
 
-    def _show_plugin_settings_empty(self, text: str) -> None:
-        if hasattr(self, "plugin_settings_empty_label"):
-            self.plugin_settings_empty_label.setText(text)
-        if hasattr(self, "plugin_settings_stack") and hasattr(self, "_plugin_settings_empty_page"):
-            self.plugin_settings_stack.setCurrentWidget(self._plugin_settings_empty_page)
+    def _plugin_settings_for(self, plugin_id: str) -> list:
+        """取选中插件的设置贡献；仅有唯一未归属分组时回退到 __unscoped__。"""
+        grouped = getattr(self, "_plugin_settings_contributions_by_id", {})
+        contributions = grouped.get(plugin_id)
+        if not contributions and len(grouped) == 1:
+            contributions = grouped.get("__unscoped__")
+        return list(contributions or [])
+
+    def _update_plugin_settings_button(self, *, enabled: bool, tooltip: str) -> None:
+        button = getattr(self, "plugin_open_settings_button", None)
+        if button is not None:
+            button.setEnabled(enabled)
+            button.setToolTip(tooltip)
+
+    def _open_plugin_settings_dialog(self) -> None:
+        """弹出独立对话框，整宽、可滚动地展示选中插件的设置面板。"""
+        dialog = self._build_plugin_settings_dialog(getattr(self, "_current_plugin_id", ""))
+        if dialog is not None:
+            dialog.exec()
+
+    def _build_plugin_settings_dialog(self, plugin_id: str) -> QDialog | None:
+        """构建（但不弹出）选中插件的设置对话框；无设置时返回 None。"""
+        contributions = self._plugin_settings_for(plugin_id)
+        if not contributions:
+            return None
+        title = self.plugin_detail_title_label.text() if hasattr(self, "plugin_detail_title_label") else "插件"
+
+        dialog = QDialog(self)
+        dialog.setObjectName("pluginSettingsDialog")
+        dialog.setWindowTitle(f"{title} · 设置")
+        # 继承主设置窗口的主题样式，避免子对话框显示为默认 Qt 灰白。
+        dialog.setStyleSheet(self.styleSheet())
+        dialog_layout = QVBoxLayout(dialog)
+        dialog_layout.setContentsMargins(0, 0, 0, 0)
+        dialog_layout.setSpacing(0)
+
+        scroll = QScrollArea(dialog)
+        # 复用主题中“透明滚动区/内容”选择器，让插件 GroupBox 落在主题背景上。
+        scroll.setObjectName("settingsScrollArea")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        content.setObjectName("settingsScrollContent")
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(16, 16, 16, 16)
+        content_layout.setSpacing(12)
+        for contribution in sorted(contributions, key=lambda item: item.order):
+            try:
+                widget = contribution.build(content)
+            except Exception as exc:  # noqa: BLE001 — 单个设置面板构建失败降级为提示，不阻断
+                widget = QLabel(f"{contribution.title} 设置加载失败：{exc}", content)
+                widget.setWordWrap(True)
+            content_layout.addWidget(widget)
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        dialog_layout.addWidget(scroll, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.setContentsMargins(12, 8, 12, 12)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        dialog_layout.addWidget(buttons)
+
+        # 尺寸贴合内容：内容少则对话框矮（关闭按钮紧随其下），多则封顶滚动。
+        hint = content.sizeHint()
+        dialog.resize(
+            min(max(hint.width() + 40, 480), 640),
+            min(hint.height() + 72, 600),
+        )
+        return dialog
 
     @Slot(bool)
     def _sync_proactive_screen_context_controls(self, enabled: bool) -> None:

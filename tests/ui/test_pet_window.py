@@ -2059,10 +2059,14 @@ def test_settings_dialog_adds_plugin_settings_panel() -> None:
     nav = dialog.findChild(QListWidget, "settingsNavList")
     assert nav is not None
     assert "插件" in [nav.item(index).text() for index in range(nav.count())]
+    # 设置面板改为按需在独立对话框中构建，这里构建对话框验证贡献已接入。
+    panel_dialog = dialog._build_plugin_settings_dialog("")
+    assert panel_dialog is not None
     assert any(
         isinstance(label, QLabel) and label.text() == "插件设置"
-        for label in dialog.findChildren(QLabel)
+        for label in panel_dialog.findChildren(QLabel)
     )
+    panel_dialog.deleteLater()
 
     dialog.deleteLater()
     app.processEvents()
@@ -2144,7 +2148,7 @@ permissions:
 def test_settings_dialog_plugin_detail_switches_settings_panel() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QLabel")):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QLabel", "QPushButton")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.plugins.models import SettingsPanelContribution
@@ -2153,6 +2157,7 @@ def test_settings_dialog_plugin_detail_switches_settings_panel() -> None:
     QApplication = qtwidgets.QApplication
     QTableWidget = qtwidgets.QTableWidget
     QLabel = qtwidgets.QLabel
+    QPushButton = qtwidgets.QPushButton
     app = QApplication.instance() or QApplication([])
     root = _ui_runtime_root("plugin_detail_switch")
     _write_settings_plugin_manifest(
@@ -2193,25 +2198,31 @@ def test_settings_dialog_plugin_detail_switches_settings_panel() -> None:
 
     table = dialog.findChild(QTableWidget, "pluginManagerTable")
     title_label = dialog.findChild(QLabel, "pluginDetailTitleLabel")
-    empty_label = dialog.findChild(QLabel, "pluginSettingsEmptyLabel")
+    settings_button = dialog.findChild(QPushButton, "pluginOpenSettingsButton")
     description_label = dialog.findChild(QLabel, "pluginDetailDescriptionLabel")
     assert table is not None
     assert title_label is not None
-    assert empty_label is not None
+    assert settings_button is not None
     assert description_label is not None
     assert table.rowCount() == 2
     assert title_label.text() == "Demo A"
-    assert empty_label.text() == "暂无内置详细设置。"
+    # Demo A 没有设置贡献：按钮禁用
+    assert settings_button.isEnabled() is False
 
     table.setCurrentCell(1, 1)
     app.processEvents()
 
     assert title_label.text() == "Demo B"
     assert description_label.text() == "B 插件介绍"
+    # Demo B 有设置贡献：按钮启用，打开对话框可见其设置内容
+    assert settings_button.isEnabled() is True
+    panel_dialog = dialog._build_plugin_settings_dialog("demo_b")
+    assert panel_dialog is not None
     assert any(
         isinstance(label, QLabel) and label.text() == "B 设置内容"
-        for label in dialog.findChildren(QLabel)
+        for label in panel_dialog.findChildren(QLabel)
     )
+    panel_dialog.deleteLater()
 
     dialog.deleteLater()
     app.processEvents()
@@ -2221,7 +2232,7 @@ def test_settings_dialog_plugin_detail_shows_disabled_restart_hint() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QCheckBox", "QLabel")):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QCheckBox", "QLabel", "QPushButton")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.ui.settings_dialog import SettingsDialog
@@ -2230,6 +2241,7 @@ def test_settings_dialog_plugin_detail_shows_disabled_restart_hint() -> None:
     QTableWidget = qtwidgets.QTableWidget
     QCheckBox = qtwidgets.QCheckBox
     QLabel = qtwidgets.QLabel
+    QPushButton = qtwidgets.QPushButton
     Qt = qtcore.Qt
     app = QApplication.instance() or QApplication([])
     root = _ui_runtime_root("plugin_detail_disabled")
@@ -2249,19 +2261,20 @@ def test_settings_dialog_plugin_detail_shows_disabled_restart_hint() -> None:
     )
 
     table = dialog.findChild(QTableWidget, "pluginManagerTable")
-    empty_label = dialog.findChild(QLabel, "pluginSettingsEmptyLabel")
+    settings_button = dialog.findChild(QPushButton, "pluginOpenSettingsButton")
     meta_label = dialog.findChild(QLabel, "pluginDetailMetaLabel")
     assert table is not None
-    assert empty_label is not None
+    assert settings_button is not None
     assert meta_label is not None
-    assert "当前未启用" in empty_label.text()
+    # 未启用插件：设置按钮禁用，提示说明需启用并重启
+    assert settings_button.isEnabled() is False
+    assert "未启用" in settings_button.toolTip()
 
     checkbox = table.cellWidget(0, 0).findChild(QCheckBox)
     assert checkbox is not None
     checkbox.setCheckState(Qt.CheckState.Checked)
     app.processEvents()
 
-    assert "保存并重启" in empty_label.text()
     assert "保存并重启" in meta_label.text()
 
     dialog.deleteLater()
@@ -2307,10 +2320,14 @@ def test_settings_dialog_plugin_settings_build_failure_has_placeholder() -> None
         ],
     )
 
+    # 设置面板按需在对话框中构建，构建失败降级为占位提示标签。
+    panel_dialog = dialog._build_plugin_settings_dialog("demo")
+    assert panel_dialog is not None
     assert any(
         isinstance(label, QLabel) and label.text() == "Demo 设置 设置加载失败：boom"
-        for label in dialog.findChildren(QLabel)
+        for label in panel_dialog.findChildren(QLabel)
     )
+    panel_dialog.deleteLater()
 
     dialog.deleteLater()
     app.processEvents()
@@ -2319,7 +2336,7 @@ def test_settings_dialog_plugin_settings_build_failure_has_placeholder() -> None
 def test_settings_dialog_plugin_page_empty_state() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QLabel")):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QLabel", "QPushButton")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.ui.settings_dialog import SettingsDialog
@@ -2327,6 +2344,7 @@ def test_settings_dialog_plugin_page_empty_state() -> None:
     QApplication = qtwidgets.QApplication
     QTableWidget = qtwidgets.QTableWidget
     QLabel = qtwidgets.QLabel
+    QPushButton = qtwidgets.QPushButton
     app = QApplication.instance() or QApplication([])
     root = _ui_runtime_root("plugin_detail_empty")
     dialog = SettingsDialog(
@@ -2344,13 +2362,14 @@ def test_settings_dialog_plugin_page_empty_state() -> None:
 
     table = dialog.findChild(QTableWidget, "pluginManagerTable")
     title_label = dialog.findChild(QLabel, "pluginDetailTitleLabel")
-    empty_label = dialog.findChild(QLabel, "pluginSettingsEmptyLabel")
+    settings_button = dialog.findChild(QPushButton, "pluginOpenSettingsButton")
     assert table is not None
     assert title_label is not None
-    assert empty_label is not None
+    assert settings_button is not None
     assert table.rowCount() == 0
     assert title_label.text() == "暂无插件"
-    assert empty_label.text() == "暂无可管理插件。"
+    # 无可管理插件：设置按钮禁用
+    assert settings_button.isEnabled() is False
 
     dialog.deleteLater()
     app.processEvents()
