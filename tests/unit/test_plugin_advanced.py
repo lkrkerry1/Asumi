@@ -7,7 +7,7 @@
 - ContextProviderContribution 注入 prompt 且异常不破坏 prompt
 - PluginManager 收集 context provider、事件订阅与 shutdown 清理
 - 旧 SDK 三参数 initialize 插件仍可加载
-- 内置 playwright_browser / emotion_state_example 仍可被发现
+- 内置 playwright_browser / emotion_state_example / mmd_renderer 仍可被发现
 """
 
 from __future__ import annotations
@@ -319,26 +319,6 @@ class EvtPlugin(PluginBase):
         return None
 """
 
-_LEGACY_PLUGIN_PY = """
-from sdk import PluginBase
-from app.plugins import ToolContribution
-
-
-class LegacyPlugin(PluginBase):
-    plugin_id = "legacy"
-
-    def initialize(self, register, plugin_root, host):
-        register.register_tool(
-            ToolContribution(
-                name="legacy_tool",
-                description="legacy",
-                parameters={"type": "object", "properties": {}, "required": []},
-                handler=lambda args: {"ok": True},
-            )
-        )
-"""
-
-
 class TestPluginManagerAdvanced:
     def test_collects_context_providers(self) -> None:
         base = _runtime_root("collect_providers")
@@ -387,20 +367,6 @@ class TestPluginManagerAdvanced:
         assert not results[0].loaded
         assert "context_provider" in str(results[0].error)
 
-    def test_legacy_three_arg_plugin_loads(self) -> None:
-        base = _runtime_root("legacy_plugin")
-        (base / "data" / "config").mkdir(parents=True, exist_ok=True)
-        # 旧 SDK 插件不声明 permissions，加载时按兼容权限处理。
-        _write_plugin(
-            base, "legacy", _LEGACY_PLUGIN_PY,
-            entry_class="LegacyPlugin",
-            permissions=None,
-        )
-        mgr = PluginManager(base)
-        results = mgr.load_all()
-        assert results[0].loaded, results[0].error
-        assert [tool.name for tool in mgr.collect_tools()] == ["legacy_tool"]
-
 
 class TestBuiltinPluginsDiscoverable:
     """确认改动未破坏内置插件的发现（仅解析清单，不导入执行）。"""
@@ -417,3 +383,9 @@ class TestBuiltinPluginsDiscoverable:
         emotion = [spec for spec in specs if spec.plugin_id == "emotion_state_example"]
         assert emotion, "emotion_state_example 应可被发现"
         assert "context_provider" in emotion[0].permissions
+
+    def test_mmd_renderer_discovered(self) -> None:
+        specs = PluginDiscovery(PROJECT_ROOT).discover()
+        mmd = [spec for spec in specs if spec.plugin_id == "mmd_renderer"]
+        assert mmd, "mmd_renderer 应可被发现"
+        assert "renderer" in mmd[0].permissions

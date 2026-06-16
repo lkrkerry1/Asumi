@@ -103,6 +103,40 @@ class PluginAgentService:
             debug_log("PluginAgentService", "request_passive_reply 失败", {"error": str(exc)})
 
 
+class PluginInputService:
+    """聊天输入框相关的安全入口。
+
+    让插件（如语音输入按钮）把文本填入用户输入框，但不直接发送，也不接触
+    主窗口或输入控件本身——交由用户确认/编辑后再自行发送。
+    """
+
+    def __init__(self) -> None:
+        # 宿主可注入：input_text_sink(text) -> None
+        self._input_text_sink: Callable[[str], None] | None = None
+
+    def set_input_text_sink(self, sink: Callable[[str], None] | None) -> None:
+        """注入真实输入框后端；传 None 恢复为空实现。"""
+        self._input_text_sink = sink
+
+    def set_input_text(self, text: str) -> None:
+        """请求宿主把文本填入聊天输入框（替换当前内容，不发送）。
+
+        典型用途：语音识别（ASR）得到结果后填入输入框，由用户确认或编辑后发送。
+        未注入后端时仅写日志。
+        """
+        try:
+            if self._input_text_sink is not None:
+                self._input_text_sink(text)
+                return
+            debug_log(
+                "PluginInputService",
+                "set_input_text（未接后端，空实现）",
+                {"text": text},
+            )
+        except Exception as exc:  # noqa: BLE001 — 服务调用不得影响插件或宿主
+            debug_log("PluginInputService", "set_input_text 失败", {"error": str(exc)})
+
+
 class PluginServices:
     """聚合宿主服务门面，作为 ``context.services`` 暴露给插件。"""
 
@@ -110,6 +144,7 @@ class PluginServices:
         self.ui = PluginUIService()
         self.tts = PluginTTSService()
         self.agent = PluginAgentService()
+        self.input = PluginInputService()
 
     def set_backends(
         self,
@@ -117,6 +152,7 @@ class PluginServices:
         bubble_sink: Callable[[str, str | None], None] | None = None,
         tts_sink: Callable[[str, bool], None] | None = None,
         passive_reply_sink: Callable[[str, dict[str, Any] | None], None] | None = None,
+        input_text_sink: Callable[[str], None] | None = None,
     ) -> None:
         """宿主装配时一次性注入真实后端（任意项可省略）。"""
         if bubble_sink is not None:
@@ -125,3 +161,5 @@ class PluginServices:
             self.tts.set_tts_sink(tts_sink)
         if passive_reply_sink is not None:
             self.agent.set_passive_reply_sink(passive_reply_sink)
+        if input_text_sink is not None:
+            self.input.set_input_text_sink(input_text_sink)

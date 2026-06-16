@@ -10,6 +10,7 @@ from app.plugins.models import (
     ChatUIWidgetContribution,
     ContextProviderContribution,
     PromptPatchContribution,
+    RendererContribution,
     SettingsPanelContribution,
     ToolContribution,
     ToolsTabContribution,
@@ -27,6 +28,7 @@ class PluginCapabilities:
     chat_ui_widgets: list[ChatUIWidgetContribution] = field(default_factory=list)
     prompt_patches: list[PromptPatchContribution] = field(default_factory=list)
     context_providers: list[ContextProviderContribution] = field(default_factory=list)
+    renderers: list[RendererContribution] = field(default_factory=list)
 
 
 @dataclass
@@ -39,6 +41,7 @@ class PluginCapabilityRegistry:
     chat_ui_widgets: list[ChatUIWidgetContribution] = field(default_factory=list)
     prompt_patches: list[PromptPatchContribution] = field(default_factory=list)
     context_providers: list[ContextProviderContribution] = field(default_factory=list)
+    renderers: list[RendererContribution] = field(default_factory=list)
 
     def register_tool(self, contribution: ToolContribution) -> None:
         self.tools.append(contribution)
@@ -57,6 +60,9 @@ class PluginCapabilityRegistry:
 
     def register_context_provider(self, contribution: ContextProviderContribution) -> None:
         self.context_providers.append(contribution)
+
+    def register_renderer(self, contribution: RendererContribution) -> None:
+        self.renderers.append(contribution)
 
     def tool(
         self,

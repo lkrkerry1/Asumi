@@ -62,6 +62,119 @@ def test_same_portrait_file_does_not_crossfade() -> None:
     )
 
 
+class _DummyPortraitLabel:
+    def __init__(self) -> None:
+        self.visible = True
+
+    def hide(self) -> None:
+        self.visible = False
+
+    def show(self) -> None:
+        self.visible = True
+
+
+def test_renderer_replaces_default_portrait_suppresses_png_labels() -> None:
+    from app.ui.pet_window import PetWindow
+
+    window = type("WindowStub", (), {})()
+    window.label = _DummyPortraitLabel()
+    window.portrait_transition_label = _DummyPortraitLabel()
+    window._set_portrait_overlay_suppressed = (  # type: ignore[attr-defined]
+        lambda suppressed: PetWindow._set_portrait_overlay_suppressed(window, suppressed)
+    )
+    window.renderer_manager = type(
+        "ManagerStub",
+        (),
+        {"is_overlay_active": True, "replaces_default_portrait": True},
+    )()
+
+    PetWindow._resuppress_portrait_if_renderer_active(window)
+
+    assert not window.label.visible
+    assert not window.portrait_transition_label.visible
+
+
+def test_renderer_without_replacement_keeps_png_labels_visible() -> None:
+    from app.ui.pet_window import PetWindow
+
+    window = type("WindowStub", (), {})()
+    window.label = _DummyPortraitLabel()
+    window.portrait_transition_label = _DummyPortraitLabel()
+    window._set_portrait_overlay_suppressed = (  # type: ignore[attr-defined]
+        lambda suppressed: PetWindow._set_portrait_overlay_suppressed(window, suppressed)
+    )
+    window.renderer_manager = type(
+        "ManagerStub",
+        (),
+        {"is_overlay_active": True, "replaces_default_portrait": False},
+    )()
+
+    PetWindow._resuppress_portrait_if_renderer_active(window)
+
+    assert window.label.visible
+    assert window.portrait_transition_label.visible
+
+
+def test_close_renderer_manager_closes_renderer_and_restores_png_label() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class ManagerStub:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    manager = ManagerStub()
+    window = type("WindowStub", (), {})()
+    window.label = _DummyPortraitLabel()
+    window.portrait_transition_label = _DummyPortraitLabel()
+    window._set_portrait_overlay_suppressed = (  # type: ignore[attr-defined]
+        lambda suppressed: PetWindow._set_portrait_overlay_suppressed(window, suppressed)
+    )
+    window.renderer_manager = manager
+    window._stop_gaze_tracking = lambda: None  # type: ignore[attr-defined]
+    window.label.hide()
+    window.portrait_transition_label.hide()
+
+    PetWindow._close_renderer_manager(window)
+
+    assert manager.closed
+    assert window.label.visible
+    # 转场 label 只在需要时显示，关闭 renderer 不应强制显示。
+    assert not window.portrait_transition_label.visible
+
+
+def test_activate_renderer_manager_assigns_before_gaze_tracking() -> None:
+    from app.ui.pet_window import PetWindow
+
+    manager = object()
+    window = type("WindowStub", (), {})()
+    window.renderer_manager = None
+    window.closed = False
+    window.gaze_started = False
+
+    def close_renderer_manager() -> None:
+        window.closed = True
+        window.renderer_manager = None
+
+    def init_renderer_manager() -> object:
+        return manager
+
+    def start_gaze_tracking() -> None:
+        assert window.renderer_manager is manager
+        window.gaze_started = True
+
+    window._close_renderer_manager = close_renderer_manager  # type: ignore[attr-defined]
+    window._init_renderer_manager = init_renderer_manager  # type: ignore[attr-defined]
+    window._start_gaze_tracking = start_gaze_tracking  # type: ignore[attr-defined]
+
+    assert PetWindow._activate_renderer_manager(window) is manager
+    assert window.closed
+    assert window.gaze_started
+    assert window.renderer_manager is manager
+
+
 def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
@@ -818,6 +931,7 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
     window.close_tts_tools = lambda: None
     window.close_mcp_tools = lambda: None
     window.close_plugins = lambda: None
+    window._close_renderer_manager = lambda: None
 
     window.close_external_tools()
 

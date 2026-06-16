@@ -430,12 +430,16 @@ class ScreenObservationEncodeWorker(QObject):
 
 class PetWindow(QWidget):
     memory_status_changed = Signal(str, str)
+    # 插件请求把文本填入输入框；用信号 marshal 回 UI 线程（ASR 等可能在后台线程触发）。
+    plugin_input_text_requested = Signal(str)
 
     def __init__(
         self,
         context: AppContext,
     ) -> None:
         super().__init__()
+        # 插件填充输入框的信号在此连接，确保后台线程触发时 marshal 回 UI 线程。
+        self.plugin_input_text_requested.connect(self._apply_plugin_input_text)
         self.context = context
         self.base_dir = context.base_dir
         self.startup_initializing = context.startup_initializing
@@ -455,6 +459,7 @@ class PetWindow(QWidget):
         self.tool_registry = context.tool_registry
         self.mcp_tool_provider = context.mcp_tool_provider
         self.plugin_manager = context.plugin_manager
+        self._wire_plugin_service_backends()
         self.agent_runtime = context.agent_runtime
         self.tts_provider = context.tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
@@ -840,6 +845,10 @@ class PetWindow(QWidget):
         self._move_to_default_position()
         if getattr(self, "startup_initializing", False):
             self._apply_startup_initializing_state()
+            self.renderer_manager = None
+        else:
+            # 插件化角色渲染后端依赖已加载插件；非首帧启动路径可立即初始化。
+            self.renderer_manager = self._activate_renderer_manager()
 
         application = QApplication.instance()
         if application is not None:
@@ -907,15 +916,18 @@ class PetWindow(QWidget):
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
         self._layout_stage()
+        self._sync_renderer_overlay_geometry()
 
     def moveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().moveEvent(event)
-        # 单窗口重构后气泡/输入栏为子控件，随主窗口一起移动，无需在此重定位。
+        # 气泡/输入栏是子控件会自动跟随；独立渲染器窗口需要同步屏幕坐标。
+        self._sync_renderer_overlay_geometry()
 
     def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().showEvent(event)
         # 子控件随主窗口显示；此处只需把它们摆到位并启动动画/自动隐藏。
         self._layout_stage()
+        self._sync_renderer_overlay_geometry()
         if hasattr(self, "bubble"):
             self.bubble.show()
         if hasattr(self, "input_bar_animator"):
@@ -991,6 +1003,147 @@ class PetWindow(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         self._handle_mouse_release(event)
 
+    def _init_renderer_manager(self) -> Any:
+        """初始化插件化角色渲染后端；失败返回 None（沿用现有立绘显示）。"""
+        try:
+            from app.renderers import RendererManager
+
+            collect_renderers = getattr(self.plugin_manager, "collect_renderers", None)
+            renderer_contributions = collect_renderers() if callable(collect_renderers) else []
+            manager = RendererManager(
+                settings_service=self.settings_service,
+                character_profile=self.character_profile,
+                event_bus=getattr(self.plugin_manager, "event_bus", None),
+                parent_window=self,
+                renderer_contributions=renderer_contributions,
+            )
+            manager.select_and_init()
+            if manager.is_overlay_active:
+                manager.load_character()
+                if getattr(manager, "replaces_default_portrait", False):
+                    self._set_portrait_overlay_suppressed(True)
+                self._sync_renderer_overlay_geometry(manager=manager)
+                manager.show()
+                debug_log(
+                    "RendererManager",
+                    "已启用独立角色渲染窗口",
+                    {"renderer": manager.active_renderer_name},
+                )
+            return manager
+        except Exception as exc:  # noqa: BLE001 — 渲染后端初始化失败不得影响桌宠启动
+            debug_log("RendererManager", "初始化失败，回退现有显示", {"error": str(exc)})
+            return None
+
+    def _activate_renderer_manager(self) -> Any:
+        """按当前插件集合重新创建角色渲染后端。"""
+        self._close_renderer_manager()
+        manager = self._init_renderer_manager()
+        self.renderer_manager = manager
+        self._start_gaze_tracking()
+        return manager
+
+    def _close_renderer_manager(self) -> None:
+        self._stop_gaze_tracking()
+        manager = getattr(self, "renderer_manager", None)
+        if manager is None:
+            return
+        try:
+            manager.close()
+        except Exception as exc:  # noqa: BLE001
+            debug_log("RendererManager", "关闭失败", {"error": str(exc)})
+        finally:
+            self.renderer_manager = None
+            self._set_portrait_overlay_suppressed(False)
+
+    def _start_gaze_tracking(self) -> None:
+        """overlay 渲染器激活时，周期采样鼠标位置驱动角色视线追踪。
+
+        仅在独立渲染器（如 MMD）接管显示时启用；默认 PNG 立绘无需追踪，
+        避免无意义的定时器开销。
+        """
+        manager = getattr(self, "renderer_manager", None)
+        if manager is None or not getattr(manager, "is_overlay_active", False):
+            return
+        timer = getattr(self, "_gaze_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(50)  # ~20fps，顺滑且开销可控
+            timer.timeout.connect(self._on_gaze_tick)
+            self._gaze_timer = timer
+        if not timer.isActive():
+            timer.start()
+
+    def _stop_gaze_tracking(self) -> None:
+        timer = getattr(self, "_gaze_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+    def _on_gaze_tick(self) -> None:
+        """把鼠标全局坐标归一化为角色坐标系 (x,y)∈[-1,1] 后驱动视线追踪。"""
+        manager = getattr(self, "renderer_manager", None)
+        if manager is None or not getattr(manager, "is_overlay_active", False):
+            return
+        try:
+            layout = self._compute_pet_layout()
+            px, py, pw, ph = layout.portrait_rect
+            if pw <= 0 or ph <= 0:
+                return
+            top_left = self.mapToGlobal(QPoint(px, py))
+            center_x = top_left.x() + pw / 2.0
+            center_y = top_left.y() + ph / 2.0
+            cursor = QCursor.pos()
+            # 以立绘矩形半宽/半高为基准归一化：x>0 鼠标在右、y>0 鼠标在下。
+            nx = max(-1.0, min(1.0, (cursor.x() - center_x) / (pw / 2.0)))
+            ny = max(-1.0, min(1.0, (cursor.y() - center_y) / (ph / 2.0)))
+            # 节流：变化过小不下发，减少 runJavaScript 频次。
+            last = getattr(self, "_gaze_last", None)
+            if last is not None and abs(nx - last[0]) < 0.02 and abs(ny - last[1]) < 0.02:
+                return
+            self._gaze_last = (nx, ny)
+            manager.look_at(nx, ny)
+        except Exception as exc:  # noqa: BLE001 — 视线追踪异常不得影响主窗口
+            debug_log("RendererManager", "视线追踪更新失败", {"error": str(exc)})
+
+    def _sync_renderer_overlay_geometry(
+        self,
+        manager: Any | None = None,
+        layout: PetLayout | None = None,
+    ) -> None:
+        """把独立渲染窗口贴到当前立绘矩形，避免覆盖气泡和输入栏。"""
+        manager = manager or getattr(self, "renderer_manager", None)
+        if manager is None or not getattr(manager, "is_overlay_active", False):
+            return
+        if layout is None:
+            layout = self._compute_pet_layout()
+        px, py, pw, ph = layout.portrait_rect
+        top_left = self.mapToGlobal(QPoint(px, py))
+        try:
+            manager.set_geometry(top_left.x(), top_left.y(), pw, ph)
+            manager.stack_below(self, topmost=bool(getattr(self, "always_on_top_enabled", False)))
+        except Exception as exc:  # noqa: BLE001 — 渲染后端异常不得影响主窗口
+            debug_log("RendererManager", "同步渲染窗口几何失败", {"error": str(exc)})
+
+    def _set_portrait_overlay_suppressed(self, suppressed: bool) -> None:
+        """独立渲染器接管角色显示时隐藏原 PNG 立绘。"""
+        for widget_name in ("label", "portrait_transition_label"):
+            widget = getattr(self, widget_name, None)
+            if widget is None:
+                continue
+            if suppressed:
+                widget.hide()
+            elif widget_name == "label":
+                widget.show()
+
+    def _resuppress_portrait_if_renderer_active(self) -> None:
+        manager = getattr(self, "renderer_manager", None)
+        if manager is not None and getattr(manager, "replaces_default_portrait", False):
+            self._set_portrait_overlay_suppressed(True)
+
+    def _maybe_resuppress_portrait(self) -> None:
+        suppress = getattr(self, "_resuppress_portrait_if_renderer_active", None)
+        if callable(suppress):
+            suppress()
+
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.close_external_tools()
         super().closeEvent(event)
@@ -1014,6 +1167,7 @@ class PetWindow(QWidget):
         self.close_tts_tools()
         self.close_mcp_tools()
         self.close_plugins()
+        self._close_renderer_manager()
 
     def _shutdown_qthread(self, thread_attr: str, worker_attr: str) -> None:
         thread = getattr(self, thread_attr, None)
@@ -1329,6 +1483,9 @@ class PetWindow(QWidget):
         # 同轮回复内各段高度延续：不在此重置，避免"段间先缩后扩"产生闪现。
         # 高度重置由 _collapse_auto_fit_bubble_height 在 cancel_reply_flow 前统一处理。
         self.portrait_controller.apply_for_segment(segment)
+        maybe_resuppress = getattr(self, "_maybe_resuppress_portrait", None)
+        if callable(maybe_resuppress):
+            maybe_resuppress()
         self._sync_reply_history_index_for_segment(segment)
         self.ui_state.begin_speaking("reply_segment")
         self._start_speaking_state_watchdog()
@@ -1485,6 +1642,9 @@ class PetWindow(QWidget):
         self.reply_history_index = index
         self.reply_history_review_active = True
         self.portrait_controller.apply_for_segment(segment)
+        maybe_resuppress = getattr(self, "_maybe_resuppress_portrait", None)
+        if callable(maybe_resuppress):
+            maybe_resuppress()
         self.subtitle_controller.show_text_immediately(segment.display_text(self.subtitle_language))
         self._log_interaction_stage(
             "reply_history_reviewed",
@@ -1675,6 +1835,7 @@ class PetWindow(QWidget):
         self._bubble_local_rect = QRect(bx, by, bw, bh)
         self._input_local_rect = QRect(ix, iy, iw, ih)
         self._sync_input_bar_native_backdrop_geometry()
+        self._sync_renderer_overlay_geometry(layout=layout)
 
     def _fit_bubble_for_label_height(self, label_h: int) -> None:
         """打字机溢出回调：按标签实际高度逐行扩展气泡（不持久化、不超上限）。"""
@@ -3621,8 +3782,10 @@ class PetWindow(QWidget):
                 api_client.set_event_emitter(emit_bus_event)
         self.mcp_tool_provider = services.mcp_tool_provider
         self.plugin_manager = services.plugin_manager
+        self._wire_plugin_service_backends()
         self._sync_plugin_chat_ui_widgets()
         self.mcp_settings = services.mcp_settings
+        self.renderer_manager = self._activate_renderer_manager()
 
         self.startup_initializing = False
         self._emit_app_started_event()
@@ -3692,6 +3855,39 @@ class PetWindow(QWidget):
                 shutdown_all()
             except Exception as exc:  # noqa: BLE001
                 debug_log("PluginManager", "关闭延迟启动插件失败", {"error": str(exc)})
+
+    def _wire_plugin_service_backends(self) -> None:
+        """把宿主真实后端注入插件服务门面（当前：输入框填充）。
+
+        每次 plugin_manager 建立后调用。sink 在插件调用时才读取输入控件，
+        因此即使此刻输入栏尚未构建也安全。
+        """
+        services = getattr(getattr(self, "plugin_manager", None), "services", None)
+        if services is None:
+            return
+        try:
+            services.set_backends(input_text_sink=self._request_fill_input_text)
+        except Exception as exc:  # noqa: BLE001 — 装配失败不得阻断启动
+            debug_log("PetWindow", "注入插件服务后端失败", {"error": str(exc)})
+
+    def _request_fill_input_text(self, text: str) -> None:
+        """插件侧入口：请求把文本填入输入框。
+
+        可能在后台线程（如 ASR 回调）被调用，通过信号 marshal 回 UI 线程。
+        """
+        self.plugin_input_text_requested.emit(str(text))
+
+    @Slot(str)
+    def _apply_plugin_input_text(self, text: str) -> None:
+        """在 UI 线程把文本填入输入框并聚焦（替换当前内容，不发送）。"""
+        if not hasattr(self, "input_edit"):
+            return
+        try:
+            self.input_edit.setText(text)  # QLineEdit.setText 会把光标置于末尾
+            self.input_edit.setFocus()
+        except RuntimeError as exc:
+            # 输入控件可能已被销毁
+            debug_log("PetWindow", "填入插件输入文本失败", {"error": str(exc)})
 
     def _sync_plugin_chat_ui_widgets(self) -> None:
         layout = self.input_bar.layout() if hasattr(self, "input_bar") else None
@@ -4809,6 +5005,7 @@ class PetWindow(QWidget):
                     ctypes.windll.user32.SetWindowPos(
                         int(window.winId()), insert_after, 0, 0, 0, 0, flags
                     )
+                self._stack_renderer_overlay_below()
             except Exception as exc:  # noqa: BLE001
                 debug_log("PetWindow", "同步原生置顶状态失败", {"error": str(exc)})
             return
@@ -4816,12 +5013,22 @@ class PetWindow(QWidget):
             try:
                 for window in self._topmost_sync_windows():
                     _set_macos_window_topmost(int(window.winId()), self.always_on_top_enabled)
+                self._stack_renderer_overlay_below()
             except Exception as exc:  # noqa: BLE001
                 debug_log("PetWindow", "同步 macOS 原生置顶状态失败", {"error": str(exc)})
 
     def _topmost_sync_windows(self):
         # 单窗口重构后只有主窗口一个顶层窗口，置顶仅作用于它。
         return [self]
+
+    def _stack_renderer_overlay_below(self) -> None:
+        manager = getattr(self, "renderer_manager", None)
+        if manager is None or not getattr(manager, "is_overlay_active", False):
+            return
+        try:
+            manager.stack_below(self, topmost=bool(getattr(self, "always_on_top_enabled", False)))
+        except Exception as exc:  # noqa: BLE001
+            debug_log("RendererManager", "同步渲染窗口层级失败", {"error": str(exc)})
 
     def _apply_layout_settings(
         self,
@@ -4866,6 +5073,9 @@ class PetWindow(QWidget):
             if scale_changed:
                 self.portrait_controller.set_portrait_scale_percent(next_scale)
                 self.portrait_controller.apply_current()  # 按新缩放重贴立绘（抑帧中，无中间帧）
+                maybe_resuppress = getattr(self, "_maybe_resuppress_portrait", None)
+                if callable(maybe_resuppress):
+                    maybe_resuppress()
             self._apply_pet_layout(anchor_global=anchor)  # 单次 setGeometry
         finally:
             self.setUpdatesEnabled(was_enabled)
@@ -5099,6 +5309,9 @@ class PetWindow(QWidget):
         self.setUpdatesEnabled(False)
         try:
             self.portrait_controller.set_profile(profile)
+            maybe_resuppress = getattr(self, "_maybe_resuppress_portrait", None)
+            if callable(maybe_resuppress):
+                maybe_resuppress()
             self._apply_pet_layout(anchor_global=anchor)
         finally:
             self.setUpdatesEnabled(was_enabled)

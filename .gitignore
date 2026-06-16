@@ -68,6 +68,10 @@ plugins/example_plugin/**/*.py[cod]
 !plugins/emotion_state_example/**
 plugins/emotion_state_example/__pycache__/
 plugins/emotion_state_example/**/*.py[cod]
+!plugins/mmd_renderer/
+!plugins/mmd_renderer/**
+plugins/mmd_renderer/__pycache__/
+plugins/mmd_renderer/**/*.py[cod]
 
 # 备份文件
 *.bak
