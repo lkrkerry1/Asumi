@@ -28,6 +28,7 @@ from PySide6.QtGui import (
     QMouseEvent,
     QPainter,
     QPixmap,
+    QRegion,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -619,6 +620,20 @@ class PetWindow(QWidget):
             on_portrait_changed=self._update_tray_icon_pixmap,
             portrait_scale_percent=self.portrait_scale_percent,
             parent=self,
+        )
+
+        # 舞台调试可视化层:开发者选项(设置页)或 env SAKURA_STAGE_DEBUG=1 启用,默认完全惰性。
+        # 画窗口/布局/实际立绘三框 + DPR 等数值,用于诊断布局/碰撞与 mac HiDPI 逻辑/物理错配。
+        self._stage_debug_overlay = None
+        self._apply_stage_debug_overlay(
+            self.debug_log_settings.stage_debug_overlay
+            or bool(os.environ.get("SAKURA_STAGE_DEBUG"))
+        )
+        # 舞台碰撞遮罩:开发者选项,把命中区裁到内容矩形并集(立绘四周空白点击穿透);默认关。
+        self._stage_collision_mask_enabled = False
+        self._apply_stage_collision_mask(
+            self.debug_log_settings.stage_collision_mask
+            or bool(os.environ.get("SAKURA_STAGE_MASK"))
         )
 
         self.bubble = QFrame(self)
@@ -1656,7 +1671,87 @@ class PetWindow(QWidget):
         只摆子控件、不改窗口尺寸，避免 setGeometry → resizeEvent → _layout_stage 递归；
         窗口尺寸的变更统一由 _apply_pet_layout 负责。
         """
-        self._place_pet_children(self._compute_pet_layout())
+        layout = self._compute_pet_layout()
+        self._place_pet_children(layout)
+        self._update_stage_debug_overlay(layout)
+        self._update_stage_mask(layout)
+
+    def _apply_stage_collision_mask(self, enabled: bool, *, refresh: bool = False) -> None:
+        """开关舞台碰撞遮罩。关闭时清除遮罩(整窗可点);开启 + refresh 时立即重算。"""
+        self._stage_collision_mask_enabled = bool(enabled)
+        if not enabled:
+            self.clearMask()
+        elif refresh:
+            self._update_stage_mask(self._compute_pet_layout())
+
+    def _update_stage_mask(self, layout) -> None:  # type: ignore[no-untyped-def]
+        """把窗口命中/绘制区裁到「立绘+气泡+输入栏」矩形并集 ∪ 可见直接子控件,空白处穿透。
+
+        始终并入三个布局矩形(气泡/输入栏即便此刻隐藏也预留,避免其出现时被裁);再并入所有
+        可见直接子控件(回复历史等),确保不裁掉任何可见 UI。任何异常都清除遮罩降级为整窗可点。
+        """
+        if not getattr(self, "_stage_collision_mask_enabled", False):
+            return
+        try:
+            region = QRegion()
+            for x, y, w, h in (layout.portrait_rect, layout.bubble_rect, layout.input_rect):
+                region = region.united(QRegion(x, y, w, h))
+            overlay = getattr(self, "_stage_debug_overlay", None)
+            for child in self.children():
+                if isinstance(child, QWidget) and child is not overlay and child.isVisible():
+                    region = region.united(QRegion(child.geometry()))
+            self.setMask(region)
+        except Exception as exc:  # noqa: BLE001
+            debug_log("UI", "舞台碰撞遮罩更新失败,清除遮罩降级", {"error": str(exc)})
+            self.clearMask()
+
+    def _apply_stage_debug_overlay(self, enabled: bool, *, refresh: bool = False) -> None:
+        """按开关创建/销毁舞台调试层。refresh=True 时立即重排以填充数值(运行期切换用)。"""
+        overlay = getattr(self, "_stage_debug_overlay", None)
+        if enabled and overlay is None:
+            from app.ui.stage_debug_overlay import StageDebugOverlay
+
+            overlay = StageDebugOverlay(self)
+            overlay.setGeometry(self.rect())
+            overlay.show()
+            self._stage_debug_overlay = overlay
+            if refresh:
+                self._layout_stage()
+        elif not enabled and overlay is not None:
+            overlay.hide()
+            overlay.deleteLater()
+            self._stage_debug_overlay = None
+
+    def _update_stage_debug_overlay(self, layout) -> None:  # type: ignore[no-untyped-def]
+        """刷新舞台调试层(仅当启用时存在);并打印一组诊断数值。"""
+        overlay = getattr(self, "_stage_debug_overlay", None)
+        if overlay is None:
+            return
+        overlay.setGeometry(self.rect())
+        overlay.raise_()
+        px, py, pw, ph = layout.portrait_rect
+        pm = self.label.pixmap()
+        pm_info = (
+            f"{pm.width()}x{pm.height()} dpr={pm.devicePixelRatio():.2f}"
+            if pm is not None and not pm.isNull()
+            else "none"
+        )
+        screen = self.screen()
+        screen_dpr = screen.devicePixelRatio() if screen is not None else 0.0
+        lg = self.label.geometry()
+        info = (
+            f"win logical   : {self.width()}x{self.height()}\n"
+            f"devicePixelRatio: win={self.devicePixelRatioF():.2f} screen={screen_dpr:.2f}\n"
+            f"stage_size    : {self.stage_size}\n"
+            f"portrait_rect : ({px},{py},{pw},{ph})  [green]\n"
+            f"label.geometry: ({lg.x()},{lg.y()},{lg.width()},{lg.height()})  [blue]\n"
+            f"label pixmap  : {pm_info}"
+        )
+        overlay.update_debug(
+            portrait_rect=QRect(px, py, pw, ph),
+            label_rect=QRect(lg.x(), lg.y(), lg.width(), lg.height()),
+            info=info,
+        )
 
     def _local_rect_to_global(self, rect: QRect) -> QRect:
         return QRect(self.mapToGlobal(rect.topLeft()), rect.size())
@@ -4308,6 +4403,12 @@ class PetWindow(QWidget):
         mcp_restart_required = dialog.result_mcp_settings != self.mcp_settings
         self.mcp_settings = dialog.result_mcp_settings
         self.debug_log_settings = dialog.result_debug_log_settings
+        self._apply_stage_debug_overlay(
+            self.debug_log_settings.stage_debug_overlay, refresh=True
+        )
+        self._apply_stage_collision_mask(
+            self.debug_log_settings.stage_collision_mask, refresh=True
+        )
         self.startup_settings = result_startup_settings
         sync_screen_awareness_timer = getattr(self, "_sync_screen_awareness_timer", None)
         if callable(sync_screen_awareness_timer):

@@ -771,6 +771,18 @@ class SystemSettingsPage:
         owner.debug_body_enabled_check.setEnabled(owner.debug_log_enabled_check.isChecked())
         owner.debug_file_enabled_check = QCheckBox("输出文件运行日志", tab)
         owner.debug_file_enabled_check.setChecked(debug_settings.file_enabled)
+        owner.stage_debug_overlay_check = QCheckBox("舞台调试框（开发者，画窗口/布局/立绘边界 + DPR）", tab)
+        owner.stage_debug_overlay_check.setChecked(debug_settings.stage_debug_overlay)
+        owner.stage_debug_overlay_check.setToolTip(
+            "在桌宠上叠加可视化调试层:红=窗口/碰撞区,绿=布局算出的立绘框,蓝=实际立绘控件,"
+            "并显示逻辑尺寸与 devicePixelRatio,用于排查舞台尺寸/碰撞与 mac HiDPI 问题。"
+        )
+        owner.stage_collision_mask_check = QCheckBox("舞台碰撞贴合（立绘四周空白可穿透点击，默认开）", tab)
+        owner.stage_collision_mask_check.setChecked(debug_settings.stage_collision_mask)
+        owner.stage_collision_mask_check.setToolTip(
+            "用 setMask 把窗口命中区裁到「立绘+气泡+输入栏」矩形并集,立绘两侧/角落的透明空白"
+            "不再拦截点击(可点到下层窗口),也不会再误拖桌宠。"
+        )
 
         owner.subtitle_typing_interval_spin = _NoWheelSpinBox(tab)
         owner.subtitle_typing_interval_spin.setRange(
@@ -810,6 +822,8 @@ class SystemSettingsPage:
         debug_form.addRow("", owner.debug_log_enabled_check)
         debug_form.addRow("", owner.debug_body_enabled_check)
         debug_form.addRow("", owner.debug_file_enabled_check)
+        debug_form.addRow("", owner.stage_debug_overlay_check)
+        debug_form.addRow("", owner.stage_collision_mask_check)
         subtitle_form = QFormLayout()
         subtitle_form.setContentsMargins(16, 12, 16, 12)
         subtitle_form.setSpacing(12)

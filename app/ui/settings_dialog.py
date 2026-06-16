@@ -1366,6 +1366,8 @@ class SettingsDialog(QDialog):
                     and self.debug_body_enabled_check.isChecked()
                 ),
                 file_enabled=self.debug_file_enabled_check.isChecked(),
+                stage_debug_overlay=self.stage_debug_overlay_check.isChecked(),
+                stage_collision_mask=self.stage_collision_mask_check.isChecked(),
             ),
             "startup_settings": StartupSettings(
                 launch_at_login=(
