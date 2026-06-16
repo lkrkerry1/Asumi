@@ -30,7 +30,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.agent.memory import EmbeddingModelImportResult, MemoryStore
+from app.agent.memory import (
+    DEFAULT_MEMORY_CONFIDENCE,
+    DEFAULT_MEMORY_IMPORTANCE,
+    DEFAULT_MEMORY_LAYER,
+    DEFAULT_MEMORY_SOURCE,
+    MEMORY_LAYER_LABELS,
+    MEMORY_LAYERS,
+    EmbeddingModelImportResult,
+    MemoryStore,
+)
 from app.agent.mcp import MCPRuntimeSettings
 from app.backchannel.model_cache import (
     DEFAULT_BACKCHANNEL_EMBEDDING_MODEL,
@@ -1144,15 +1153,27 @@ class SettingsDialog(QDialog):
             return
         keyword = self.memory_search_edit.text().strip()
         keyword_lower = keyword.lower()
+        layer_filter = ""
+        layer_combo = getattr(self, "memory_layer_filter_combo", None)
+        if layer_combo is not None:
+            layer_filter = str(layer_combo.currentData() or "")
         if keyword_lower:
             self._visible_memories = [
                 memory
                 for memory in self._all_memories
                 if keyword_lower in str(memory.get("content", "")).lower()
                 or keyword_lower in str(memory.get("id", "")).lower()
+                or keyword_lower in str(memory.get("category", "")).lower()
+                or keyword_lower in str(memory.get("source", "")).lower()
             ]
         else:
             self._visible_memories = list(self._all_memories)
+        if layer_filter:
+            self._visible_memories = [
+                memory
+                for memory in self._visible_memories
+                if str(memory.get("layer") or DEFAULT_MEMORY_LAYER) == layer_filter
+            ]
         if not self._visible_memories:
             self._show_memory_placeholder("没有匹配的记忆。" if keyword else "暂无长期记忆。")
             return
@@ -1164,6 +1185,11 @@ class SettingsDialog(QDialog):
         for row, memory in enumerate(self._visible_memories):
             memory_id = str(memory.get("id", ""))
             content = str(memory.get("content", ""))
+            layer = str(memory.get("layer") or DEFAULT_MEMORY_LAYER)
+            category = str(memory.get("category") or "")
+            importance = _format_memory_score(memory.get("importance"), DEFAULT_MEMORY_IMPORTANCE)
+            confidence = _format_memory_score(memory.get("confidence"), DEFAULT_MEMORY_CONFIDENCE)
+            source = str(memory.get("source") or "")
             updated_at = str(memory.get("updated_at") or memory.get("created_at") or "")
             is_checked = memory_id in self._selected_memory_ids
 
@@ -1173,8 +1199,12 @@ class SettingsDialog(QDialog):
 
             values = [
                 content,
+                MEMORY_LAYER_LABELS.get(layer, layer),
+                category,
+                importance,
+                confidence,
+                source,
                 _format_memory_time(updated_at),
-                _compact_memory_id(memory_id),
             ]
             self.memory_table.setItem(row, 0, select_item)
             self._set_memory_checkbox_widget(row, memory_id, is_checked)
@@ -1182,8 +1212,10 @@ class SettingsDialog(QDialog):
                 item = QTableWidgetItem(value)
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 if column == 1:
-                    item.setToolTip(content)
-                elif column == 3:
+                    item.setToolTip(f"{content}\n\nID: {memory_id}")
+                elif column == 2:
+                    item.setData(Qt.ItemDataRole.UserRole, layer)
+                elif column == 7:
                     item.setToolTip(memory_id)
                     item.setData(Qt.ItemDataRole.UserRole, memory_id)
                 self.memory_table.setItem(row, column, item)
@@ -1204,9 +1236,9 @@ class SettingsDialog(QDialog):
         item = QTableWidgetItem(text)
         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
         self.memory_table.setItem(0, 1, item)
-        self.memory_table.setItem(0, 0, QTableWidgetItem(""))
-        self.memory_table.setItem(0, 2, QTableWidgetItem(""))
-        self.memory_table.setItem(0, 3, QTableWidgetItem(""))
+        for column in range(self.memory_table.columnCount()):
+            if self.memory_table.item(0, column) is None:
+                self.memory_table.setItem(0, column, QTableWidgetItem(""))
         self.memory_table.blockSignals(False)
         self._syncing_memory_selection = False
         self._sync_memory_bulk_actions()
@@ -1285,6 +1317,11 @@ class SettingsDialog(QDialog):
         self._editing_memory_id = memory_id
         self._active_memory_id = memory_id
         self.memory_content_edit.setPlainText(str(memory.get("content", "")))
+        _set_combo_current_data(self.memory_layer_combo, str(memory.get("layer") or DEFAULT_MEMORY_LAYER))
+        self.memory_category_edit.setText(str(memory.get("category") or ""))
+        self.memory_source_edit.setText(str(memory.get("source") or DEFAULT_MEMORY_SOURCE))
+        self.memory_importance_spin.setValue(_float_value(memory.get("importance"), DEFAULT_MEMORY_IMPORTANCE))
+        self.memory_confidence_spin.setValue(_float_value(memory.get("confidence"), DEFAULT_MEMORY_CONFIDENCE))
         self.memory_content_edit.setPlaceholderText("编辑长期记忆内容")
         self.memory_save_button.setText("保存修改")
         self.memory_editor_container.setVisible(True)
@@ -1382,6 +1419,11 @@ class SettingsDialog(QDialog):
             self._editing_memory_id = None
             self._active_memory_id = None
             self.memory_content_edit.clear()
+            _set_combo_current_data(self.memory_layer_combo, DEFAULT_MEMORY_LAYER)
+            self.memory_category_edit.clear()
+            self.memory_source_edit.setText(DEFAULT_MEMORY_SOURCE)
+            self.memory_importance_spin.setValue(DEFAULT_MEMORY_IMPORTANCE)
+            self.memory_confidence_spin.setValue(DEFAULT_MEMORY_CONFIDENCE)
             self.memory_content_edit.setPlaceholderText("新增长期记忆内容")
             self.memory_save_button.setText("保存")
             self.memory_preview_label.setText("正在新增记忆")
@@ -1438,6 +1480,16 @@ class SettingsDialog(QDialog):
         if not hasattr(self, "memory_content_edit"):
             return
         self.memory_content_edit.clear()
+        if hasattr(self, "memory_category_edit"):
+            self.memory_category_edit.clear()
+        if hasattr(self, "memory_source_edit"):
+            self.memory_source_edit.setText(DEFAULT_MEMORY_SOURCE)
+        if hasattr(self, "memory_importance_spin"):
+            self.memory_importance_spin.setValue(DEFAULT_MEMORY_IMPORTANCE)
+        if hasattr(self, "memory_confidence_spin"):
+            self.memory_confidence_spin.setValue(DEFAULT_MEMORY_CONFIDENCE)
+        if hasattr(self, "memory_layer_combo"):
+            _set_combo_current_data(self.memory_layer_combo, DEFAULT_MEMORY_LAYER)
 
     def _save_memory_entry(self) -> None:
         if self.memory_store is None:
@@ -1446,11 +1498,12 @@ class SettingsDialog(QDialog):
         if not content:
             QMessageBox.warning(self, "内容为空", "记忆内容不能为空。")
             return
+        metadata = self._collect_memory_editor_metadata()
         try:
             if self._memory_editor_mode == "edit" and self._editing_memory_id:
                 editing_id = self._editing_memory_id
                 self.memory_store.update_memory(
-                    {"id": editing_id, "content": content, "source": "manual"},
+                    {"id": editing_id, "content": content, **metadata},
                     allow_sensitive=True,
                 )
                 self._selected_memory_ids = {editing_id}
@@ -1458,7 +1511,7 @@ class SettingsDialog(QDialog):
                 success_message = "记忆已更新。"
             else:
                 self.memory_store.create_memory(
-                    {"content": content, "source": "manual"},
+                    {"content": content, **metadata},
                     allow_sensitive=True,
                 )
                 self._memory_editor_mode = None
@@ -1472,6 +1525,37 @@ class SettingsDialog(QDialog):
             return
         self._load_memory_entries()
         QMessageBox.information(self, "保存成功", success_message)
+
+    def _collect_memory_editor_metadata(self) -> dict[str, object]:
+        layer = DEFAULT_MEMORY_LAYER
+        layer_combo = getattr(self, "memory_layer_combo", None)
+        if layer_combo is not None:
+            layer = str(layer_combo.currentData() or DEFAULT_MEMORY_LAYER)
+        if layer not in MEMORY_LAYERS:
+            layer = DEFAULT_MEMORY_LAYER
+        source = DEFAULT_MEMORY_SOURCE
+        source_edit = getattr(self, "memory_source_edit", None)
+        if source_edit is not None:
+            source = source_edit.text().strip() or DEFAULT_MEMORY_SOURCE
+        category = ""
+        category_edit = getattr(self, "memory_category_edit", None)
+        if category_edit is not None:
+            category = category_edit.text().strip()
+        importance = DEFAULT_MEMORY_IMPORTANCE
+        importance_spin = getattr(self, "memory_importance_spin", None)
+        if importance_spin is not None:
+            importance = float(importance_spin.value())
+        confidence = DEFAULT_MEMORY_CONFIDENCE
+        confidence_spin = getattr(self, "memory_confidence_spin", None)
+        if confidence_spin is not None:
+            confidence = float(confidence_spin.value())
+        return {
+            "layer": layer,
+            "category": category,
+            "importance": importance,
+            "confidence": confidence,
+            "source": source,
+        }
 
     def _delete_memory_entry(self) -> None:
         if self.memory_store is None:
@@ -2864,3 +2948,24 @@ def _format_memory_time(value: str) -> str:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone()
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_memory_score(value: object, default: float) -> str:
+    return f"{_float_value(value, default):.2f}"
+
+
+def _float_value(value: object, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(1.0, max(0.0, number))
+
+
+def _set_combo_current_data(combo: object, value: str) -> None:
+    finder = getattr(combo, "findData", None)
+    setter = getattr(combo, "setCurrentIndex", None)
+    if not callable(finder) or not callable(setter):
+        return
+    index = finder(value)
+    setter(index if index >= 0 else 0)

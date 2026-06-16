@@ -29,7 +29,16 @@ def test_curator_adds_memory_from_first_person_view() -> None:
     assert result.created == 1
     assert result.returned == 1
     assert result.processed_entries == 1
-    assert store.created == [{"content": "主人默认用中文交流", "source": "self_curation"}]
+    assert store.created == [
+        {
+            "content": "主人默认用中文交流",
+            "layer": "semantic",
+            "category": "",
+            "importance": 0.5,
+            "confidence": 0.75,
+            "source": "self_curation",
+        }
+    ]
     # 人格卡注入到第一人称整理的 system prompt。
     assert "我是 Sakura，这是我的人格卡。" in api.calls[0]["system_prompt"]
     # 现有记忆（带 id）注入到 user prompt，供模型对照去重。
@@ -59,7 +68,17 @@ def test_curator_updates_and_deletes_existing_memories() -> None:
     assert result.updated == 1
     assert result.archived == 1
     assert result.returned == 2
-    assert store.updated == [{"id": "m1", "content": "主人搬到了新地址"}]
+    assert store.updated == [
+        {
+            "id": "m1",
+            "content": "主人搬到了新地址",
+            "layer": "semantic",
+            "category": "",
+            "importance": 0.5,
+            "confidence": 0.75,
+            "source": "self_curation",
+        }
+    ]
     assert store.deleted == [{"id": "m2"}]
 
 
@@ -83,6 +102,53 @@ def test_curator_ignores_operations_with_unknown_id() -> None:
     assert result.updated == 0
     assert result.archived == 0
     assert result.ignored == 2
+
+
+def test_curator_skips_low_confidence_and_sensitive_candidates() -> None:
+    store = FakeMemoryStore()
+    operations = (
+        '{"operations":['
+        '{"op":"add","content":"主人喜欢抹茶","confidence":0.4},'
+        '{"op":"add","content":"主人密码是 abc123","confidence":0.9}'
+        ']}'
+    )
+    api = FakeCurationApiClient([operations])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries([_entry("user", "随便记一下")])
+
+    assert store.created == []
+    assert result.created == 0
+    assert result.ignored == 2
+
+
+def test_curator_merges_similar_memory_in_same_layer() -> None:
+    store = FakeMemoryStore(
+        existing=[
+            {
+                "id": "m1",
+                "content": "主人默认使用中文交流",
+                "layer": "procedural",
+                "category": "preference",
+            }
+        ]
+    )
+    operations = (
+        '{"operations":['
+        '{"op":"add","layer":"procedural","category":"preference",'
+        '"content":"主人默认使用简体中文交流","confidence":0.9}'
+        ']}'
+    )
+    api = FakeCurationApiClient([operations])
+    curator = MemoryCurator(api, store)
+
+    result = curator.curate_entries([_entry("user", "以后默认简体中文")])
+
+    assert result.created == 0
+    assert result.updated == 1
+    assert store.created == []
+    assert store.updated[0]["id"] == "m1"
+    assert store.updated[0]["layer"] == "procedural"
 
 
 def test_curator_chunks_large_history_into_separate_calls() -> None:

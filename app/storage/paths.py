@@ -108,6 +108,9 @@ class StoragePaths:
     def memory_store(self) -> Path:
         return self._data / "memory.json"
 
+    def memory_core_profiles(self) -> Path:
+        return self.memory_dir / "core_profiles.json"
+
     def memory_curation_state(self) -> Path:
         return self._data / "memory_curation_state.json"
 

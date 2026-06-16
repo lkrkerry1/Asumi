@@ -1165,6 +1165,16 @@ class AgentRuntime:
     def _build_event_reply_prompt(self, event_type: str = "reminder_due") -> str:
         return self._build_event_reply_result(event_type).system_prompt
 
+    def _memory_context(self, messages: list[ChatMessage], *, mode: str) -> str:
+        query = _latest_user_text(messages)
+        try:
+            builder = getattr(self.memory, "build_memory_context", None)
+            if callable(builder):
+                return builder(query, mode=mode)
+            return self.memory.summary()
+        except Exception as exc:
+            return f"长期记忆读取失败：{exc}"
+
 
 def _emit_progress_from_content(
     progress_callback: ProgressCallback | None,
@@ -1268,6 +1278,31 @@ def _groups_from_search_tools_result(result: ToolExecutionResult) -> set[str]:
         if isinstance(group, str) and group.strip():
             groups.add(group.strip())
     return groups
+
+
+def _latest_user_text(messages: list[ChatMessage]) -> str:
+    """提取最近一条用户文本，作为分层记忆检索查询。"""
+
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        return _message_text_content(message.get("content"))
+    return ""
+
+
+def _message_text_content(content: object) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts)
 
 
 def _build_tool_role_message(call: NativeToolCall, result: ToolExecutionResult) -> ChatMessage:

@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.agent.mcp import MCPRuntimeSettings, WINDOWS_MCP_EXPERIMENTAL_TEXT
-from app.agent.memory import MemoryStore
+from app.agent.memory import MEMORY_LAYER_LABELS, MEMORY_LAYERS, MemoryStore
 from app.backchannel.model_cache import (
     BACKCHANNEL_MODEL_CACHE_NAME,
     DEFAULT_BACKCHANNEL_EMBEDDING_MODEL,
@@ -1039,6 +1039,11 @@ class MemorySettingsPage:
         owner.memory_search_edit = QLineEdit(tab)
         owner.memory_search_edit.setPlaceholderText("搜索记忆内容或 ID")
         owner.memory_search_edit.textChanged.connect(owner._refresh_memory_table)
+        owner.memory_layer_filter_combo = _NoWheelComboBox(tab)
+        owner.memory_layer_filter_combo.addItem("全部层级", "")
+        for layer in MEMORY_LAYERS:
+            owner.memory_layer_filter_combo.addItem(MEMORY_LAYER_LABELS.get(layer, layer), layer)
+        owner.memory_layer_filter_combo.currentIndexChanged.connect(owner._refresh_memory_table)
         owner.memory_refresh_button = QPushButton("刷新", tab)
         owner.memory_refresh_button.clicked.connect(owner._load_memory_entries)
         owner.memory_download_model_button = QPushButton("在线安装记忆模型", tab)
@@ -1053,8 +1058,10 @@ class MemorySettingsPage:
         owner.memory_import_model_button.clicked.connect(owner._import_memory_model_archive)
         owner.memory_status_label = QLabel(MEMORY_READING_TEXT, tab)
 
-        owner.memory_table = QTableWidget(0, 4, tab)
-        owner.memory_table.setHorizontalHeaderLabels(["", "内容", "更新时间", "ID"])
+        owner.memory_table = QTableWidget(0, 8, tab)
+        owner.memory_table.setHorizontalHeaderLabels(
+            ["", "内容", "层级", "分类", "重要性", "置信度", "来源", "更新时间"]
+        )
         owner.memory_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         owner.memory_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         owner.memory_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1067,9 +1074,12 @@ class MemorySettingsPage:
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         owner.memory_table.setColumnWidth(0, 56)
-        owner.memory_table.setColumnWidth(3, 82)
         owner.memory_select_all_check = QCheckBox(header)
         owner.memory_select_all_check.setToolTip("全选当前结果")
         owner.memory_select_all_check.stateChanged.connect(
@@ -1096,11 +1106,27 @@ class MemorySettingsPage:
         owner.memory_content_edit = QTextEdit(tab)
         owner.memory_content_edit.setPlaceholderText("新增长期记忆内容")
         owner.memory_content_edit.setFixedHeight(84)
+        owner.memory_layer_combo = _NoWheelComboBox(tab)
+        for layer in MEMORY_LAYERS:
+            owner.memory_layer_combo.addItem(MEMORY_LAYER_LABELS.get(layer, layer), layer)
+        owner.memory_category_edit = QLineEdit(tab)
+        owner.memory_category_edit.setPlaceholderText("如 preference / project / workflow")
+        owner.memory_source_edit = QLineEdit(tab)
+        owner.memory_source_edit.setPlaceholderText("manual")
+        owner.memory_importance_spin = _NoWheelDoubleSpinBox(tab)
+        owner.memory_importance_spin.setRange(0.0, 1.0)
+        owner.memory_importance_spin.setSingleStep(0.05)
+        owner.memory_importance_spin.setDecimals(2)
+        owner.memory_confidence_spin = _NoWheelDoubleSpinBox(tab)
+        owner.memory_confidence_spin.setRange(0.0, 1.0)
+        owner.memory_confidence_spin.setSingleStep(0.05)
+        owner.memory_confidence_spin.setDecimals(2)
         owner.memory_save_button = QPushButton("保存", tab)
         owner.memory_save_button.clicked.connect(owner._save_memory_entry)
 
         filter_layout = QHBoxLayout()
         filter_layout.addWidget(owner.memory_search_edit, 1)
+        filter_layout.addWidget(owner.memory_layer_filter_combo)
         filter_layout.addWidget(owner.memory_download_model_button)
         filter_layout.addWidget(owner.memory_import_model_button)
         filter_layout.addWidget(owner.memory_refresh_button)
@@ -1118,6 +1144,11 @@ class MemorySettingsPage:
         editor_layout.setContentsMargins(0, 0, 0, 0)
         editor_layout.setSpacing(8)
         editor_layout.addRow("内容", owner.memory_content_edit)
+        editor_layout.addRow("层级", owner.memory_layer_combo)
+        editor_layout.addRow("分类", owner.memory_category_edit)
+        editor_layout.addRow("重要性", owner.memory_importance_spin)
+        editor_layout.addRow("置信度", owner.memory_confidence_spin)
+        editor_layout.addRow("来源", owner.memory_source_edit)
         editor_layout.addRow("", owner.memory_save_button)
         owner.memory_editor_container.setLayout(editor_layout)
         owner.memory_editor_container.setVisible(False)

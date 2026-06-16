@@ -853,6 +853,87 @@ def test_memory_store_create_update_search_and_delete() -> None:
     assert store.list_memories() == []
 
 
+def test_memory_store_defaults_legacy_records_to_semantic_layer() -> None:
+    fake = FakeMem0()
+    store = MemoryStore(base_dir=_runtime_root_path("memory_legacy_layer"), scope_id="sakura", memory_client=fake)
+    created = store.create_memory({"content": "主人喜欢低糖咖啡"})["memory"]
+
+    assert created["layer"] == "semantic"
+    assert created["metadata"]["layer"] == "semantic"
+    assert created["scope"] == "sakura"
+
+
+def test_memory_store_builds_layered_context_with_core_profile() -> None:
+    fake = FakeMem0()
+    store = MemoryStore(base_dir=_runtime_root_path("memory_context"), scope_id="sakura", memory_client=fake)
+    store.create_memory(
+        {
+            "content": "主人希望默认使用简体中文回答",
+            "layer": "procedural",
+            "category": "preference",
+            "confidence": 0.9,
+        }
+    )
+    store.create_memory(
+        {
+            "content": "Sakura 正在升级记忆系统",
+            "layer": "session",
+            "category": "project",
+        }
+    )
+    store.create_memory(
+        {
+            "content": "主人喜欢低糖咖啡",
+            "layer": "semantic",
+            "category": "preference",
+        }
+    )
+    store.create_memory(
+        {
+            "content": "上次讨论过记忆注入策略",
+            "layer": "episodic",
+            "category": "project",
+        }
+    )
+    store.create_memory(
+        {
+            "content": "主人长期偏好中文沟通",
+            "layer": "core_profile",
+            "category": "profile",
+        }
+    )
+
+    context = store.build_memory_context("", mode="tool")
+
+    assert "【常驻档案】" in context
+    assert "主人长期偏好中文沟通" in context
+    assert "【当前任务记忆】" in context
+    assert "【相关长期事实】" in context
+    assert "【协作规则与偏好】" in context
+    episodic_context = store.build_memory_context("上次", mode="event")
+    assert "【过往事件总结】" in episodic_context
+
+
+def test_memory_store_searches_and_converts_core_profile() -> None:
+    fake = FakeMem0()
+    store = MemoryStore(base_dir=_runtime_root_path("memory_core_profile"), scope_id="sakura", memory_client=fake)
+    created = store.create_memory({"content": "临时普通记忆"})["memory"]
+
+    converted = store.update_memory(
+        {
+            "id": created["id"],
+            "content": "主人长期偏好中文沟通",
+            "layer": "core_profile",
+            "category": "profile",
+        }
+    )["memory"]
+    result = store.search_memory({"layer": "core_profile", "query": "中文"})
+
+    assert converted["id"] == "core_profile:sakura"
+    assert result["memories"] == [converted]
+    assert fake.records == []
+
+
 def test_memory_store_uses_vendored_mem0_path_first() -> None:
     from app.agent.memory import MEM0_VENDOR_ROOT, install_mem0_vendor
 

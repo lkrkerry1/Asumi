@@ -174,6 +174,12 @@ def create_builtin_tool_registry(
                     "properties": {
                         "query": {"type": "string", "description": "搜索关键词，可为空；为空时列出最近记忆。"},
                         "limit": {"type": "integer", "description": "最多返回多少条，默认 20。"},
+                        "layer": {
+                            "type": "string",
+                            "description": "可选记忆层级：core_profile、semantic、episodic、procedural、session。",
+                        },
+                        "category": {"type": "string", "description": "可选分类过滤。"},
+                        "scope": {"type": "string", "description": "可选角色/作用域，默认当前角色。"},
                     },
                 },
                 handler=lambda arguments: memory.search_memory(arguments, wait=False),
@@ -189,6 +195,13 @@ def create_builtin_tool_registry(
                     "type": "object",
                     "properties": {
                         "content": {"type": "string", "description": "要保存的长期记忆内容。"},
+                        "layer": {
+                            "type": "string",
+                            "description": "可选记忆层级，默认 semantic；稳定偏好/协作规则用 procedural，当前任务用 session。",
+                        },
+                        "category": {"type": "string", "description": "可选分类，如 preference/project/profile。"},
+                        "importance": {"type": "number", "description": "0-1 的重要性，默认 0.5。"},
+                        "confidence": {"type": "number", "description": "0-1 的置信度，默认 0.75。"},
                     },
                     "required": ["content"],
                 },
@@ -207,6 +220,10 @@ def create_builtin_tool_registry(
                     "properties": {
                         "memory_id": {"type": "string", "description": "记忆 id，来自 memory_search 结果。"},
                         "content": {"type": "string", "description": "更新后的完整长期记忆内容。"},
+                        "layer": {"type": "string", "description": "可选记忆层级。"},
+                        "category": {"type": "string", "description": "可选分类。"},
+                        "importance": {"type": "number", "description": "0-1 的重要性。"},
+                        "confidence": {"type": "number", "description": "0-1 的置信度。"},
                     },
                     "required": ["memory_id", "content"],
                 },
@@ -277,7 +294,11 @@ def _memory_forget_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def _memory_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     memory_id = arguments.get("memory_id") or arguments.get("id")
-    return {"id": memory_id, "content": arguments.get("content")}
+    mapped = {"id": memory_id, "content": arguments.get("content")}
+    for key in ("layer", "category", "importance", "confidence"):
+        if key in arguments:
+            mapped[key] = arguments.get(key)
+    return mapped
 
 
 class TodoStore:

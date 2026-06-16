@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 from app.core.debug_log import debug_log
-from app.agent.memory import MemoryStore
+from app.agent.memory import (
+    DEFAULT_MEMORY_CONFIDENCE,
+    DEFAULT_MEMORY_IMPORTANCE,
+    MEMORY_LAYER_SEMANTIC,
+    MEMORY_LAYERS,
+    MemoryStore,
+    looks_like_sensitive_memory,
+)
 from app.core.cancellation import CancelChecker, OperationCancelled, check_cancelled
 from app.storage.atomic import atomic_write_text
 from app.storage.chat_history import ChatHistoryEntry
@@ -22,6 +31,10 @@ CURATION_MEMORY_SNAPSHOT_LIMIT = 500
 CURATION_MEMORY_SNAPSHOT_CHAR_BUDGET = 20000
 # 单次整理允许写回的操作数量上限，避免异常输出放大写入。
 MAX_CURATION_OPERATIONS = 50
+MIN_AUTO_WRITE_CONFIDENCE = 0.55
+CURATION_DUPLICATE_SIMILARITY = 0.92
+CURATION_MERGE_SIMILARITY = 0.78
+MAX_CURATION_OPERATIONS_PER_LAYER = 20
 
 
 @dataclass(frozen=True)
@@ -240,6 +253,7 @@ class MemoryCurator:
             for memory in existing
             if str(memory.get("id", "")).strip()
         }
+        operations_per_layer: dict[str, int] = {}
         created = 0
         updated = 0
         archived = 0
@@ -252,16 +266,78 @@ class MemoryCurator:
             action = str(operation.get("op") or operation.get("action") or "").strip().lower()
             memory_id = str(operation.get("id") or operation.get("memory_id") or "").strip()
             content = str(operation.get("content") or operation.get("memory") or "").strip()
+            layer = _normalize_operation_layer(operation)
+            category = str(operation.get("category") or "").strip()
+            confidence = _bounded_float(operation.get("confidence"), DEFAULT_MEMORY_CONFIDENCE)
+            importance = _bounded_float(operation.get("importance"), DEFAULT_MEMORY_IMPORTANCE)
+            if action in {"add", "update"}:
+                if confidence < MIN_AUTO_WRITE_CONFIDENCE:
+                    debug_log(
+                        "Memory",
+                        "跳过低置信记忆候选",
+                        {"op": action, "layer": layer, "confidence": confidence},
+                    )
+                    ignored += 1
+                    continue
+                if looks_like_sensitive_memory(content):
+                    debug_log("Memory", "跳过疑似敏感记忆候选", {"op": action, "layer": layer})
+                    ignored += 1
+                    continue
+                if operations_per_layer.get(layer, 0) >= MAX_CURATION_OPERATIONS_PER_LAYER:
+                    debug_log("Memory", "跳过超出单层写入上限的记忆候选", {"layer": layer})
+                    ignored += 1
+                    continue
             try:
                 if action == "add":
                     if not content:
                         ignored += 1
                         continue
+                    matched = _find_existing_memory_for_candidate(
+                        existing,
+                        content=content,
+                        layer=layer,
+                        category=category,
+                    )
+                    if matched is not None:
+                        similarity = _memory_similarity(content, str(matched.get("content") or ""))
+                        if similarity >= CURATION_DUPLICATE_SIMILARITY:
+                            ignored += 1
+                            event_counts["SKIP_DUPLICATE"] = event_counts.get("SKIP_DUPLICATE", 0) + 1
+                            continue
+                        matched_id = str(matched.get("id") or "").strip()
+                        if matched_id in existing_ids:
+                            self.memory_store.update_memory(
+                                {
+                                    "id": matched_id,
+                                    "content": content,
+                                    "layer": layer,
+                                    "category": category,
+                                    "importance": importance,
+                                    "confidence": confidence,
+                                    "source": "self_curation",
+                                },
+                                allow_sensitive=True,
+                            )
+                            matched["content"] = content
+                            matched["layer"] = layer
+                            matched["category"] = category
+                            updated += 1
+                            operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
+                            event_counts["MERGE_UPDATE"] = event_counts.get("MERGE_UPDATE", 0) + 1
+                            continue
                     self.memory_store.create_memory(
-                        {"content": content, "source": "self_curation"},
+                        {
+                            "content": content,
+                            "layer": layer,
+                            "category": category,
+                            "importance": importance,
+                            "confidence": confidence,
+                            "source": "self_curation",
+                        },
                         allow_sensitive=True,
                     )
                     created += 1
+                    operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                     event_counts["ADD"] = event_counts.get("ADD", 0) + 1
                 elif action == "update":
                     if memory_id not in existing_ids or not content:
@@ -272,8 +348,20 @@ class MemoryCurator:
                         )
                         ignored += 1
                         continue
-                    self.memory_store.update_memory({"id": memory_id, "content": content})
+                    self.memory_store.update_memory(
+                        {
+                            "id": memory_id,
+                            "content": content,
+                            "layer": layer,
+                            "category": category,
+                            "importance": importance,
+                            "confidence": confidence,
+                            "source": "self_curation",
+                        },
+                        allow_sensitive=True,
+                    )
                     updated += 1
+                    operations_per_layer[layer] = operations_per_layer.get(layer, 0) + 1
                     event_counts["UPDATE"] = event_counts.get("UPDATE", 0) + 1
                 elif action == "delete":
                     if memory_id not in existing_ids:
@@ -378,12 +466,14 @@ _SELF_CURATION_TASK_PROMPT = (
     "- 已有记忆已经明确失效、错误或不该再保留 → 删除对应那条记忆；\n"
     "- 没有值得整理的内容时，就不要产生任何操作。\n\n"
     "只保留对长期陪伴与协作真正有用、且能独立理解的事实；忽略寒暄、一次性的临时提醒、转瞬即逝的情绪和无长期价值的内容。\n"
+    "请为每条候选记忆选择 layer：semantic=长期事实，episodic=事件总结，procedural=协作规则/偏好，session=当前任务短期状态，core_profile=高度稳定的常驻档案。\n"
+    "不要记录密码、token、密钥、证件号、银行卡等敏感信息。\n"
     "所有记忆内容必须使用简体中文，并以你自己的口吻或客观事实记录（例如「主人喜欢……」「我和主人约定……」）。\n\n"
     "必须只返回严格 JSON，格式如下：\n"
     "{\"operations\":[\n"
-    "  {\"op\":\"add\",\"content\":\"要新增的记忆内容\"},\n"
-    "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"content\":\"更新后的完整记忆内容\"},\n"
-    "  {\"op\":\"delete\",\"id\":\"已有记忆的id\"}\n"
+    "  {\"op\":\"add\",\"layer\":\"semantic\",\"category\":\"preference\",\"importance\":0.6,\"confidence\":0.8,\"reason\":\"为什么值得记住\",\"content\":\"要新增的记忆内容\"},\n"
+    "  {\"op\":\"update\",\"id\":\"已有记忆的id\",\"layer\":\"procedural\",\"category\":\"workflow\",\"importance\":0.7,\"confidence\":0.9,\"reason\":\"为什么需要更新\",\"content\":\"更新后的完整记忆内容\"},\n"
+    "  {\"op\":\"delete\",\"id\":\"已有记忆的id\",\"reason\":\"为什么删除\"}\n"
     "]}\n"
     "其中 update 和 delete 的 id 必须来自下面「已有记忆」列表里真实存在的 id，不要编造 id。"
     "没有要整理的内容时返回 {\"operations\":[]}。"
@@ -401,7 +491,10 @@ def _format_existing_memories(memories: list[dict[str, Any]]) -> str:
         content = str(memory.get("content", "")).strip()
         if not memory_id or not content:
             continue
-        line = f"- [{memory_id}] {content}"
+        layer = str(memory.get("layer") or MEMORY_LAYER_SEMANTIC)
+        category = str(memory.get("category") or "").strip()
+        tag = layer if not category else f"{layer}/{category}"
+        line = f"- [{memory_id}] ({tag}) {content}"
         if used + len(line) > CURATION_MEMORY_SNAPSHOT_CHAR_BUDGET and lines:
             truncated = True
             break
@@ -437,6 +530,67 @@ def _parse_curation_operations(raw: str) -> list[dict[str, Any]]:
         if isinstance(item, dict):
             operations.append(item)
     return operations
+
+
+def _normalize_operation_layer(operation: dict[str, Any]) -> str:
+    layer = str(operation.get("layer") or "").strip()
+    return layer if layer in MEMORY_LAYERS else MEMORY_LAYER_SEMANTIC
+
+
+def _bounded_float(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(1.0, max(0.0, number))
+
+
+def _find_existing_memory_for_candidate(
+    existing: list[dict[str, Any]],
+    *,
+    content: str,
+    layer: str,
+    category: str,
+) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    best_score = 0.0
+    for memory in existing:
+        memory_layer = str(memory.get("layer") or MEMORY_LAYER_SEMANTIC)
+        if memory_layer != layer:
+            continue
+        memory_category = str(memory.get("category") or "").strip()
+        if category and memory_category and category != memory_category:
+            continue
+        score = _memory_similarity(content, str(memory.get("content") or ""))
+        if score > best_score:
+            best = memory
+            best_score = score
+    if best_score >= CURATION_MERGE_SIMILARITY:
+        return best
+    return None
+
+
+def _memory_similarity(left: str, right: str) -> float:
+    left_tokens = _memory_tokens(left)
+    right_tokens = _memory_tokens(right)
+    token_score = 0.0
+    if left_tokens and right_tokens:
+        overlap = len(left_tokens & right_tokens)
+        union = len(left_tokens | right_tokens)
+        token_score = overlap / union if union else 0.0
+    sequence_score = SequenceMatcher(None, left, right).ratio()
+    return max(token_score, sequence_score)
+
+
+def _memory_tokens(text: str) -> set[str]:
+    normalized = text.lower()
+    ascii_tokens = set(re.findall(r"[a-z0-9_./:-]{2,}", normalized))
+    cjk_tokens = {
+        normalized[index : index + 2]
+        for index in range(max(0, len(normalized) - 1))
+        if any("\u4e00" <= char <= "\u9fff" for char in normalized[index : index + 2])
+    }
+    return ascii_tokens | cjk_tokens
 
 
 def _load_json_object(raw: str) -> dict[str, Any]:
