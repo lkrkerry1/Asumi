@@ -11,6 +11,7 @@ from app.llm.api_client import (
     _build_segmented_reply_instruction,
     _build_chat_completion_payload,
     _filter_supported_chat_params,
+    _is_temperature_unsupported_error,
 )
 from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply, sanitize_reply_tones
 
@@ -156,6 +157,36 @@ def test_complete_raw_retries_without_temperature_when_provider_rejects(monkeypa
 
     assert "temperature" in calls[0]
     assert "temperature" not in calls[1]
+
+
+def test_is_temperature_unsupported_error_matches_varied_provider_wordings() -> None:
+    # 各家供应商对「仅支持默认温度」的措辞不一，都应触发自动回退。
+    recoverable = [
+        "Unsupported value: 'temperature' does not support 0.8 with this model."
+        " Only the default (1) value is supported.",
+        "temperature only supports the default value",
+        "temperature is not supported with this model",
+        "temperature must be 1 for this model",
+        "temperature can only be set to the default",
+        "this model only accepts the default temperature",
+        "temperature cannot be modified for reasoning models",
+        "Invalid value for 'temperature'.",
+    ]
+    for message in recoverable:
+        assert _is_temperature_unsupported_error(ApiRequestError(message)), message
+
+
+def test_is_temperature_unsupported_error_ignores_value_range_and_unrelated_errors() -> None:
+    # 值域错误是用户配置问题，应原样抛出；与温度无关的错误更不该误判。
+    non_recoverable = [
+        "temperature must be between 0 and 2",
+        "temperature should be in the range [0, 2]",
+        "temperature must be less than or equal to 2",
+        "invalid api key",
+        "model not found",
+    ]
+    for message in non_recoverable:
+        assert not _is_temperature_unsupported_error(ApiRequestError(message)), message
 
 
 def test_complete_raw_remembers_temperature_unsupported(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -584,6 +615,38 @@ def test_chat_completions_normalizes_google_ai_studio_base_url(monkeypatch) -> N
 
     assert client.test_connection() == "OK"
     assert captured["url"] == "https://generativelanguage.googleapis.com/v1/openai/chat/completions"
+
+
+def test_connection_omits_temperature(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import json
+
+    captured: dict[str, Any] = {}
+    client = OpenAICompatibleClient(
+        ApiSettings(base_url="https://api.example.com/v1", api_key="key", model="o3")
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_args):  # type: ignore[no-untyped-def]
+            return None
+
+        def read(self) -> bytes:
+            return b'{"choices":[{"message":{"content":"OK"}}]}'
+
+    def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+        _ = timeout
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    # 只接受默认温度的模型在检测阶段不应被显式 temperature 拒绝。
+    assert client.test_connection() == "OK"
+    assert "temperature" not in captured["payload"]
 
 
 def test_list_models_allows_empty_model_but_requires_key() -> None:

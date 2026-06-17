@@ -121,6 +121,8 @@ class OpenAICompatibleClient:
         """发送一次最小聊天请求，验证 Base URL、API Key 和模型是否可用。"""
         self._ensure_chat_config("缺少 API_KEY。请在设置中填写 API Key。")
 
+        # 连通性检测只需验证 Base URL / API Key / 模型可用，不发送 temperature：
+        # 部分模型（如 o1/o3/gpt-5 等推理模型）只接受默认温度，显式传值会直接报错。
         payload = {
             "model": self.settings.model,
             "messages": [
@@ -130,7 +132,6 @@ class OpenAICompatibleClient:
                 },
             ],
             "max_tokens": 8,
-            "temperature": 0,
         }
         data = self._post_chat_completions_with_compatibility_fallbacks(payload)
 
@@ -676,12 +677,39 @@ def _is_temperature_unsupported_error(exc: ApiRequestError) -> bool:
     text = str(exc).lower()
     if "temperature" not in text:
         return False
+    # 值域错误（如「temperature 必须在 0~2 之间」）属于用户填错配置，应原样抛出，
+    # 不能误判成「模型不支持自定义温度」而静默剥参、悄悄忽略用户设置。
+    range_markers = (
+        "between",
+        "range",
+        "minimum",
+        "maximum",
+        "less than",
+        "greater than",
+        "<=",
+        ">=",
+    )
+    if any(marker in text for marker in range_markers):
+        return False
+    # 不同供应商对「仅支持默认温度」的措辞各异，尽量覆盖以便自动回退。
     markers = (
         "unsupported",
         "not support",
         "does not support",
+        "only support",
         "only the default",
         "default value",
+        "only accept",
+        "not allowed",
+        "can only be",
+        "must be",
+        "cannot be changed",
+        "cannot be modified",
+        "cannot be set",
+        "is fixed",
+        "not configurable",
+        "cannot be configured",
+        "invalid",
     )
     return any(marker in text for marker in markers)
 
