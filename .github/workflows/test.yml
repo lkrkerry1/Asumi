@@ -129,10 +129,4 @@ jobs:
             fi
           fi
 
-          # keep existing special-case for Qt cleanup abort code 134 (if you still want it)
-          if [ $EXIT_CODE -eq 134 ]; then
-            echo "::warning::Qt cleanup crash after all tests passed — treating as success"
-            exit 0
-          fi
-
           exit $EXIT_CODE
