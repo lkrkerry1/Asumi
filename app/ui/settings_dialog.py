@@ -1139,7 +1139,7 @@ class SettingsDialog(QDialog):
             self._editing_memory_id = None
             self._active_memory_id = None
             self._clear_memory_editor()
-            self.memory_editor_container.setVisible(False)
+            self._set_memory_editor_visible(False)
         self.memory_status_label.setText(f"已加载 {len(self._all_memories)} 条记忆")
         self._refresh_memory_table()
 
@@ -1198,10 +1198,6 @@ class SettingsDialog(QDialog):
             memory_id = str(memory.get("id", ""))
             content = str(memory.get("content", ""))
             layer = str(memory.get("layer") or DEFAULT_MEMORY_LAYER)
-            category = str(memory.get("category") or "")
-            importance = _format_memory_score(memory.get("importance"), DEFAULT_MEMORY_IMPORTANCE)
-            confidence = _format_memory_score(memory.get("confidence"), DEFAULT_MEMORY_CONFIDENCE)
-            source = str(memory.get("source") or "")
             updated_at = str(memory.get("updated_at") or memory.get("created_at") or "")
             is_checked = memory_id in self._selected_memory_ids
 
@@ -1212,10 +1208,6 @@ class SettingsDialog(QDialog):
             values = [
                 content,
                 MEMORY_LAYER_LABELS.get(layer, layer),
-                category,
-                importance,
-                confidence,
-                source,
                 _format_memory_time(updated_at),
             ]
             self.memory_table.setItem(row, 0, select_item)
@@ -1227,7 +1219,7 @@ class SettingsDialog(QDialog):
                     item.setToolTip(f"{content}\n\nID: {memory_id}")
                 elif column == 2:
                     item.setData(Qt.ItemDataRole.UserRole, layer)
-                elif column == 7:
+                elif column == 3:
                     item.setToolTip(memory_id)
                     item.setData(Qt.ItemDataRole.UserRole, memory_id)
                 self.memory_table.setItem(row, column, item)
@@ -1314,6 +1306,12 @@ class SettingsDialog(QDialog):
             self.memory_table.blockSignals(False)
         self._sync_memory_checkbox_widget(row, checked)
         self._apply_memory_row_checked_style(row, checked)
+        if not self._selected_memory_ids and self._memory_editor_mode == "edit":
+            self._memory_editor_mode = None
+            self._editing_memory_id = None
+            self._active_memory_id = None
+            self._clear_memory_editor()
+            self._set_memory_editor_visible(False)
         self._sync_memory_bulk_actions()
 
     def _open_memory_editor(self, row: int) -> None:
@@ -1336,7 +1334,7 @@ class SettingsDialog(QDialog):
         self.memory_confidence_spin.setValue(_float_value(memory.get("confidence"), DEFAULT_MEMORY_CONFIDENCE))
         self.memory_content_edit.setPlaceholderText("编辑长期记忆内容")
         self.memory_save_button.setText("保存修改")
-        self.memory_editor_container.setVisible(True)
+        self._set_memory_editor_visible(True)
         self.memory_preview_label.setText("")
 
     def _set_all_visible_memories_checked(self, checked: bool) -> None:
@@ -1439,13 +1437,13 @@ class SettingsDialog(QDialog):
             self.memory_content_edit.setPlaceholderText("新增长期记忆内容")
             self.memory_save_button.setText("保存")
             self.memory_preview_label.setText("正在新增记忆")
-            self.memory_editor_container.setVisible(True)
+            self._set_memory_editor_visible(True)
         elif self._memory_editor_mode == "new":
             self._memory_editor_mode = None
             self._editing_memory_id = None
             self._active_memory_id = None
             self._clear_memory_editor()
-            self.memory_editor_container.setVisible(False)
+            self._set_memory_editor_visible(False)
             self._sync_memory_bulk_actions()
         self.memory_new_button.setText("收起新增" if checked else "新增记忆")
 
@@ -1453,6 +1451,12 @@ class SettingsDialog(QDialog):
         if not hasattr(self, "memory_table"):
             return
         self._selected_memory_ids.clear()
+        if self._memory_editor_mode == "edit":
+            self._memory_editor_mode = None
+            self._editing_memory_id = None
+            self._active_memory_id = None
+            self._clear_memory_editor()
+            self._set_memory_editor_visible(False)
         self._refresh_memory_table()
 
     def _sync_memory_bulk_actions(self) -> None:
@@ -1502,6 +1506,13 @@ class SettingsDialog(QDialog):
             self.memory_confidence_spin.setValue(DEFAULT_MEMORY_CONFIDENCE)
         if hasattr(self, "memory_layer_combo"):
             _set_combo_current_data(self.memory_layer_combo, DEFAULT_MEMORY_LAYER)
+
+    def _set_memory_editor_visible(self, visible: bool) -> None:
+        if not hasattr(self, "memory_editor_container"):
+            return
+        # 编辑区贴合内容固定在底部；表格不再封顶，凭 stretch=1 吸收多余纵向空间，
+        # 因此拉高窗口时增高的是记忆列表而非空白。
+        self.memory_editor_container.setVisible(visible)
 
     def _save_memory_entry(self) -> None:
         if self.memory_store is None:
@@ -1603,7 +1614,7 @@ class SettingsDialog(QDialog):
             self._editing_memory_id = None
             self._active_memory_id = None
             self._clear_memory_editor()
-            self.memory_editor_container.setVisible(False)
+            self._set_memory_editor_visible(False)
         self._clear_memory_selection()
         self._load_memory_entries()
         if failed:

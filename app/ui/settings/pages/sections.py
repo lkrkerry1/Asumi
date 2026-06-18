@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTextEdit,
@@ -90,6 +92,7 @@ from app.ui.portrait_controller import (
 )
 from app.ui.settings.widgets import (
     ModelComboBox,
+    _FitContentScrollArea,
     _NoWheelComboBox,
     _NoWheelDoubleSpinBox,
     _NoWheelSlider,
@@ -1129,9 +1132,9 @@ class MemorySettingsPage:
         owner.memory_import_model_button.clicked.connect(owner._import_memory_model_archive)
         owner.memory_status_label = QLabel(MEMORY_READING_TEXT, tab)
 
-        owner.memory_table = QTableWidget(0, 8, tab)
+        owner.memory_table = QTableWidget(0, 4, tab)
         owner.memory_table.setHorizontalHeaderLabels(
-            ["", "内容", "层级", "分类", "重要性", "置信度", "来源", "更新时间"]
+            ["", "内容", "层级", "更新时间"]
         )
         owner.memory_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         owner.memory_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -1146,10 +1149,6 @@ class MemorySettingsPage:
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         owner.memory_table.setColumnWidth(0, 56)
         owner.memory_select_all_check = QCheckBox(header)
         owner.memory_select_all_check.setToolTip("全选当前结果")
@@ -1176,7 +1175,13 @@ class MemorySettingsPage:
         owner.memory_new_button.toggled.connect(owner._toggle_memory_new_editor)
         owner.memory_content_edit = QTextEdit(tab)
         owner.memory_content_edit.setPlaceholderText("新增长期记忆内容")
-        owner.memory_content_edit.setFixedHeight(84)
+        owner.memory_content_edit.setFixedHeight(88)
+        owner.memory_content_edit.setMinimumHeight(88)
+        owner.memory_content_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        owner.memory_content_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         owner.memory_layer_combo = _NoWheelComboBox(tab)
         for layer in MEMORY_LAYERS:
             owner.memory_layer_combo.addItem(MEMORY_LAYER_LABELS.get(layer, layer), layer)
@@ -1210,10 +1215,32 @@ class MemorySettingsPage:
         selection_layout.addWidget(owner.memory_clear_selection_button)
         selection_layout.addWidget(owner.memory_delete_button)
 
-        owner.memory_editor_container = QWidget(tab)
-        editor_layout = QFormLayout()
-        editor_layout.setContentsMargins(0, 0, 0, 0)
-        editor_layout.setSpacing(8)
+        # 编辑区滚动面板：sizeHint 贴合表单实际高度（见 _FitContentScrollArea），配合
+        # Maximum 纵向策略 —— 空间充足时正好占满表单高度、不留空白，多余纵向空间留给上方
+        # 记忆表格（stretch=1）；窗口压矮时面板收缩并内部滚动，而不是把各行压成重叠。
+        # 不再用 setFixedHeight 锁死高度，避免 QSS padding 注入后行高被压缩导致输入框重叠。
+        owner.memory_editor_container = _FitContentScrollArea(tab)
+        owner.memory_editor_container.setObjectName("memoryEditorPanel")
+        owner.memory_editor_container.setWidgetResizable(True)
+        owner.memory_editor_container.setFrameShape(QFrame.Shape.NoFrame)
+        owner.memory_editor_container.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        owner.memory_editor_container.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        owner.memory_editor_container.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
+        owner.memory_editor_content = QWidget(owner.memory_editor_container)
+        owner.memory_editor_content.setObjectName("memoryEditorContent")
+        owner.memory_editor_form = QWidget(owner.memory_editor_content)
+        owner.memory_editor_form.setObjectName("memoryEditorForm")
+        editor_layout = QFormLayout(owner.memory_editor_form)
+        editor_layout.setContentsMargins(10, 10, 10, 10)
+        editor_layout.setHorizontalSpacing(12)
+        editor_layout.setVerticalSpacing(9)
         editor_layout.addRow("内容", owner.memory_content_edit)
         editor_layout.addRow("层级", owner.memory_layer_combo)
         editor_layout.addRow("分类", owner.memory_category_edit)
@@ -1221,7 +1248,11 @@ class MemorySettingsPage:
         editor_layout.addRow("置信度", owner.memory_confidence_spin)
         editor_layout.addRow("来源", owner.memory_source_edit)
         editor_layout.addRow("", owner.memory_save_button)
-        owner.memory_editor_container.setLayout(editor_layout)
+        editor_content_layout = QVBoxLayout(owner.memory_editor_content)
+        editor_content_layout.setContentsMargins(0, 0, 0, 0)
+        editor_content_layout.setSpacing(0)
+        editor_content_layout.addWidget(owner.memory_editor_form)
+        owner.memory_editor_container.setWidget(owner.memory_editor_content)
         owner.memory_editor_container.setVisible(False)
 
         layout = QVBoxLayout()

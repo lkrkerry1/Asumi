@@ -5150,6 +5150,8 @@ def test_settings_dialog_formats_memory_time_as_local_timezone() -> None:
 
 
 def test_settings_dialog_loads_memory_after_memory_tab_selected_in_background() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QListWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5166,6 +5168,10 @@ def test_settings_dialog_loads_memory_after_memory_tab_selected_in_background() 
                 {
                     "id": "memory-001",
                     "content": "主人喜欢精简的管理界面",
+                    "category": "preference",
+                    "importance": 0.7,
+                    "confidence": 0.9,
+                    "source": "manual",
                     "updated_at": "2026-06-02T01:00:00Z",
                 }
             ]
@@ -5197,7 +5203,46 @@ def test_settings_dialog_loads_memory_after_memory_tab_selected_in_background() 
     assert _process_events_until(app, lambda: memory_store.list_calls == 1)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
     assert dialog.memory_status_label.text() == "已加载 1 条记忆"
+    assert dialog.memory_table.columnCount() == 4
+    assert [
+        dialog.memory_table.horizontalHeaderItem(column).text()
+        for column in range(dialog.memory_table.columnCount())
+    ] == ["", "内容", "层级", "更新时间"]
     assert dialog.memory_table.item(0, 1).text() == "主人喜欢精简的管理界面"
+    assert "preference" not in [
+        dialog.memory_table.item(0, column).text()
+        for column in range(dialog.memory_table.columnCount())
+        if dialog.memory_table.item(0, column) is not None
+    ]
+    dialog._open_memory_editor(0)
+    assert dialog.memory_category_edit.text() == "preference"
+    assert dialog.memory_source_edit.text() == "manual"
+    # 编辑区是贴合内容的滚动面板:Maximum 纵向策略 + sizeHint 取内容高度,空间充足时贴合
+    # 表单不留空白,窗口压矮时内部滚动而非把各行压重叠。
+    assert isinstance(dialog.memory_editor_container, qtwidgets.QScrollArea)
+    assert dialog.memory_editor_container.widgetResizable()
+    assert (
+        dialog.memory_editor_container.verticalScrollBarPolicy()
+        == qtcore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+    )
+    assert (
+        dialog.memory_editor_container.sizePolicy().verticalPolicy()
+        == qtwidgets.QSizePolicy.Policy.Maximum
+    )
+    # sizeHint 贴合内部表单高度(而非 QScrollArea 默认经验值),才能既不留空白又能随内容收缩。
+    assert (
+        dialog.memory_editor_container.sizeHint().height()
+        >= dialog.memory_editor_content.sizeHint().height()
+    )
+    # 编辑区可见时表格仍不封顶,凭 stretch 随窗口增高。
+    assert not dialog.memory_editor_container.isHidden()
+    assert dialog.memory_table.maximumHeight() == 16777215
+    assert dialog.memory_content_edit.minimumHeight() == 88
+    assert dialog.memory_content_edit.maximumHeight() == 88
+    assert (
+        dialog.memory_content_edit.sizePolicy().verticalPolicy()
+        == qtwidgets.QSizePolicy.Policy.Fixed
+    )
     dialog.deleteLater()
     app.processEvents()
 
@@ -6044,6 +6089,48 @@ def test_settings_dialog_first_column_click_toggles_check_only() -> None:
     dialog._handle_memory_item_clicked(dialog.memory_table.item(0, 0))
 
     assert dialog._selected_memory_ids == {"memory-001"}
+    assert dialog._editing_memory_id is None
+    assert dialog.memory_editor_container.isHidden()
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_unchecking_last_selected_memory_collapses_editor() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return [{"id": "memory-001", "content": "第一条记忆"}]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+    )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog._handle_memory_item_clicked(dialog.memory_table.item(0, 1))
+    assert dialog._selected_memory_ids == {"memory-001"}
+    assert not dialog.memory_editor_container.isHidden()
+
+    dialog._set_memory_checked(0, False)
+
+    assert dialog._selected_memory_ids == set()
     assert dialog._editing_memory_id is None
     assert dialog.memory_editor_container.isHidden()
     dialog.deleteLater()

@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QStringListModel, Qt
+from PySide6.QtCore import QSize, QStringListModel, Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
     QDoubleSpinBox,
     QListWidget,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QWidget,
@@ -48,6 +49,24 @@ class _NoWheelComboBox(QComboBox):
 
 class _NoWheelSlider(_NoWheelMixin, QSlider):
     pass
+
+
+class _FitContentScrollArea(QScrollArea):
+    """纵向贴合内部控件高度的滚动区。
+
+    QScrollArea 默认的 sizeHint 是与内容无关的经验值，放进布局里既会撑出空白、又无法
+    随内容收缩。这里把 sizeHint 改成内部控件的高度：配合 `Maximum` 纵向尺寸策略，空间
+    充足时正好贴合内容（不留空白），空间不足时收缩并启用内部滚动条，而不是把表单各行压到
+    重叠。横向仍沿用 QScrollArea 默认值。
+    """
+
+    def sizeHint(self) -> QSize:
+        widget = self.widget()
+        if widget is not None:
+            frame = 2 * self.frameWidth()
+            hint = widget.sizeHint()
+            return QSize(hint.width() + frame, hint.height() + frame)
+        return super().sizeHint()
 
 
 class _ClickOnlyListWidget(QListWidget):
