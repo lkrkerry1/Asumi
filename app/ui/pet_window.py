@@ -578,6 +578,7 @@ class PetWindow(QWidget):
         self._runtime_app_closed_logged = False
         self._shutdown_in_progress = False
         self._shutdown_lingering_threads: list[tuple[QThread, QObject | None]] = []
+        self._retired_qobject_wrappers: list[QObject] = []
         self.screen_observation_followup_in_progress = False
         self.active_reminder_id: str | None = None
         self.active_reminder_text = ""
@@ -3372,8 +3373,49 @@ class PetWindow(QWidget):
 
     @Slot()
     def _cleanup_screen_observation_encode_worker(self) -> None:
+        self._retain_qobject_wrappers_until_deleted(
+            self.screen_observation_encode_thread,
+            self.screen_observation_encode_worker,
+        )
         self.screen_observation_encode_thread = None
         self.screen_observation_encode_worker = None
+
+    def _retain_qobject_wrappers_until_deleted(self, *objects: QObject | None) -> None:
+        """Keep PySide wrappers alive until Qt has processed deleteLater.
+
+        A queued Qt signal can reach Python while Qt is already tearing down the
+        same QObject. If assigning an attribute drops the final Python wrapper
+        reference at that point, Shiboken may try to destroy an object whose C++
+        lifetime is already controlled by Qt. Retaining wrappers briefly avoids
+        that double-destruction window; invalid wrappers are pruned later.
+        """
+        retained = [obj for obj in objects if obj is not None]
+        if not retained:
+            return
+        wrappers = getattr(self, "_retired_qobject_wrappers", None)
+        if wrappers is None:
+            wrappers = []
+            self._retired_qobject_wrappers = wrappers
+        wrappers.extend(retained)
+        QTimer.singleShot(1000, self._prune_retired_qobject_wrappers)
+
+    @Slot()
+    def _prune_retired_qobject_wrappers(self) -> None:
+        wrappers = getattr(self, "_retired_qobject_wrappers", None)
+        if not wrappers:
+            return
+        try:
+            import shiboken6
+        except ImportError:
+            return
+        alive: list[QObject] = []
+        for wrapper in wrappers:
+            try:
+                if shiboken6.isValid(wrapper):
+                    alive.append(wrapper)
+            except (RuntimeError, TypeError):
+                pass
+        self._retired_qobject_wrappers = alive
 
     def _resume_screen_observation_followup_cleanup(self) -> None:
         if getattr(self, "_shutdown_in_progress", False):
@@ -4110,6 +4152,7 @@ class PetWindow(QWidget):
                 "screen_observation_followup_in_progress": self.screen_observation_followup_in_progress,
             },
         )
+        self._retain_qobject_wrappers_until_deleted(self.worker_thread, self.worker)
         if self.worker is not None:
             self.worker.deleteLater()
         if self.worker_thread is not None:
@@ -4303,6 +4346,10 @@ class PetWindow(QWidget):
 
     @Slot()
     def _cleanup_memory_curation_worker(self) -> None:
+        self._retain_qobject_wrappers_until_deleted(
+            self.memory_curation_thread,
+            self.memory_curation_worker,
+        )
         if self.memory_curation_worker is not None:
             self.memory_curation_worker.deleteLater()
         if self.memory_curation_thread is not None:
@@ -4601,6 +4648,10 @@ class PetWindow(QWidget):
 
     @Slot()
     def _cleanup_tts_ready_warmup_worker(self) -> None:
+        self._retain_qobject_wrappers_until_deleted(
+            self.tts_ready_warmup_thread,
+            self.tts_ready_warmup_worker,
+        )
         self.tts_ready_warmup_thread = None
         self.tts_ready_warmup_worker = None
 

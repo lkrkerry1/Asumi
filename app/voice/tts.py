@@ -36,6 +36,7 @@ from app.voice.tts_settings import (
     DEFAULT_GENIE_TTS_API_URL as _DEFAULT_GENIE_TTS_API_URL,
     GPTSoVITSTTSSettings as _GPTSoVITSTTSSettings,
     TTS_PLAYBACK_BACKEND_AUDIO_SINK as _TTS_PLAYBACK_BACKEND_AUDIO_SINK,
+    TTS_PROVIDER_CUSTOM_GPT_SOVITS as _TTS_PROVIDER_CUSTOM_GPT_SOVITS,
     TTS_PROVIDER_GENIE as _TTS_PROVIDER_GENIE,
     TTS_PROVIDER_GPT_SOVITS as _TTS_PROVIDER_GPT_SOVITS,
     TTSConfigError as _TTSConfigError,
@@ -673,97 +674,109 @@ class GPTSoVITSTTSProvider(QObject):
                 return
 
             fail = lambda message: self._fail_audio_request(tts_request, message)
-            if not self._ensure_service_available(fail):
-                return
+            restart_attempted = False
+            while True:
+                if not self._ensure_service_available(fail):
+                    return
 
-            if not self._ensure_character_weights(fail):
-                return
+                if not self._ensure_character_weights(fail):
+                    return
 
-            reference = self._select_reference(tts_request.tone)
-            payload = {
-                "text": tts_request.text,
-                "text_lang": _resolve_request_text_lang(
-                    tts_request.text,
-                    self.settings.text_lang,
-                ),
-                "ref_audio_path": str(reference.ref_audio_path),
-                "prompt_text": reference.ref_text,
-                "prompt_lang": reference.ref_lang,
-                "text_split_method": "cut1",
-                "batch_size": 1,
-                "media_type": "wav",
-                "streaming_mode": False,
-                "top_k": 15,
-                "top_p": 1,
-                "temperature": 1,
-                "repetition_penalty": 1.2,
-            }
-            debug_log(
-                "TTS",
-                "发送 GPT-SoVITS 请求",
-                {
-                    "api_url": self.settings.api_url,
+                reference = self._select_reference(tts_request.tone)
+                payload = {
                     "text": tts_request.text,
-                    "tone": tts_request.tone,
-                    "reference": {
-                        "tone": reference.tone,
-                        "ref_audio_path": reference.ref_audio_path,
-                        "ref_lang": reference.ref_lang,
-                    },
-                    "payload": payload,
-                },
-            )
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            http_request = urllib.request.Request(
-                url=self.settings.api_url,
-                data=body,
-                method="POST",
-                headers={"Content-Type": "application/json"},
-            )
-
-            try:
-                with urllib.request.urlopen(
-                    http_request,
-                    timeout=self.settings.timeout_seconds,
-                ) as response:
-                    audio_data = response.read()
-                    debug_log(
-                        "TTS",
-                        "GPT-SoVITS 请求成功",
-                        {
-                            "status": getattr(response, "status", None),
-                            "audio_bytes": len(audio_data),
-                        },
-                    )
-            except urllib.error.HTTPError as exc:
-                error_body = exc.read().decode("utf-8", errors="replace")
+                    "text_lang": _resolve_request_text_lang(
+                        tts_request.text,
+                        self.settings.text_lang,
+                    ),
+                    "ref_audio_path": str(reference.ref_audio_path),
+                    "prompt_text": reference.ref_text,
+                    "prompt_lang": reference.ref_lang,
+                    "text_split_method": "cut1",
+                    "batch_size": 1,
+                    "media_type": "wav",
+                    "streaming_mode": False,
+                    "top_k": 15,
+                    "top_p": 1,
+                    "temperature": 1,
+                    "repetition_penalty": 1.2,
+                }
                 debug_log(
                     "TTS",
-                    "GPT-SoVITS HTTP 失败",
+                    "发送 GPT-SoVITS 请求",
                     {
-                        "status": exc.code,
-                        "error_body": error_body,
+                        "api_url": self.settings.api_url,
+                        "text": tts_request.text,
+                        "tone": tts_request.tone,
+                        "reference": {
+                            "tone": reference.tone,
+                            "ref_audio_path": reference.ref_audio_path,
+                            "ref_lang": reference.ref_lang,
+                        },
+                        "payload": payload,
+                        "attempt": 2 if restart_attempted else 1,
                     },
                 )
-                message = _format_gpt_sovits_http_error(exc.code, error_body)
-                if _is_soft_synth_failure(exc.code, error_body):
-                    # 单段合成失败（服务端 tts failed）：文本已照常显示，语音缺一段无需
-                    # 打断用户，静默跳过、正常完成回调，不向 UI 弹 TTS 异常。
-                    self._skip_audio_request(tts_request, message)
-                else:
-                    self._fail_audio_request(tts_request, message)
-                return
-            except urllib.error.URLError as exc:
-                debug_log("TTS", "GPT-SoVITS 请求失败", {"reason": str(exc.reason)})
-                self._fail_audio_request(
-                    tts_request,
-                    f"GPT-SoVITS 请求失败，请确认服务已启动并可访问 {self.settings.api_url}：{exc.reason}",
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                http_request = urllib.request.Request(
+                    url=self.settings.api_url,
+                    data=body,
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
                 )
-                return
-            except TimeoutError:
-                debug_log("TTS", "GPT-SoVITS 请求超时")
-                self._fail_audio_request(tts_request, "GPT-SoVITS 请求超时。")
-                return
+
+                try:
+                    with urllib.request.urlopen(
+                        http_request,
+                        timeout=self.settings.timeout_seconds,
+                    ) as response:
+                        audio_data = response.read()
+                        debug_log(
+                            "TTS",
+                            "GPT-SoVITS 请求成功",
+                            {
+                                "status": getattr(response, "status", None),
+                                "audio_bytes": len(audio_data),
+                                "attempt": 2 if restart_attempted else 1,
+                            },
+                        )
+                    break
+                except urllib.error.HTTPError as exc:
+                    error_body = exc.read().decode("utf-8", errors="replace")
+                    debug_log(
+                        "TTS",
+                        "GPT-SoVITS HTTP 失败",
+                        {
+                            "status": exc.code,
+                            "error_body": error_body,
+                            "attempt": 2 if restart_attempted else 1,
+                        },
+                    )
+                    if (
+                        not restart_attempted
+                        and self._restart_local_service_after_http_failure(exc.code, error_body)
+                    ):
+                        restart_attempted = True
+                        continue
+                    message = _format_gpt_sovits_http_error(exc.code, error_body)
+                    if _is_soft_synth_failure(exc.code, error_body):
+                        # 单段合成失败（服务端 tts failed）：文本已照常显示，语音缺一段无需
+                        # 打断用户，静默跳过、正常完成回调，不向 UI 弹 TTS 异常。
+                        self._skip_audio_request(tts_request, message)
+                    else:
+                        self._fail_audio_request(tts_request, message)
+                    return
+                except urllib.error.URLError as exc:
+                    debug_log("TTS", "GPT-SoVITS 请求失败", {"reason": str(exc.reason)})
+                    self._fail_audio_request(
+                        tts_request,
+                        f"GPT-SoVITS 请求失败，请确认服务已启动并可访问 {self.settings.api_url}：{exc.reason}",
+                    )
+                    return
+                except TimeoutError:
+                    debug_log("TTS", "GPT-SoVITS 请求超时")
+                    self._fail_audio_request(tts_request, "GPT-SoVITS 请求超时。")
+                    return
 
             if not audio_data:
                 debug_log("TTS", "GPT-SoVITS 返回空音频")
@@ -862,6 +875,57 @@ class GPTSoVITSTTSProvider(QObject):
             "本地 GPT-SoVITS 服务启动并探测成功",
             {"api_url": self.settings.api_url, "work_dir": str(self.settings.work_dir)},
         )
+        return True
+
+    def _restart_local_service_after_http_failure(
+        self,
+        status_code: int,
+        error_body: str,
+    ) -> bool:
+        """HTTP 层显示本地服务管道已坏时，重启 Sakura 管理的本地服务。
+
+        GPT-SoVITS 在进程 stdout/stderr 管道断开时可能把任意有效文本都包装成
+        400 + tts failed + Broken pipe。它不是单段文本问题；继续复用该端口只会
+        让后续回复全部无声。只对带 work_dir 的本地整合包启用，远端/手动服务不
+        擅自终止。
+        """
+        if not _is_restartable_local_tts_service_failure(status_code, error_body):
+            return False
+        if self.settings.work_dir is None:
+            debug_log(
+                "TTS",
+                "GPT-SoVITS 服务疑似管道断开，但非本地整合包，不自动重启",
+                {"status": status_code, "error_body": error_body},
+            )
+            return False
+        if _provider_is_closed(self):
+            return False
+
+        endpoint = _parse_service_endpoint(self.settings.api_url)
+        if self._server_process is None and endpoint is not None:
+            host, port = endpoint
+            GPTSoVITSTTSProvider._adopt_existing_local_service(self, host, port)
+        if self._server_process is None:
+            debug_log(
+                "TTS",
+                "GPT-SoVITS 服务疑似管道断开，但未能定位本地服务进程",
+                {"status": status_code, "api_url": self.settings.api_url},
+            )
+            return False
+
+        debug_log(
+            "TTS",
+            "GPT-SoVITS 服务疑似管道断开，重启本地服务后重试",
+            {
+                "status": status_code,
+                "pid": self._server_process.pid,
+                "api_url": self.settings.api_url,
+            },
+        )
+        self._service_checked = False
+        self._weights_ready = False
+        _set_service_state(self, TTSServiceState.STARTING, {"reason": "restart_after_broken_pipe"})
+        GPTSoVITSTTSProvider._stop_local_service(self)
         return True
 
     def _adopt_existing_local_service(self, host: str, port: int) -> None:
@@ -2155,22 +2219,29 @@ def _find_running_local_tts_process(
     settings: _GPTSoVITSTTSSettings,
     port: int,
 ) -> _AttachedLocalProcess | None:
-    if sys.platform != "win32" or settings.work_dir is None:
+    if settings.work_dir is None:
         return None
-    if settings.provider not in {_TTS_PROVIDER_GPT_SOVITS, _TTS_PROVIDER_GENIE}:
+    if settings.provider not in {
+        _TTS_PROVIDER_GPT_SOVITS,
+        _TTS_PROVIDER_CUSTOM_GPT_SOVITS,
+        _TTS_PROVIDER_GENIE,
+    }:
         return None
 
     pid = _find_listening_tcp_pid(port)
     if pid is None or pid == os.getpid():
         return None
 
-    command_line = _query_windows_process_command_line(pid)
+    command_line = _query_process_command_line(pid)
     if not command_line or not _command_line_matches_local_tts(settings, command_line, port):
         return None
     return _AttachedLocalProcess(pid)
 
 
 def _find_listening_tcp_pid(port: int) -> int | None:
+    if sys.platform != "win32":
+        return _find_listening_tcp_pid_lsof(port)
+
     try:
         result = subprocess.run(
             ["netstat", "-ano", "-p", "tcp"],
@@ -2203,6 +2274,33 @@ def _find_listening_tcp_pid(port: int) -> int | None:
     return None
 
 
+def _find_listening_tcp_pid_lsof(port: int) -> int | None:
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-Fp"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        debug_log("TTS", "查询本地监听端口失败", {"port": port, "error": str(exc)})
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if not line.startswith("p"):
+            continue
+        try:
+            return int(line[1:])
+        except ValueError:
+            return None
+    return None
+
+
 def _netstat_address_port(address: str) -> int | None:
     if address.startswith("["):
         _host, separator, port_text = address.rpartition("]:")
@@ -2214,6 +2312,12 @@ def _netstat_address_port(address: str) -> int | None:
         return int(port_text)
     except ValueError:
         return None
+
+
+def _query_process_command_line(pid: int) -> str | None:
+    if sys.platform == "win32":
+        return _query_windows_process_command_line(pid)
+    return _query_posix_process_command_line(pid)
 
 
 def _query_windows_process_command_line(pid: int) -> str | None:
@@ -2229,6 +2333,26 @@ def _query_windows_process_command_line(pid: int) -> str | None:
             check=False,
             timeout=5,
             **_windows_no_window_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        debug_log("TTS", "查询本地 TTS 进程命令行失败", {"pid": pid, "error": str(exc)})
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _query_posix_process_command_line(pid: int) -> str | None:
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(int(pid)), "-o", "command="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         debug_log("TTS", "查询本地 TTS 进程命令行失败", {"pid": pid, "error": str(exc)})
@@ -2256,7 +2380,7 @@ def _command_line_matches_local_tts(
     if settings.provider == _TTS_PROVIDER_GENIE:
         return "genie_tts.start_server" in normalized_command and f"port={int(port)}" in normalized_command
 
-    if settings.provider == _TTS_PROVIDER_GPT_SOVITS:
+    if settings.provider in {_TTS_PROVIDER_GPT_SOVITS, _TTS_PROVIDER_CUSTOM_GPT_SOVITS}:
         api_script = _normalize_process_text(str(work_dir.resolve() / "api_v2.py"))
         return api_script in normalized_command
 
@@ -2403,6 +2527,16 @@ def _looks_like_charmap_encode_error(error_body: str) -> bool:
     return "charmap" in normalized and "can't encode" in normalized
 
 
+def _is_restartable_local_tts_service_failure(status_code: int, error_body: str) -> bool:
+    """本地 TTS 服务自身进入坏状态，重启服务比跳过单段更正确。"""
+    if status_code != 400:
+        return False
+    normalized = error_body.lower()
+    return "tts failed" in normalized and (
+        "broken pipe" in normalized or "[errno 32]" in normalized
+    )
+
+
 def _is_soft_synth_failure(status_code: int, error_body: str) -> bool:
     """判断是否为可静默降级的单段合成失败，区别于需提示用户的服务/配置故障。
 
@@ -2414,6 +2548,8 @@ def _is_soft_synth_failure(status_code: int, error_body: str) -> bool:
     if status_code != 400:
         return False
     if _looks_like_charmap_encode_error(error_body):
+        return False
+    if _is_restartable_local_tts_service_failure(status_code, error_body):
         return False
     return "tts failed" in error_body.lower()
 
