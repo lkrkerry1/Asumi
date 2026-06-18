@@ -1524,23 +1524,27 @@ class SettingsDialog(QDialog):
     def _set_memory_editor_visible(self, visible: bool) -> None:
         if not hasattr(self, "memory_editor_container"):
             return
-        # 编辑区贴合内容固定在底部；表格不再封顶，凭 stretch=1 吸收多余纵向空间，
-        # 因此拉高窗口时增高的是记忆列表而非空白。
         self.memory_editor_container.setVisible(visible)
+        pane = getattr(self, "memory_editor_pane", None)
+        splitter = getattr(self, "memory_list_splitter", None)
+        if pane is None or splitter is None:
+            return
+        # 下窗格(选择行 + 编辑区)在 QSplitter 中:把内容/窗格最大高度都钉到自身 sizeHint,
+        # 这样无论拖手柄还是初始分配都不会被撑出空白;多余纵向空间一律归上方的记忆列表。
+        if visible:
+            content_height = self.memory_editor_content.sizeHint().height()
+            self.memory_editor_container.setMaximumHeight(content_height)
+        pane.setMaximumHeight(16777215)
+        pane_hint = pane.sizeHint().height()
+        pane.setMaximumHeight(pane_hint)
         if not visible:
             return
-        splitter = getattr(self, "memory_list_splitter", None)
-        if splitter is None:
-            return
-        # 编辑区在 QSplitter 中:把最大高度钉到内容高度,避免拖动/分配时被撑出空白;
-        # 默认给编辑区刚好贴合的高度,其余留给上方列表,用户可再拖手柄加长列表。
-        content_height = self.memory_editor_content.sizeHint().height()
-        self.memory_editor_container.setMaximumHeight(content_height)
         total = splitter.height()
         if total <= 0:
             return
-        editor_height = min(content_height, max(0, total - 120))
-        splitter.setSizes([total - editor_height, editor_height])
+        # 默认给下窗格刚好贴合的高度,其余留给列表;用户可再拖手柄进一步加长列表。
+        bottom_height = min(pane_hint, max(80, total - 120))
+        splitter.setSizes([total - bottom_height, bottom_height])
 
     def _save_memory_entry(self) -> None:
         if self.memory_store is None:
