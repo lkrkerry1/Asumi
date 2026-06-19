@@ -5,6 +5,12 @@ from dataclasses import dataclass
 from typing import Callable
 
 from PySide6.QtCore import QTimer, Qt
+
+try:
+    import shiboken6
+except ImportError:  # pragma: no cover - 仅供无真实 PySide6 的最小测试桩环境
+    shiboken6 = None  # type: ignore[assignment]
+
 from PySide6.QtWidgets import (
     QLabel,
     QDialog,
@@ -397,6 +403,15 @@ class HistoryWindow(QDialog):
             QTimer.singleShot(delay_ms, self._sync_history_layout)
 
     def _sync_history_layout(self) -> None:
+        # 延迟触发的 singleShot 可能在窗口被销毁后才执行（典型场景是 pytest-qt
+        # 拆除时的 processEvents），此时底层 C++ QObject 已失效，直接访问会抛
+        # ``RuntimeError: Internal C++ object already deleted``。先确认存活再继续。
+        if shiboken6 is not None:
+            try:
+                if not shiboken6.isValid(self):
+                    return
+            except RuntimeError:
+                return
         self._update_bubble_widths()
         self.history_layout.activate()
         self.history_content.adjustSize()
