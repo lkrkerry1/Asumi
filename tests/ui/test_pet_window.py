@@ -847,6 +847,7 @@ def test_emit_app_closed_event_logs_once_with_interrupted_flag() -> None:
 
 
 def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
+    from app.core.resource_manager import QtWorkerResource, ResourceManager
     from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 
     class SignalStub:
@@ -890,38 +891,52 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
         def cancel_reply_flow(self) -> None:
             self.cancelled = True
 
+    order: list[str] = []
+
+    class BackchannelStub:
+        def cancel(self) -> None:
+            order.append("backchannel_cancel")
+
+    class RecordingResourceManager(ResourceManager):
+        def stop_all(self, timeout_ms: int = 1000) -> None:
+            order.append("stop_all")
+            super().stop_all(timeout_ms)
+
     class MinimalWindow:
         close_external_tools = PetWindow.close_external_tools
-        _shutdown_qthread = PetWindow._shutdown_qthread
-        _keep_shutdown_lingering_thread = PetWindow._keep_shutdown_lingering_thread
-        _release_shutdown_lingering_thread = PetWindow._release_shutdown_lingering_thread
 
     window = MinimalWindow()
+    manager = RecordingResourceManager()
     thread = ThreadStub()
     worker = WorkerStub()
     subtitle = SubtitleStub()
     window._shutdown_in_progress = False
-    window._shutdown_lingering_threads = []
+    window.resource_manager = manager
     window.messages = [
         {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
     ]
     window.subtitle_controller = subtitle
+    window.backchannel_controller = BackchannelStub()
     window.worker_thread = thread
     window.worker = worker
-    window.memory_curation_thread = None
-    window.memory_curation_worker = None
-    window.deferred_startup_thread = None
-    window.deferred_startup_worker = None
-    window.tts_ready_warmup_thread = None
-    window.tts_ready_warmup_worker = None
-    window.screen_observation_encode_thread = None
-    window.screen_observation_encode_worker = None
+    # close_external_tools 通过 resource_manager.stop_all 关闭已注册的 worker。
+    manager._register(
+        QtWorkerResource(
+            manager,
+            thread,
+            worker,
+            owner=window,
+            thread_attr="worker_thread",
+            worker_attr="worker",
+            label="worker_thread",
+        )
+    )
     window._emit_app_closed_event = lambda: None
     window._stop_speaking_state_watchdog = lambda: None
-    window.close_tts_tools = lambda: None
-    window.close_mcp_tools = lambda: None
-    window.close_plugins = lambda: None
-    window._close_renderer_manager = lambda: None
+    window.close_tts_tools = lambda: order.append("tts_close")
+    window.close_mcp_tools = lambda: order.append("mcp_close")
+    window.close_plugins = lambda: order.append("plugins_close")
+    window._close_renderer_manager = lambda: order.append("renderer_close")
 
     window.close_external_tools()
 
@@ -930,9 +945,46 @@ def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
     assert thread.interrupted is True
     assert thread.quit_called is True
     assert thread.waits == [1000]
-    assert window._shutdown_lingering_threads == [(thread, worker)]
+    assert manager._lingering == [(thread, worker)]
     assert window.messages == []
     assert subtitle.cancelled is True
+    assert order == ["backchannel_cancel", "stop_all"]
+
+
+def test_pet_window_registers_runtime_services_in_registry_order() -> None:
+    from app.core.resource_manager import ResourceManager, ResourceRegistry
+    from app.ui.pet_window import PetWindow
+
+    order: list[str] = []
+
+    class MemoryStoreStub:
+        def close(self) -> None:
+            order.append("memory")
+
+    class MinimalWindow:
+        _register_runtime_service_resources = PetWindow._register_runtime_service_resources
+
+        def close_tts_tools(self) -> None:
+            order.append("tts")
+
+        def close_mcp_tools(self) -> None:
+            order.append("mcp")
+
+        def _close_renderer_manager(self) -> None:
+            order.append("renderer")
+
+        def close_plugins(self) -> None:
+            order.append("plugins")
+
+    registry = ResourceRegistry()
+    window = MinimalWindow()
+    window.memory_store = MemoryStoreStub()
+    window.resource_manager = ResourceManager(registry=registry)
+
+    window._register_runtime_service_resources()
+    registry.stop_all()
+
+    assert order == ["memory", "tts", "mcp", "renderer", "plugins"]
 
 
 def test_shutdown_ignores_late_progress_and_reply() -> None:
