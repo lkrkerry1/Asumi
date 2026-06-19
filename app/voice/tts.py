@@ -10,7 +10,10 @@ from app.core.resource_manager import ResourceManager
 from app.core.debug_log import debug_log
 from app.core.interaction import get_interaction_id
 from app.storage.paths import StoragePaths
-from app.voice.tts_settings import GPTSoVITSTTSSettings as _GPTSoVITSTTSSettings
+from app.voice.tts_settings import (
+    GPTSoVITSTTSSettings as _GPTSoVITSTTSSettings,
+    TTS_PROVIDER_GENIE as _TTS_PROVIDER_GENIE,
+)
 from app.voice.tts_types import (
     TTSCallback,
     TTSPreparedAudio,
@@ -239,8 +242,13 @@ class GPTSoVITSTTSProvider(QObject):
         *,
         adopt_existing_service: bool,
     ) -> TTSServiceSupervisor:
-        """装配本 Provider 的服务监督；Genie 子类覆写为 GenieServiceSupervisor。"""
-        return TTSServiceSupervisor(
+        """按 settings.provider 选型服务监督（GPT-SoVITS / Genie），无需子类覆写。"""
+        supervisor_cls = (
+            GenieServiceSupervisor
+            if settings.provider == _TTS_PROVIDER_GENIE
+            else TTSServiceSupervisor
+        )
+        return supervisor_cls(
             settings,
             base_dir=self._base_dir,
             resource_manager=self._resource_manager,
@@ -249,7 +257,9 @@ class GPTSoVITSTTSProvider(QObject):
         )
 
     def _create_synthesis_engine(self) -> object:
-        """装配本 Provider 的合成引擎；Genie 子类覆写为 GenieSynthesisEngine。"""
+        """按 settings.provider 选型合成引擎（GPT-SoVITS / Genie），无需子类覆写。"""
+        if self.settings.provider == _TTS_PROVIDER_GENIE:
+            return GenieSynthesisEngine()
         return GPTSoVITSSynthesisEngine()
 
     def _create_synthesis_queue(self) -> TTSSynthesisQueue:
@@ -369,26 +379,12 @@ class GPTSoVITSTTSProvider(QObject):
 
 
 class GenieTTSProvider(GPTSoVITSTTSProvider):
-    """Genie TTS CPU 推理 Provider，复用现有队列、预生成和播放器链路。
+    """Genie TTS Provider：与 GPT-SoVITS 协调器同一实现，无继承覆写。
 
-    差异收敛到装配选型：服务监督差异（Genie API 探测 / 备用端口 / 角色模型 /
-    参考音频 / ONNX 转换）在 GenieServiceSupervisor，合成差异在 GenieSynthesisEngine。
+    Genie 差异（API 探测 / 备用端口 / 角色模型 / 参考音频 / ONNX 转换、以及合成
+    payload）已收敛到 GenieServiceSupervisor 与 GenieSynthesisEngine，由协调器按
+    ``settings.provider`` 在 ``_create_supervisor``/``_create_synthesis_engine`` 选型。
+    保留本类名仅为让 factory/pet_window 的导入与装配（decision #1）以及 test_bootstrap
+    的 monkeypatch 目标保持不变。
     """
-
-    def _create_supervisor(
-        self,
-        settings: _GPTSoVITSTTSSettings,
-        *,
-        adopt_existing_service: bool,
-    ) -> TTSServiceSupervisor:
-        return GenieServiceSupervisor(
-            settings,
-            base_dir=self._base_dir,
-            resource_manager=self._resource_manager,
-            is_closed=self._is_closed,
-            adopt_existing_service=adopt_existing_service,
-        )
-
-    def _create_synthesis_engine(self) -> object:
-        return GenieSynthesisEngine()
 

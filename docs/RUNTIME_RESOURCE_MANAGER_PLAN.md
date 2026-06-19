@@ -41,8 +41,8 @@ flowchart TD
     A["QApplication / UI 主线程"] --> B["ResourceManager (QObject)"]
     B --> C["资源注册表"]
     C --> E["QtWorkerResource: QThread + QObject worker"]
-    C --> F["ThreadResource: Python thread / executor（规划中）"]
-    C --> G["ProcessResource: 本地 TTS 子进程（规划中）"]
+    C --> F["ThreadResource: Python thread / executor（第 3 阶段：TTS 合成线程）"]
+    C --> G["ProcessResource: 本地 TTS 子进程（第 3 阶段：GPT-SoVITS/Genie）"]
     C --> H["ServiceResource: TTS / MCP / Plugin / Memory（规划中）"]
     E --> I["PetWindow UI 更新（signal/queued 回主线程）"]
 ```

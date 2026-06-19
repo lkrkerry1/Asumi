@@ -4,7 +4,7 @@
 
 ## 项目与分支
 - 仓库根目录：`C:\Users\LBW\MyFile\sakura-project\Sakura`（PySide6/Qt 桌宠，Windows）
-- 当前分支：`refactor/resource-manager`（从 `origin/dev` 切出），第 1+2 阶段已完成，ahead 4 个提交，**未推送**。
+- 当前分支：`refactor/resource-manager`（从 `origin/dev` 切出），第 1+2+3 阶段已完成，**未推送**。
 - issue #94：把散落在 `PetWindow`（6700+ 行）里的 Qt/Python/进程生命周期，分 5 阶段抽到统一的后端资源管理器。
 
 ## 已完成（第 1+2 阶段，4 个提交）
@@ -26,16 +26,31 @@
 - 已知 2 个**环境性**失败、与重构无关：`tests/ui/test_history_window.py` 需要 qtbot（runtime 没装 pytest-qt）；`test_public_api_cleanup.py::test_legacy_sdk_package_is_removed` 因工作树里有残留未跟踪的 `sdk/` 目录。CI 下不会出现。
 - 回归验证命令：`./runtime/python.exe -m pytest tests/unit/test_resource_manager.py tests/ui/test_pet_window.py tests/ui/test_backchannel_controller.py -q -p no:warnings`
 
-## 下一步：第 3 阶段——拆分 TTS Provider（风险最高，最需谨慎）
-当前 `app/voice/tts.py` 的 `GPTSoVITSTTSProvider`（QObject）混了三类职责，按 issue 拆成：
-- `TTSServiceSupervisor`：本地 GPT-SoVITS/Genie 子进程、健康检查、Broken pipe 重启
-- `TTSSynthesisQueue`：合成请求队列、prepare、HTTP 超时、失败重试
-- `TTSPlaybackEndpoint`：**留在 UI 主线程**，QMediaPlayer/AudioSinkPlayer 播放（绝不移出主线程）
+## 第 3 阶段——拆分 TTS Provider（已完成）
+原 `app/voice/tts.py` 的 `GPTSoVITSTTSProvider`（QObject）混的三类职责已拆分（详见
+`docs/TTS_PROVIDER_SPLIT_PLAN.md` §8 完成记录），落地为 6 个提交：
+- `app/voice/tts_types.py`：共享类型（`TTSPreparedAudio`/`_TTSRequest`/`TTSServiceState` 等）
+- `app/voice/tts_service.py`：`TTSServiceSupervisor`(+`GenieServiceSupervisor`)——本地子进程
+  探测/启动/接管/Broken pipe 重启/权重·模型加载；子进程经 `ProcessResource` 托管
+- `app/voice/tts_synthesis.py`：`TTSSynthesisQueue` + `GPTSoVITSSynthesisEngine`/
+  `GenieSynthesisEngine`——合成线程经 `ThreadResource` 托管
+- `app/voice/tts_playback.py`：`TTSPlaybackEndpoint`（UI 主线程子 QObject，随协调器 moveToThread）
+- `app/voice/tts.py`：瘦身为「装配 + 委托」协调器 + `NullTTSProvider` + `TTSProvider` 协议；
+  `GenieTTSProvider` 不再有继承覆写，差异由 `settings.provider` 在协调器内选型；
+  `close()` 走协调器自持 `ResourceManager.stop_all`
+- `ResourceManager` 增 `ThreadResource`/`ProcessResource`/`ResourceState` 与泛化注册表
 
-必须保留的语义：prepare、播放完成回调、fallback timeout、Broken pipe 重启、临时 wav 清理。后台只生成 wav，播放仍回 UI 线程。
+已保留的语义：prepare、播放完成回调、fallback timeout、Broken pipe 重启、临时 wav 清理、
+soft-fail 静默跳过、`detach_local_service` 保留进程、provider 退役热切换。后台只生成 wav，
+播放仍回 UI 线程。
+
+## 下一步：第 4/5 阶段
+按 `docs/RUNTIME_RESOURCE_MANAGER_PLAN.md` 继续把 ServiceResource（MCP / Plugin / Memory）
+等纳入资源管理器。
 
 ## 工作方式（请遵守）
 - **分段提交 git**，每个提交保持测试绿（破坏某测试就在同一提交里改它）。
-- 第 3 阶段体量大、风险高：先给计划，**确认后再动手**；做完先停下等确认，再继续第 4/5 阶段。
 - 用中文交流。
 - 工作树里两个未跟踪的 `docs/*CHANGELOG.md` 与本次无关，别动。
+- 测试：`./runtime/python.exe -m pytest`；tests/ui 退出阶段约 1/3 概率的 native access
+  violation 是早于本阶段就存在的 daemon 线程/Qt 析构竞态，重跑即可，关注非崩溃运行是否全绿。
