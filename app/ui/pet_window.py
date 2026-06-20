@@ -1515,10 +1515,23 @@ class PetWindow(QWidget):
             animator.resume_after_drag()
 
     def _handle_pet_click(self) -> None:
-        """单击桌宠（非拖动）：唤回被自动隐藏的气泡。具体由气泡自动隐藏控制器实现。"""
+        """单击桌宠（非拖动）：唤回被自动隐藏的气泡，并浮现输入栏供用户输入。"""
         controller = getattr(self, "bubble_auto_hide", None)
         if controller is not None:
             controller.handle_pet_clicked()
+        # 无副窗口/对话框占用且模型未在思考时，让输入栏现身并把焦点移入输入框。
+        # 先 set_force_visible(True) 使 input_card 同步 show()（hidden widget 无法接收焦点），
+        # 设完焦点后立即释放 force_visible——_input_bar_pinned 会通过焦点继续维持可见。
+        # 思考中不浮现：避免用户点击桌宠时反而让输入栏被焦点固定、无法随思考态收起。
+        if not self._any_dialog_open() and not getattr(self, "reply_waiting_ui_active", False):
+            animator = getattr(self, "input_bar_animator", None)
+            input_edit = getattr(self, "input_edit", None)
+            if animator is not None:
+                animator.set_force_visible(True)
+            if input_edit is not None:
+                input_edit.setFocus()
+            if animator is not None:
+                animator.set_force_visible(False)
 
     def _apply_bubble_settings(self, settings: BubbleSettings) -> None:
         """应用气泡无操作自动隐藏配置到控制器（设置保存后调用）。"""

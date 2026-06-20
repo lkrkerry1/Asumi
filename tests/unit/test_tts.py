@@ -382,6 +382,7 @@ def test_stop_local_service_serialized_by_lifecycle_lock(monkeypatch) -> None:  
     # 拆解同一子进程会原生崩溃。两者用同一把 _service_lifecycle_lock 串行化:持锁期间
     # 后台 stop 必须被挡住。
     provider = GPTSoVITSTTSProvider(_minimal_tts_settings(), adopt_existing_service=False)
+    supervisor = provider._supervisor
 
     class FakeProcess:
         def __init__(self) -> None:
@@ -392,7 +393,7 @@ def test_stop_local_service_serialized_by_lifecycle_lock(monkeypatch) -> None:  
             return None  # 仍在运行
 
     fake = FakeProcess()
-    provider._server_process = fake
+    supervisor._server_process = fake
 
     terminated = threading.Event()
 
@@ -400,25 +401,25 @@ def test_stop_local_service_serialized_by_lifecycle_lock(monkeypatch) -> None:  
         process.terminated = True
         terminated.set()
 
-    monkeypatch.setattr("app.voice.tts._terminate_process_tree", fake_terminate)
+    monkeypatch.setattr("app.voice.tts_service._terminate_process_tree", fake_terminate)
 
     # 主线程先占住服务生命周期锁,模拟一次启动/采用正在进行。
-    provider._service_lifecycle_lock.acquire()
-    worker = threading.Thread(target=provider._stop_local_service)
+    supervisor._service_lifecycle_lock.acquire()
+    worker = threading.Thread(target=supervisor._stop_local_service)
     worker.start()
     try:
         # 锁被占用期间后台 stop 应被挡住,不会终止进程。
         assert not terminated.wait(0.2)
         assert fake.terminated is False
-        assert provider._server_process is fake
+        assert supervisor._server_process is fake
     finally:
-        provider._service_lifecycle_lock.release()
+        supervisor._service_lifecycle_lock.release()
 
     # 释放锁后 stop 立即完成并清理进程。
     assert terminated.wait(2.0)
     worker.join(2.0)
     assert fake.terminated is True
-    assert provider._server_process is None
+    assert supervisor._server_process is None
 
 
 def test_tts_service_probe_reports_unavailable_service(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1107,6 +1108,7 @@ def test_gptsovits_broken_pipe_restart_resets_local_service_state(monkeypatch) -
         _server_process=FakeProcess(),
         _service_checked=True,
         _weights_ready=True,
+        _service_lifecycle_lock=threading.RLock(),
     )
     body = '{"message":"tts failed","Exception":"[Errno 32] Broken pipe"}'
     monkeypatch.setattr("app.voice.tts_service.sys.platform", "linux")

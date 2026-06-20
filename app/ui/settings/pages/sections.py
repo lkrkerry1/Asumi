@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QTableWidget,
     QTextEdit,
     QVBoxLayout,
