@@ -2317,6 +2317,11 @@ class PetWindow(QWidget):
                 self.resize(new_w, new_h)
             self.stage_size = (new_w, new_h)
             self._place_pet_children(layout)
+            # 窗口尺寸不变时不会派发 resizeEvent，遮罩/调试层无法经 _layout_stage 刷新，
+            # 旧遮罩会裁掉新摆放的气泡/输入栏（设置预览、气泡自适应扩展均受影响）。
+            # 在抑帧区间内同帧补刷，保证裁剪层始终跟随刚应用的布局。
+            self._update_stage_debug_overlay(layout)
+            self._update_stage_mask(layout)
         finally:
             self.setUpdatesEnabled(was_enabled)
 

@@ -1536,6 +1536,62 @@ def test_pet_window_screen_change_restores_stage_geometry(monkeypatch) -> None: 
     app.processEvents()
 
 
+def test_apply_pet_layout_refreshes_mask_when_window_size_unchanged() -> None:
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication") or not hasattr(qtwidgets, "QWidget"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.control_panel_layout import PetLayout
+    from app.ui.pet_window import PetWindow
+
+    QApplication = qtwidgets.QApplication
+    QWidget = qtwidgets.QWidget
+    app = QApplication.instance() or QApplication([])
+
+    # 窗口尺寸固定，使 _apply_pet_layout 内的 resize() 为同尺寸 no-op，不派发 resizeEvent，
+    # 从而排除 _layout_stage 那条旁路：遮罩若仍被刷新，只能来自 _apply_pet_layout 本身。
+    layout = PetLayout(
+        window_size=(400, 300),
+        portrait_rect=(50, 0, 300, 240),
+        bubble_rect=(60, 0, 280, 60),
+        input_rect=(60, 250, 280, 40),
+        portrait_anchor=(200, 280),
+    )
+
+    class MinimalLayoutWindow(PetWindow):
+        def __init__(self) -> None:
+            QWidget.__init__(self)
+            self.mask_calls = 0
+            self.overlay_calls = 0
+
+        def _compute_pet_layout(self) -> PetLayout:  # type: ignore[override]
+            return layout
+
+        def _place_pet_children(self, _layout) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        def _update_stage_mask(self, _layout) -> None:  # type: ignore[no-untyped-def]
+            self.mask_calls += 1
+
+        def _update_stage_debug_overlay(self, _layout) -> None:  # type: ignore[no-untyped-def]
+            self.overlay_calls += 1
+
+    window = MinimalLayoutWindow()
+    window.resize(*layout.window_size)
+    app.processEvents()
+    # 复位：构造期 resize 触发的任何 resizeEvent 不应计入待测调用。
+    window.mask_calls = 0
+    window.overlay_calls = 0
+
+    window._apply_pet_layout()
+
+    assert window.mask_calls == 1
+    assert window.overlay_calls == 1
+
+    window.deleteLater()
+    app.processEvents()
+
+
 def test_screen_change_event_check_tolerates_missing_qt_enum(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import _is_screen_change_event
