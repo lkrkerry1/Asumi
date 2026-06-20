@@ -17,6 +17,8 @@ from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
 from app.agent.screen_tools import create_screen_observation_tool
 from app.agent.tools.registry import Tool
+from app.storage.atomic import atomic_write_text
+from app.storage.paths import StoragePaths
 
 
 class BuiltinToolProvider:
@@ -34,10 +36,13 @@ class BuiltinToolProvider:
         reminders: ReminderStore | None = None,
     ) -> None:
         self.base_dir = base_dir
-        self.memory = memory or MemoryStore(base_dir / "data" / "memory.json")
-        self.reminders = reminders or ReminderStore(base_dir / "data" / "reminders.json")
-        self._todo_store = TodoStore(base_dir / "data" / "tasks.json")
-        self._notes_store = NotesStore(base_dir / "data" / "notes")
+        paths = StoragePaths(base_dir)
+        # MemoryStore 是 dataclass，第一个字段是 base_dir；旧写法误把 json 路径
+        # 当 base_dir 传入（主链路总会注入 memory，未实际触发），一并修正
+        self.memory = memory or MemoryStore(base_dir=base_dir)
+        self.reminders = reminders or ReminderStore(paths.reminders_store())
+        self._todo_store = TodoStore(paths.tasks_store())
+        self._notes_store = NotesStore(paths.notes_dir)
 
     def contribute_tools(self) -> list[Tool]:
         """返回所有内置工具。"""
@@ -181,6 +186,26 @@ class BuiltinToolProvider:
                 group="memory",
             ),
             Tool(
+                name="memory_update",
+                description="按 memory_id 更新已存在的长期记忆；先用 memory_search 获取 id。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "记忆 id。"},
+                        "content": {"type": "string", "description": "更新后的完整记忆内容。"},
+                    },
+                    "required": ["memory_id", "content"],
+                },
+                handler=lambda args: self.memory.update_memory(
+                    {
+                        "id": args.get("memory_id") or args.get("id"),
+                        "content": args.get("content"),
+                    },
+                    wait=False,
+                ),
+                group="memory",
+            ),
+            Tool(
                 name="memory_forget",
                 description="按 memory_id 删除长期记忆。",
                 parameters={
@@ -248,8 +273,11 @@ class TodoStore:
         return {"tasks": [t for t in data["tasks"] if isinstance(t, dict)]}
 
     def _save(self, data: dict[str, list[dict[str, Any]]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        atomic_write_text(
+            self.path,
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _required_text(arguments: dict[str, Any], key: str) -> str:

@@ -13,9 +13,11 @@ import uuid
 import pytest
 
 from app.agent.mcp import MCPRuntimeSettings
-from app.config.settings_service import DebugLogSettings, StartupSettings
+from app.agent.runtime_limits import RuntimeLoopSettings
+from app.config.settings_service import BackchannelSettings, DebugLogSettings, StartupSettings
 from app.llm.api_client import ApiSettings
-from app.llm.chat_reply import ChatSegment
+from app.agent import AgentEvent, AgentResult
+from app.llm.chat_reply import ChatReply, ChatSegment
 from app.ui.portrait_utils import portrait_kind_key, should_crossfade_portrait
 from app.ui.theme import (
     DEFAULT_THEME_SETTINGS,
@@ -24,8 +26,9 @@ from app.ui.theme import (
     build_pet_window_stylesheet,
 )
 from app.agent.proactive_care import ProactiveCareSettings
+from app.agent.screen_awareness import ScreenAwarenessSettings
 from app.agent.screen_observation import ScreenObservation
-from app.voice.tts import GPTSoVITSTTSSettings
+from app.voice.tts_settings import GPTSoVITSTTSSettings
 from app.storage.visual_observation import VisualObservationRecord, VisualObservationStore
 
 
@@ -60,8 +63,120 @@ def test_same_portrait_file_does_not_crossfade() -> None:
     )
 
 
+class _DummyPortraitLabel:
+    def __init__(self) -> None:
+        self.visible = True
+
+    def hide(self) -> None:
+        self.visible = False
+
+    def show(self) -> None:
+        self.visible = True
+
+
+def test_renderer_replaces_default_portrait_suppresses_png_labels() -> None:
+    from app.ui.pet_window import PetWindow
+
+    window = type("WindowStub", (), {})()
+    window.label = _DummyPortraitLabel()
+    window.portrait_transition_label = _DummyPortraitLabel()
+    window._set_portrait_overlay_suppressed = (  # type: ignore[attr-defined]
+        lambda suppressed: PetWindow._set_portrait_overlay_suppressed(window, suppressed)
+    )
+    window.renderer_manager = type(
+        "ManagerStub",
+        (),
+        {"is_overlay_active": True, "replaces_default_portrait": True},
+    )()
+
+    PetWindow._resuppress_portrait_if_renderer_active(window)
+
+    assert not window.label.visible
+    assert not window.portrait_transition_label.visible
+
+
+def test_renderer_without_replacement_keeps_png_labels_visible() -> None:
+    from app.ui.pet_window import PetWindow
+
+    window = type("WindowStub", (), {})()
+    window.label = _DummyPortraitLabel()
+    window.portrait_transition_label = _DummyPortraitLabel()
+    window._set_portrait_overlay_suppressed = (  # type: ignore[attr-defined]
+        lambda suppressed: PetWindow._set_portrait_overlay_suppressed(window, suppressed)
+    )
+    window.renderer_manager = type(
+        "ManagerStub",
+        (),
+        {"is_overlay_active": True, "replaces_default_portrait": False},
+    )()
+
+    PetWindow._resuppress_portrait_if_renderer_active(window)
+
+    assert window.label.visible
+    assert window.portrait_transition_label.visible
+
+
+def test_close_renderer_manager_closes_renderer_and_restores_png_label() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class ManagerStub:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    manager = ManagerStub()
+    window = type("WindowStub", (), {})()
+    window.label = _DummyPortraitLabel()
+    window.portrait_transition_label = _DummyPortraitLabel()
+    window._set_portrait_overlay_suppressed = (  # type: ignore[attr-defined]
+        lambda suppressed: PetWindow._set_portrait_overlay_suppressed(window, suppressed)
+    )
+    window.renderer_manager = manager
+    window._stop_gaze_tracking = lambda: None  # type: ignore[attr-defined]
+    window.label.hide()
+    window.portrait_transition_label.hide()
+
+    PetWindow._close_renderer_manager(window)
+
+    assert manager.closed
+    assert window.label.visible
+    # 转场 label 只在需要时显示，关闭 renderer 不应强制显示。
+    assert not window.portrait_transition_label.visible
+
+
+def test_activate_renderer_manager_assigns_before_gaze_tracking() -> None:
+    from app.ui.pet_window import PetWindow
+
+    manager = object()
+    window = type("WindowStub", (), {})()
+    window.renderer_manager = None
+    window.closed = False
+    window.gaze_started = False
+
+    def close_renderer_manager() -> None:
+        window.closed = True
+        window.renderer_manager = None
+
+    def init_renderer_manager() -> object:
+        return manager
+
+    def start_gaze_tracking() -> None:
+        assert window.renderer_manager is manager
+        window.gaze_started = True
+
+    window._close_renderer_manager = close_renderer_manager  # type: ignore[attr-defined]
+    window._init_renderer_manager = init_renderer_manager  # type: ignore[attr-defined]
+    window._start_gaze_tracking = start_gaze_tracking  # type: ignore[attr-defined]
+
+    assert PetWindow._activate_renderer_manager(window) is manager
+    assert window.closed
+    assert window.gaze_started
+    assert window.renderer_manager is manager
+
+
 def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication") or not hasattr(qtwidgets, "QWidget"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -113,7 +228,6 @@ def test_pet_window_menu_keeps_only_allowed_checkable_switches() -> None:
 
 
 def test_pet_window_menu_shows_restore_action_when_hidden() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication") or not hasattr(qtwidgets, "QWidget"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -147,7 +261,6 @@ def test_pet_window_menu_shows_restore_action_when_hidden() -> None:
 
 
 def test_show_runtime_log_uses_non_modal_show(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QWidget"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -184,6 +297,19 @@ def test_show_runtime_log_uses_non_modal_show(monkeypatch) -> None:  # type: ign
     class Host(qtwidgets.QWidget):
         show_runtime_log = pet_window_module.PetWindow.show_runtime_log
         _any_dialog_open = pet_window_module.PetWindow._any_dialog_open
+        _prepare_secondary_window = pet_window_module.PetWindow._prepare_secondary_window
+        _present_registered_secondary_window = (
+            pet_window_module.PetWindow._present_registered_secondary_window
+        )
+        _register_secondary_window = pet_window_module.PetWindow._register_secondary_window
+        _sync_secondary_window_state = pet_window_module.PetWindow._sync_secondary_window_state
+        _is_secondary_window_visible = pet_window_module.PetWindow._is_secondary_window_visible
+        _set_secondary_windows_input_bar_hidden = (
+            pet_window_module.PetWindow._set_secondary_windows_input_bar_hidden
+        )
+        _set_secondary_windows_topmost_suppressed = (
+            pet_window_module.PetWindow._set_secondary_windows_topmost_suppressed
+        )
 
     monkeypatch.setattr(pet_window_module, "RuntimeLogWindow", RuntimeLogWindowStub)
 
@@ -198,14 +324,13 @@ def test_show_runtime_log_uses_non_modal_show(monkeypatch) -> None:  # type: ign
 
     assert events == ["theme", "refresh:True", "show", "raise", "activate"]
     assert host.runtime_log_window.kwargs["parent"] is host
-    assert host._any_dialog_open() is False
+    assert host._any_dialog_open() is True
 
     host.deleteLater()
     app.processEvents()
 
 
 def test_runtime_log_window_is_non_modal() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     qtcore = pytest.importorskip("PySide6.QtCore")
     if not hasattr(qtwidgets, "QApplication"):
@@ -230,7 +355,6 @@ def test_runtime_log_window_is_non_modal() -> None:
 
 
 def test_runtime_log_window_collapses_consecutive_duplicate_rows() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     qtcore = pytest.importorskip("PySide6.QtCore")
     if not hasattr(qtwidgets, "QApplication"):
@@ -258,6 +382,7 @@ def test_runtime_log_window_collapses_consecutive_duplicate_rows() -> None:
 
     app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
     window = RuntimeLogWindow(log_buffer=buffer, theme_settings=DEFAULT_THEME_SETTINGS)
+    window.refresh(reset=True)
 
     assert window.program_list.count() == 2
     first_item = window.program_list.item(0)
@@ -271,7 +396,6 @@ def test_runtime_log_window_collapses_consecutive_duplicate_rows() -> None:
 
 
 def test_runtime_log_window_row_shows_category_level_and_detail_summary() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -304,6 +428,7 @@ def test_runtime_log_window_row_shows_category_level_and_detail_summary() -> Non
 
     app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
     window = RuntimeLogWindow(log_buffer=buffer, theme_settings=DEFAULT_THEME_SETTINGS)
+    window.refresh(reset=True)
 
     info_item = window.program_list.item(0)
     # 行内带分类标签，detail 中的标量字段提取为行尾摘要，嵌套结构与脱敏值不出现
@@ -322,7 +447,6 @@ def test_runtime_log_window_row_shows_category_level_and_detail_summary() -> Non
 
 
 def test_runtime_log_window_shows_tts_text_preview_as_detail() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -343,6 +467,7 @@ def test_runtime_log_window_shows_tts_text_preview_as_detail() -> None:
 
     app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
     window = RuntimeLogWindow(log_buffer=buffer, theme_settings=DEFAULT_THEME_SETTINGS)
+    window.refresh(reset=True)
 
     item = window.program_list.item(0)
     # 合成/播放记录的灰字摘要优先显示文本内容而不是 detail 字段
@@ -355,7 +480,6 @@ def test_runtime_log_window_shows_tts_text_preview_as_detail() -> None:
 
 
 def test_runtime_log_window_updates_progress_rows_in_place() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -375,6 +499,7 @@ def test_runtime_log_window_updates_progress_rows_in_place() -> None:
 
     app = qtwidgets.QApplication.instance() or qtwidgets.QApplication([])
     window = RuntimeLogWindow(log_buffer=buffer, theme_settings=DEFAULT_THEME_SETTINGS)
+    window.refresh(reset=True)
     assert window.tts_list.count() == 1
 
     # 已展示的进度行在新进度到达后应原地刷新，而不是追加新行
@@ -397,7 +522,6 @@ def test_runtime_log_window_updates_progress_rows_in_place() -> None:
 
 
 def test_pet_window_status_tray_icon_is_not_empty() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -477,7 +601,12 @@ def test_memory_status_does_not_use_tray_balloon(monkeypatch) -> None:  # type: 
         "reloading message",
         "failed message",
     ]
-    assert warnings == [("记忆模型下载失败", "failed message")]
+    assert len(warnings) == 1
+    assert warnings[0][0] == "记忆模型下载失败"
+    assert "发生了什么" in warnings[0][1]
+    assert "处理建议" in warnings[0][1]
+    assert "诊断信息（截图时请保留）" in warnings[0][1]
+    assert "failed message" in warnings[0][1]
     assert single_shots == [(pet_window_module.MEMORY_STATUS_DISPLAY_MS, window._restore_memory_status_speech)]
 
 
@@ -532,7 +661,10 @@ def test_memory_failure_dialog_is_deferred_until_startup_window_is_visible(monke
     PetWindow._show_pending_memory_status_after_startup(window)
 
     assert window.subtitle_controller.messages == ["download failed"]
-    assert warnings == [("记忆模型下载失败", "download failed")]
+    assert len(warnings) == 1
+    assert warnings[0][0] == "记忆模型下载失败"
+    assert "处理建议" in warnings[0][1]
+    assert "download failed" in warnings[0][1]
     assert window.memory_failure_dialog_pending_message == ""
 
 
@@ -737,6 +869,325 @@ def test_emit_app_closed_event_logs_once_with_interrupted_flag() -> None:
     assert len(window.runtime_event_queue) == 0
 
 
+def test_close_external_tools_cancels_and_keeps_lingering_thread() -> None:
+    from app.core.resource_manager import QtWorkerResource, ResourceManager
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class SignalStub:
+        def __init__(self) -> None:
+            self.callbacks = []
+
+        def connect(self, callback):  # type: ignore[no-untyped-def]
+            self.callbacks.append(callback)
+
+    class ThreadStub:
+        def __init__(self) -> None:
+            self.finished = SignalStub()
+            self.interrupted = False
+            self.quit_called = False
+            self.waits: list[int] = []
+
+        def requestInterruption(self) -> None:
+            self.interrupted = True
+
+        def isRunning(self) -> bool:
+            return True
+
+        def quit(self) -> None:
+            self.quit_called = True
+
+        def wait(self, timeout: int) -> bool:
+            self.waits.append(timeout)
+            return False
+
+    class WorkerStub:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class SubtitleStub:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel_reply_flow(self) -> None:
+            self.cancelled = True
+
+    order: list[str] = []
+
+    class BackchannelStub:
+        def cancel(self) -> None:
+            order.append("backchannel_cancel")
+
+    class RecordingResourceManager(ResourceManager):
+        def stop_all(self, timeout_ms: int = 1000) -> None:
+            order.append("stop_all")
+            super().stop_all(timeout_ms)
+
+    class MinimalWindow:
+        close_external_tools = PetWindow.close_external_tools
+
+    window = MinimalWindow()
+    manager = RecordingResourceManager()
+    thread = ThreadStub()
+    worker = WorkerStub()
+    subtitle = SubtitleStub()
+    window._shutdown_in_progress = False
+    window.resource_manager = manager
+    window.messages = [
+        {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+    ]
+    window.subtitle_controller = subtitle
+    window.backchannel_controller = BackchannelStub()
+    window.worker_thread = thread
+    window.worker = worker
+    # close_external_tools 通过 resource_manager.stop_all 关闭已注册的 worker。
+    manager._register(
+        QtWorkerResource(
+            manager,
+            thread,
+            worker,
+            owner=window,
+            thread_attr="worker_thread",
+            worker_attr="worker",
+            label="worker_thread",
+        )
+    )
+    window._emit_app_closed_event = lambda: None
+    window._stop_speaking_state_watchdog = lambda: None
+    window.close_tts_tools = lambda: order.append("tts_close")
+    window.close_mcp_tools = lambda: order.append("mcp_close")
+    window.close_plugins = lambda: order.append("plugins_close")
+    window._close_renderer_manager = lambda: order.append("renderer_close")
+
+    window.close_external_tools()
+
+    assert window._shutdown_in_progress is True
+    assert worker.cancelled is True
+    assert thread.interrupted is True
+    assert thread.quit_called is True
+    assert thread.waits == [1000]
+    assert manager._lingering == [(thread, worker)]
+    assert window.messages == []
+    assert subtitle.cancelled is True
+    assert order == ["backchannel_cancel", "stop_all"]
+
+
+def test_pet_window_registers_runtime_services_in_registry_order() -> None:
+    from app.core.resource_manager import ResourceManager, ResourceRegistry
+    from app.ui.pet_window import PetWindow
+
+    order: list[str] = []
+
+    class MemoryStoreStub:
+        def close(self) -> None:
+            order.append("memory")
+
+    class MinimalWindow:
+        _register_runtime_service_resources = PetWindow._register_runtime_service_resources
+
+        def close_tts_tools(self) -> None:
+            order.append("tts")
+
+        def close_mcp_tools(self) -> None:
+            order.append("mcp")
+
+        def _close_renderer_manager(self) -> None:
+            order.append("renderer")
+
+        def close_plugins(self) -> None:
+            order.append("plugins")
+
+    registry = ResourceRegistry()
+    window = MinimalWindow()
+    window.memory_store = MemoryStoreStub()
+    window.resource_manager = ResourceManager(registry=registry)
+
+    window._register_runtime_service_resources()
+    registry.stop_all()
+
+    assert order == ["memory", "tts", "mcp", "renderer", "plugins"]
+
+
+def test_shutdown_ignores_late_progress_and_reply() -> None:
+    from app.agent import AgentProgress, AgentResult
+    from app.llm.chat_reply import parse_chat_reply
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class MinimalWindow:
+        _handle_progress_reply = PetWindow._handle_progress_reply
+        _handle_reply = PetWindow._handle_reply
+
+    window = MinimalWindow()
+    window._shutdown_in_progress = True
+    window.messages = [
+        {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+    ]
+    progress = AgentProgress(
+        reply=parse_chat_reply('{"segments":[{"ja":"見るね。","zh":"我看看。","tone":"中性"}]}')
+    )
+    result = AgentResult(
+        reply=parse_chat_reply('{"segments":[{"ja":"終わり。","zh":"结束。","tone":"中性"}]}')
+    )
+
+    window._handle_progress_reply(progress)
+    window._handle_reply(result)
+
+    assert window.messages == []
+
+
+def test_silent_screen_awareness_reply_ends_interaction() -> None:
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class MinimalWindow:
+        _handle_event_reply = PetWindow._handle_event_reply
+        _clear_active_event = PetWindow._clear_active_event
+
+        def __init__(self) -> None:
+            self._shutdown_in_progress = False
+            self.messages = [
+                {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+            ]
+            self.active_event = AgentEvent(type="screen_awareness_check", payload={})
+            self.active_event_type = "screen_awareness_check"
+            self.active_reminder_id = None
+            self.active_reminder_text = ""
+            self.active_interaction_id = "interaction-1"
+            self.logged = []
+            self.ended = []
+
+        def _log_interaction_stage(self, *args):  # type: ignore[no-untyped-def]
+            self.logged.append(args)
+
+        def _queue_event_screen_observation_followup(self, *args):  # type: ignore[no-untyped-def]
+            return False
+
+        def _filter_screen_awareness_reply(self, result, event):  # type: ignore[no-untyped-def]
+            return result
+
+        def _consume_agent_result(self, _result):  # type: ignore[no-untyped-def]
+            raise AssertionError("静默主动事件不应进入回复展示")
+
+        def _mark_reminder_completed(self, _reminder_id):  # type: ignore[no-untyped-def]
+            raise AssertionError("本用例没有提醒 id")
+
+        def _end_interaction(self, outcome: str) -> None:
+            self.ended.append(outcome)
+            self.active_interaction_id = ""
+
+    window = MinimalWindow()
+    result = AgentResult(reply=ChatReply([]), actions=[])
+
+    window._handle_event_reply(result)
+
+    assert window.messages == []
+    assert window.active_event_type == ""
+    assert window.active_interaction_id == ""
+    assert window.ended == ["event_silent"]
+
+
+def test_event_error_cleans_transient_progress_during_shutdown() -> None:
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
+
+    class MinimalWindow:
+        _handle_event_error = PetWindow._handle_event_error
+
+        def _clear_active_event(self) -> None:
+            self.active_event_type = ""
+
+    window = MinimalWindow()
+    window._shutdown_in_progress = True
+    window.active_event_type = "custom"
+    window.messages = [
+        {"role": "assistant", "content": "途中", TRANSIENT_PROGRESS_MESSAGE_KEY: True}
+    ]
+
+    window._handle_event_error("late error")
+
+    assert window.messages == []
+    assert window.active_event_type == ""
+
+
+def test_screen_awareness_event_error_ends_interaction() -> None:
+    """主动感知 API 失败时必须结束交互，否则 active_interaction_id 卡住会让后续主动感知永久停摆。"""
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _handle_event_error = PetWindow._handle_event_error
+        _clear_active_event = PetWindow._clear_active_event
+
+        def __init__(self) -> None:
+            self._shutdown_in_progress = False
+            self.messages = []
+            self.active_event = None
+            self.active_event_type = "screen_awareness_check"
+            self.active_reminder_id = None
+            self.active_reminder_text = ""
+            self.active_interaction_id = "interaction-3"
+            self.logged = []
+            self.ended = []
+
+        def _log_interaction_stage(self, *args):  # type: ignore[no-untyped-def]
+            self.logged.append(args)
+
+        def _consume_agent_result(self, _result):  # type: ignore[no-untyped-def]
+            raise AssertionError("静默主动感知失败不应进入回复展示")
+
+        def _mark_reminder_completed(self, _reminder_id):  # type: ignore[no-untyped-def]
+            raise AssertionError("本用例没有提醒 id")
+
+        def _end_interaction(self, outcome: str) -> None:
+            self.ended.append(outcome)
+            self.active_interaction_id = ""
+
+    window = MinimalWindow()
+
+    window._handle_event_error("API 请求超时。")
+
+    assert window.active_event_type == ""
+    # 关键断言：交互已结束，active_interaction_id 被清空，主动感知总闸不会被永久卡住
+    assert window.active_interaction_id == ""
+    assert window.ended == ["screen_awareness_error_silent"]
+
+
+def test_speaking_state_timeout_cancels_reply_and_ends_interaction() -> None:
+    from app.ui.pet_window import PetWindow
+    from app.ui.state import PetUiState
+
+    class UiStateStub:
+        state = PetUiState.SPEAKING
+
+        def finish(self, reason: str) -> None:
+            raise AssertionError(f"active interaction should use _end_interaction, got {reason}")
+
+    class SubtitleStub:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def is_reply_sequence_active(self) -> bool:
+            return True
+
+        def cancel_reply_flow(self) -> None:
+            self.cancelled = True
+
+    class MinimalWindow:
+        _handle_speaking_state_timeout = PetWindow._handle_speaking_state_timeout
+
+    window = MinimalWindow()
+    subtitle = SubtitleStub()
+    outcomes = []
+    window.ui_state = UiStateStub()
+    window.subtitle_controller = subtitle
+    window.active_interaction_id = "interaction-1"
+    window._end_interaction = lambda outcome: outcomes.append(outcome)
+
+    window._handle_speaking_state_timeout()
+
+    assert subtitle.cancelled is True
+    assert outcomes == ["speaking_timeout"]
+
+
 def test_pet_window_application_activation_restores_when_hidden_to_tray(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import PetWindow
@@ -829,6 +1280,60 @@ def test_pet_window_context_menu_opens_on_right_release_not_press() -> None:
     assert window.context_menu_positions == [release_event.position().toPoint()]
 
 
+def test_pet_window_left_press_clears_input_focus_without_clearing_text() -> None:
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    from app.ui.pet_window import PetWindow
+
+    class MouseEventStub:
+        def __init__(self) -> None:
+            self.accepted = False
+            self._position = qtcore.QPointF(40, 60)
+
+        def button(self):  # type: ignore[no-untyped-def]
+            return qtcore.Qt.MouseButton.LeftButton
+
+        def position(self):  # type: ignore[no-untyped-def]
+            return self._position
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    class InputStub:
+        def __init__(self) -> None:
+            self._text = "还没发出去的话"
+            self.focused = True
+            self.clear_focus_count = 0
+
+        def hasFocus(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return self.focused
+
+        def clearFocus(self) -> None:  # noqa: N802 - Qt API 兼容命名。
+            self.focused = False
+            self.clear_focus_count += 1
+
+        def text(self) -> str:
+            return self._text
+
+    class MinimalWindow:
+        _handle_mouse_press = PetWindow._handle_mouse_press
+        _drag_anchor_from_event = PetWindow._drag_anchor_from_event
+        _clear_input_focus_for_pet_interaction = PetWindow._clear_input_focus_for_pet_interaction
+
+        def __init__(self) -> None:
+            self.input_edit = InputStub()
+            self.drag_anchor = None
+
+    window = MinimalWindow()
+    press_event = MouseEventStub()
+
+    assert window._handle_mouse_press(press_event) is True
+    assert window.input_edit.clear_focus_count == 1
+    assert not window.input_edit.hasFocus()
+    assert window.input_edit.text() == "还没发出去的话"
+    assert window.drag_anchor == qtcore.QPoint(40, 60)
+    assert press_event.accepted
+
+
 def test_pet_window_drag_uses_window_local_anchor_not_frame_geometry() -> None:
     qtcore = pytest.importorskip("PySide6.QtCore")
     from app.ui.pet_window import PetWindow
@@ -875,6 +1380,7 @@ def test_pet_window_drag_uses_window_local_anchor_not_frame_geometry() -> None:
         _handle_mouse_move = PetWindow._handle_mouse_move
         _handle_mouse_release = PetWindow._handle_mouse_release
         _drag_anchor_from_event = PetWindow._drag_anchor_from_event
+        _clear_input_focus_for_pet_interaction = PetWindow._clear_input_focus_for_pet_interaction
 
         def __init__(self) -> None:
             self.drag_anchor = None
@@ -950,6 +1456,7 @@ def test_pet_window_drag_maps_child_widget_anchor_to_window_coordinates() -> Non
         _handle_mouse_press = PetWindow._handle_mouse_press
         _handle_mouse_move = PetWindow._handle_mouse_move
         _drag_anchor_from_event = PetWindow._drag_anchor_from_event
+        _clear_input_focus_for_pet_interaction = PetWindow._clear_input_focus_for_pet_interaction
 
         def __init__(self) -> None:
             self.drag_anchor = None
@@ -1029,6 +1536,62 @@ def test_pet_window_screen_change_restores_stage_geometry(monkeypatch) -> None: 
     app.processEvents()
 
 
+def test_apply_pet_layout_refreshes_mask_when_window_size_unchanged() -> None:
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication") or not hasattr(qtwidgets, "QWidget"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.control_panel_layout import PetLayout
+    from app.ui.pet_window import PetWindow
+
+    QApplication = qtwidgets.QApplication
+    QWidget = qtwidgets.QWidget
+    app = QApplication.instance() or QApplication([])
+
+    # 窗口尺寸固定，使 _apply_pet_layout 内的 resize() 为同尺寸 no-op，不派发 resizeEvent，
+    # 从而排除 _layout_stage 那条旁路：遮罩若仍被刷新，只能来自 _apply_pet_layout 本身。
+    layout = PetLayout(
+        window_size=(400, 300),
+        portrait_rect=(50, 0, 300, 240),
+        bubble_rect=(60, 0, 280, 60),
+        input_rect=(60, 250, 280, 40),
+        portrait_anchor=(200, 280),
+    )
+
+    class MinimalLayoutWindow(PetWindow):
+        def __init__(self) -> None:
+            QWidget.__init__(self)
+            self.mask_calls = 0
+            self.overlay_calls = 0
+
+        def _compute_pet_layout(self) -> PetLayout:  # type: ignore[override]
+            return layout
+
+        def _place_pet_children(self, _layout) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        def _update_stage_mask(self, _layout) -> None:  # type: ignore[no-untyped-def]
+            self.mask_calls += 1
+
+        def _update_stage_debug_overlay(self, _layout) -> None:  # type: ignore[no-untyped-def]
+            self.overlay_calls += 1
+
+    window = MinimalLayoutWindow()
+    window.resize(*layout.window_size)
+    app.processEvents()
+    # 复位：构造期 resize 触发的任何 resizeEvent 不应计入待测调用。
+    window.mask_calls = 0
+    window.overlay_calls = 0
+
+    window._apply_pet_layout()
+
+    assert window.mask_calls == 1
+    assert window.overlay_calls == 1
+
+    window.deleteLater()
+    app.processEvents()
+
+
 def test_screen_change_event_check_tolerates_missing_qt_enum(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     import app.ui.pet_window as pet_window_module
     from app.ui.pet_window import _is_screen_change_event
@@ -1047,7 +1610,6 @@ def test_screen_change_event_check_tolerates_missing_qt_enum(monkeypatch) -> Non
 
 
 def test_reply_history_controls_use_capsule_sizing() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QToolButton")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -1108,7 +1670,6 @@ def test_reply_history_controls_use_capsule_sizing() -> None:
 
 
 def test_portrait_controller_scales_pixmap_by_configured_percent() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     qtgui = pytest.importorskip("PySide6.QtGui")
     qtcore = pytest.importorskip("PySide6.QtCore")
@@ -1189,7 +1750,6 @@ def test_portrait_controller_never_resizes_parent_window() -> None:
     会与底边锚点几何相互打架，产生切表情/缩放时的偶发跳闪。此处把宿主尺寸设成与
     stage_size 不同的哨兵值，验证 apply_current 后宿主尺寸保持不变，且 relayout 仍被调用。
     """
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     qtgui = pytest.importorskip("PySide6.QtGui")
     qtcore = pytest.importorskip("PySide6.QtCore")
@@ -1432,7 +1992,6 @@ def test_pet_window_defaults_autonomous_screen_observation_to_enabled() -> None:
 
 
 def test_pet_window_locks_controls_during_startup_initialization(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     qtgui = pytest.importorskip("PySide6.QtGui")
     qtcore = pytest.importorskip("PySide6.QtCore")
@@ -1474,7 +2033,6 @@ def test_pet_window_locks_controls_during_startup_initialization(monkeypatch) ->
 
 
 def test_pet_window_unlocks_after_deferred_services_are_applied(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     qtgui = pytest.importorskip("PySide6.QtGui")
     qtcore = pytest.importorskip("PySide6.QtCore")
@@ -1484,7 +2042,7 @@ def test_pet_window_unlocks_after_deferred_services_are_applied(monkeypatch) -> 
     from app.agent.memory import MemoryStore
     from app.core.bootstrap import DeferredStartupServices, build_initial_app_context
     from app.core.extensions import ExtensionRegistry
-    from app.core.plugin_manager import SakuraPluginManager
+    from app.plugins.manager import PluginManager
     from app.ui.pet_window import PetWindow
     from app.voice.tts import NullTTSProvider
 
@@ -1507,7 +2065,7 @@ def test_pet_window_unlocks_after_deferred_services_are_applied(monkeypatch) -> 
         tts_provider=tts_provider,
         tool_registry=context.tool_registry,
         extension_registry=ExtensionRegistry(),
-        plugin_manager=SakuraPluginManager(base_dir=root),
+        plugin_manager=PluginManager(base_dir=root),
         mcp_settings=context.mcp_settings,
         mcp_tool_provider=None,
         errors=("TTS 配置无效，已禁用：参考音频不存在",),
@@ -1530,8 +2088,99 @@ def test_pet_window_unlocks_after_deferred_services_are_applied(monkeypatch) -> 
     app.processEvents()
 
 
+def test_shutdown_closes_late_deferred_services() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class CloseableStub:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    class PluginManagerStub:
+        def __init__(self) -> None:
+            self.shutdowns = 0
+
+        def shutdown_all(self) -> None:
+            self.shutdowns += 1
+
+    class ServicesStub:
+        def __init__(self) -> None:
+            self.tts_provider = CloseableStub()
+            self.mcp_tool_provider = CloseableStub()
+            self.plugin_manager = PluginManagerStub()
+
+    class WindowStub:
+        _shutdown_in_progress = True
+        apply_deferred_services = PetWindow.apply_deferred_services
+        _close_deferred_services = PetWindow._close_deferred_services
+
+    services = ServicesStub()
+    window = WindowStub()
+
+    window.apply_deferred_services(services)
+
+    assert services.tts_provider.closed == 1
+    assert services.mcp_tool_provider.closed == 1
+    assert services.plugin_manager.shutdowns == 1
+
+
+def test_deferred_startup_worker_closes_services_when_cancelled_after_move(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import main as main_module
+    from main import DeferredStartupWorker
+
+    class CloseableStub:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    class PluginManagerStub:
+        def __init__(self) -> None:
+            self.shutdowns = 0
+
+        def shutdown_all(self) -> None:
+            self.shutdowns += 1
+
+    class ServicesStub:
+        def __init__(self) -> None:
+            self.tts_provider = CloseableStub()
+            self.mcp_tool_provider = CloseableStub()
+            self.plugin_manager = PluginManagerStub()
+
+    services = ServicesStub()
+    monkeypatch.setattr(
+        main_module,
+        "build_deferred_services",
+        lambda *_args, **_kwargs: services,
+    )
+
+    worker = DeferredStartupWorker(Path("."), object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        worker,
+        "_move_service_objects_to_ui_thread",
+        lambda _services: worker.cancel(),
+    )
+    cancelled: list[bool] = []
+    finished: list[object] = []
+    failed: list[str] = []
+    worker.cancelled.connect(lambda: cancelled.append(True))
+    worker.finished.connect(lambda value: finished.append(value))
+    worker.failed.connect(lambda message: failed.append(message))
+
+    worker.run()
+
+    assert cancelled == [True]
+    assert finished == []
+    assert failed == []
+    assert services.tts_provider.closed == 1
+    assert services.mcp_tool_provider.closed == 1
+    assert services.plugin_manager.shutdowns == 1
+
+
 def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabled() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -1556,28 +2205,34 @@ def test_settings_dialog_disables_proactive_intervals_when_screen_context_disabl
         ),
     )
 
+    assert dialog.proactive_screen_context_enabled_check.text() == "启用主动屏幕感知（会定期获取屏幕信息）"
     assert not dialog.proactive_check_interval_spin.isEnabled()
     assert not dialog.proactive_cooldown_spin.isEnabled()
     assert not dialog.proactive_batch_limit_spin.isEnabled()
+    assert not dialog.proactive_token_estimate_label.isEnabled()
+    assert "按原始屏幕" in dialog.proactive_token_estimate_label.text()
+    assert "高细节估算" in dialog.proactive_token_estimate_label.text()
+    assert "6 张约" in dialog.proactive_token_estimate_label.text()
 
     dialog.proactive_screen_context_enabled_check.setChecked(True)
     app.processEvents()
     assert dialog.proactive_check_interval_spin.isEnabled()
     assert dialog.proactive_cooldown_spin.isEnabled()
     assert dialog.proactive_batch_limit_spin.isEnabled()
+    assert dialog.proactive_token_estimate_label.isEnabled()
 
     dialog.proactive_screen_context_enabled_check.setChecked(False)
     app.processEvents()
     assert not dialog.proactive_check_interval_spin.isEnabled()
     assert not dialog.proactive_cooldown_spin.isEnabled()
     assert not dialog.proactive_batch_limit_spin.isEnabled()
+    assert not dialog.proactive_token_estimate_label.isEnabled()
 
     dialog.deleteLater()
     app.processEvents()
 
 
 def test_settings_dialog_disables_tts_settings_when_tts_disabled() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -1606,8 +2261,6 @@ def test_settings_dialog_disables_tts_settings_when_tts_disabled() -> None:
         dialog.tts_work_dir_edit,
         dialog.tts_python_path_edit,
         dialog.tts_config_path_edit,
-        dialog.ref_lang_edit,
-        dialog.text_lang_edit,
         dialog.tts_timeout_spin,
     )
     assert all(not widget.isEnabled() for widget in controlled_widgets)
@@ -1625,8 +2278,6 @@ def test_settings_dialog_disables_tts_settings_when_tts_disabled() -> None:
             dialog.tts_config_path_edit,
         )
     )
-    assert dialog.ref_lang_edit.isEnabled()
-    assert dialog.text_lang_edit.isEnabled()
     assert dialog.tts_timeout_spin.isEnabled()
     assert dialog.tts_bundle_download_button.isEnabled()
 
@@ -1639,14 +2290,665 @@ def test_settings_dialog_disables_tts_settings_when_tts_disabled() -> None:
     app.processEvents()
 
 
+def test_settings_dialog_returns_backchannel_settings() -> None:
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("backchannel_settings_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        backchannel_settings=BackchannelSettings(
+            enabled=False,
+            delay_ms=600,
+            probability=1.0,
+            tts_enabled=False,
+        ),
+    )
+
+    assert not dialog.backchannel_tts_enabled_check.isEnabled()
+    assert dialog.backchannel_download_model_button.isEnabled()
+    assert dialog.backchannel_import_model_button.isEnabled()
+    assert dialog.backchannel_refresh_status_button.isEnabled()
+    dialog.backchannel_enabled_check.setChecked(True)
+    dialog.backchannel_tts_enabled_check.setChecked(True)
+    dialog.backchannel_mode_combo.setCurrentIndex(dialog.backchannel_mode_combo.findData("hybrid"))
+    dialog.backchannel_delay_spin.setValue(900)
+    dialog.backchannel_probability_spin.setValue(0.55)
+    dialog.accept()
+
+    assert dialog.result_backchannel_settings == BackchannelSettings(
+        enabled=True,
+        mode="hybrid",
+        delay_ms=900,
+        probability=0.55,
+        tts_enabled=True,
+    )
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_pet_window_backchannel_disk_cache_persists_and_replays(tmp_path: Path) -> None:
+    """合成音频持久化与动态链接:空闲落盘 → 跳过重复合成 → 重启等价场景直接命中磁盘缓存播放。"""
+    from app.backchannel.audio_cache import BackchannelAudioCache
+    from app.backchannel.models import (
+        BackchannelManifest,
+        BackchannelTemplate,
+        BackchannelVariant,
+    )
+    from app.backchannel.resolver import BackchannelChoice
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.prepared: list[str] = []
+            self.spoken_paths: list[Path | None] = []
+            self.discarded: list[str] = []
+
+        def prepare(self, text: str, tone: str | None = None) -> TTSPreparedAudio:
+            self.prepared.append(text)
+            return TTSPreparedAudio(text=text, tone=tone)
+
+        def speak_prepared(self, handle, on_started=None, on_finished=None):  # type: ignore[no-untyped-def]
+            self.spoken_paths.append(handle.audio_path)
+
+        def discard_prepared(self, handle: TTSPreparedAudio) -> None:
+            self.discarded.append(handle.text)
+
+    class WindowStub:
+        _backchannel_tts_wanted = PetWindow._backchannel_tts_wanted
+        _backchannel_tts_active = PetWindow._backchannel_tts_active
+        _backchannel_audio_key = PetWindow._backchannel_audio_key
+        _prepare_backchannel_audio_cache = PetWindow._prepare_backchannel_audio_cache
+        _backchannel_variant_audio_available = PetWindow._backchannel_variant_audio_available
+        _resolve_backchannel_audio_path = PetWindow._resolve_backchannel_audio_path
+        _copy_backchannel_audio_for_playback = PetWindow._copy_backchannel_audio_for_playback
+        _play_backchannel_audio = PetWindow._play_backchannel_audio
+        _request_backchannel_audio_playback = PetWindow._request_backchannel_audio_playback
+
+        def __init__(self) -> None:
+            self.backchannel_settings = BackchannelSettings(enabled=True, tts_enabled=True)
+            self.tts_provider = ProviderStub()
+            self._active_backchannel_audio = None
+            self.logged: list[tuple[str, dict[str, object] | None]] = []
+            template = BackchannelTemplate(
+                id="greeting",
+                tone="中性",
+                portrait="高兴满足",
+                variants=(BackchannelVariant(ja="……おかえり。", zh="……欢迎回来。"),),
+                intent="greeting_return",
+                emotion="neutral",
+            )
+            self.backchannel_manifest = BackchannelManifest(templates=(template,))
+            self.choice = BackchannelChoice(template, template.variants[0])
+            self._backchannel_audio_cache = BackchannelAudioCache(tmp_path / "audio", "fp")
+            synth = tmp_path / "synth.wav"
+            synth.write_bytes(b"wav-bytes")
+            self._backchannel_prepared_audio = {
+                ("greeting", "中性", "……おかえり。"): TTSPreparedAudio(
+                    text="……おかえり。", tone="中性", audio_path=synth
+                )
+            }
+
+        def _log_interaction_stage(self, stage: str, payload=None):  # type: ignore[no-untyped-def]
+            self.logged.append((stage, payload))
+
+    window = WindowStub()
+    cache = window._backchannel_audio_cache
+
+    # 空闲补合成入口:已合成句柄落盘、从内存丢弃、不重复提交合成
+    window._prepare_backchannel_audio_cache()
+    cached = cache.lookup("中性", "……おかえり。")
+    assert cached is not None and cached.read_bytes() == b"wav-bytes"
+    assert window._backchannel_prepared_audio == {}
+    assert window.tts_provider.discarded == ["……おかえり。"]
+    assert window.tts_provider.prepared == []  # 磁盘已有 → 不再合成
+
+    # 播放走磁盘缓存分支:播的是临时副本而非缓存本体,缓存在播后存活
+    window._play_backchannel_audio(window.choice)
+    assert len(window.tts_provider.spoken_paths) == 1
+    played = window.tts_provider.spoken_paths[0]
+    assert played is not None and played != cached
+    assert cached.exists()
+    played.unlink(missing_ok=True)
+
+
+def test_pet_window_backchannel_synth_persisted_on_play(tmp_path: Path) -> None:
+    """磁盘缓存未命中时播放内存句柄,播放前落盘——下次直接复用。"""
+    from app.backchannel.audio_cache import BackchannelAudioCache
+    from app.backchannel.models import BackchannelTemplate, BackchannelVariant
+    from app.backchannel.resolver import BackchannelChoice
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.spoken: list[str] = []
+
+        def speak_prepared(self, handle, on_started=None, on_finished=None):  # type: ignore[no-untyped-def]
+            self.spoken.append(handle.text)
+
+    class WindowStub:
+        _backchannel_tts_wanted = PetWindow._backchannel_tts_wanted
+        _backchannel_audio_key = PetWindow._backchannel_audio_key
+        _resolve_backchannel_audio_path = PetWindow._resolve_backchannel_audio_path
+        _copy_backchannel_audio_for_playback = PetWindow._copy_backchannel_audio_for_playback
+        _play_backchannel_audio = PetWindow._play_backchannel_audio
+        _request_backchannel_audio_playback = PetWindow._request_backchannel_audio_playback
+
+        def __init__(self) -> None:
+            self.backchannel_settings = BackchannelSettings(enabled=True, tts_enabled=True)
+            self.tts_provider = ProviderStub()
+            self._active_backchannel_audio = None
+            self.backchannel_manifest = None
+            self.logged: list[tuple[str, dict[str, object] | None]] = []
+            template = BackchannelTemplate(
+                id="greeting",
+                tone="中性",
+                portrait="高兴满足",
+                variants=(BackchannelVariant(ja="……おかえり。", zh="……欢迎回来。"),),
+                intent="greeting_return",
+                emotion="neutral",
+            )
+            self.choice = BackchannelChoice(template, template.variants[0])
+            self._backchannel_audio_cache = BackchannelAudioCache(tmp_path / "audio", "fp")
+            synth = tmp_path / "synth.wav"
+            synth.write_bytes(b"wav-bytes")
+            self._backchannel_prepared_audio = {
+                ("greeting", "中性", "……おかえり。"): TTSPreparedAudio(
+                    text="……おかえり。", tone="中性", audio_path=synth
+                )
+            }
+
+        def _log_interaction_stage(self, stage: str, payload=None):  # type: ignore[no-untyped-def]
+            self.logged.append((stage, payload))
+
+    window = WindowStub()
+    window._play_backchannel_audio(window.choice)
+    assert window.tts_provider.spoken == ["……おかえり。"]
+    # 播放前已持久化,句柄已从内存移除
+    assert window._backchannel_audio_cache.lookup("中性", "……おかえり。") is not None
+    assert window._backchannel_prepared_audio == {}
+
+
+def test_pet_window_backchannel_audio_uses_prepared_tts() -> None:
+    from app.backchannel.models import (
+        BackchannelManifest,
+        BackchannelTemplate,
+        BackchannelVariant,
+    )
+    from app.backchannel.resolver import BackchannelChoice
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.prepared: list[tuple[str, str | None]] = []
+            self.spoken: list[tuple[str, str | None]] = []
+
+        def prepare(self, text: str, tone: str | None = None) -> TTSPreparedAudio:
+            self.prepared.append((text, tone))
+            return TTSPreparedAudio(text=text, tone=tone, audio_path=Path("ready.wav"))
+
+        def speak_prepared(
+            self,
+            handle: TTSPreparedAudio,
+            on_started=None,  # type: ignore[no-untyped-def]
+            on_finished=None,  # type: ignore[no-untyped-def]
+        ) -> None:
+            self.spoken.append((handle.text, handle.tone))
+            if on_started is not None:
+                on_started()
+            _ = on_finished
+
+        def discard_prepared(self, _handle: TTSPreparedAudio) -> None:
+            pass
+
+    class PortraitControllerStub:
+        def __init__(self) -> None:
+            self.segments: list[ChatSegment] = []
+
+        def apply_for_segment(self, segment: ChatSegment) -> None:
+            self.segments.append(segment)
+
+    class SubtitleControllerStub:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def set_speech(self, text: str, *, pulse: bool = False) -> None:
+            self.texts.append(text)
+            assert pulse is True
+
+    class WindowStub:
+        _display_backchannel = PetWindow._display_backchannel
+        _backchannel_tts_wanted = PetWindow._backchannel_tts_wanted
+        _backchannel_tts_active = PetWindow._backchannel_tts_active
+        _backchannel_audio_key = PetWindow._backchannel_audio_key
+        _prepare_backchannel_audio_cache = PetWindow._prepare_backchannel_audio_cache
+        _backchannel_variant_audio_available = PetWindow._backchannel_variant_audio_available
+        _resolve_backchannel_audio_path = PetWindow._resolve_backchannel_audio_path
+        _play_backchannel_audio = PetWindow._play_backchannel_audio
+        _request_backchannel_audio_playback = PetWindow._request_backchannel_audio_playback
+        _handle_backchannel_audio_finished = PetWindow._handle_backchannel_audio_finished
+        _discard_active_backchannel_audio = PetWindow._discard_active_backchannel_audio
+
+        def __init__(self) -> None:
+            self.backchannel_settings = BackchannelSettings(enabled=True, tts_enabled=True)
+            self.tts_provider = ProviderStub()
+            self._backchannel_prepared_audio = {}
+            self._active_backchannel_audio = None
+            self.subtitle_language = "zh"
+            self.portrait_controller = PortraitControllerStub()
+            self.subtitle_controller = SubtitleControllerStub()
+            self.logged: list[tuple[str, dict[str, object] | None]] = []
+            template = BackchannelTemplate(
+                id="greeting",
+                tone="中性",
+                portrait="高兴满足",
+                variants=(BackchannelVariant(ja="……おかえり。", zh="……欢迎回来。"),),
+                intent="greeting_return",
+                emotion="neutral",
+            )
+            self.backchannel_manifest = BackchannelManifest(templates=(template,))
+            self.choice = BackchannelChoice(template, template.variants[0])
+
+        def _log_interaction_stage(
+            self,
+            stage: str,
+            payload: dict[str, object] | None = None,
+        ) -> None:
+            self.logged.append((stage, payload))
+
+    window = WindowStub()
+    window._prepare_backchannel_audio_cache()
+    window._display_backchannel(window.choice)
+
+    assert window.tts_provider.prepared == [("……おかえり。", "中性")]
+    assert window.tts_provider.spoken == [("……おかえり。", "中性")]
+    assert window.subtitle_controller.texts == ["……欢迎回来。"]
+    assert ("backchannel_tts_requested", {"template": "greeting", "tone": "中性"}) in window.logged
+
+    # 接话音频播完不立即补合成:对话中补合成会抢占回复分段的串行合成队列,
+    # 统一推迟到 reply_completed 空闲时机。
+    played_handle = window._active_backchannel_audio
+    prepared_before = list(window.tts_provider.prepared)
+    window._handle_backchannel_audio_finished(played_handle)
+    assert window.tts_provider.prepared == prepared_before
+    assert window._active_backchannel_audio is None
+
+
+def test_pet_window_backchannel_audio_uses_manifest_audio_copy(tmp_path: Path) -> None:
+    from app.backchannel.models import (
+        BackchannelManifest,
+        BackchannelTemplate,
+        BackchannelVariant,
+    )
+    from app.backchannel.resolver import BackchannelChoice
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    source_audio = tmp_path / "line.wav"
+    source_audio.write_bytes(b"RIFFbackchannel")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.prepared: list[tuple[str, str | None]] = []
+            self.spoken: list[TTSPreparedAudio] = []
+
+        def prepare(self, text: str, tone: str | None = None) -> TTSPreparedAudio:
+            self.prepared.append((text, tone))
+            return TTSPreparedAudio(text=text, tone=tone)
+
+        def speak_prepared(
+            self,
+            handle: TTSPreparedAudio,
+            on_started=None,  # type: ignore[no-untyped-def]
+            on_finished=None,  # type: ignore[no-untyped-def]
+        ) -> None:
+            self.spoken.append(handle)
+            if on_finished is not None:
+                on_finished()
+
+    class WindowStub:
+        _backchannel_tts_wanted = PetWindow._backchannel_tts_wanted
+        _resolve_backchannel_audio_path = PetWindow._resolve_backchannel_audio_path
+        _copy_backchannel_audio_for_playback = PetWindow._copy_backchannel_audio_for_playback
+        _play_backchannel_audio = PetWindow._play_backchannel_audio
+        _request_backchannel_audio_playback = PetWindow._request_backchannel_audio_playback
+        _handle_backchannel_audio_finished = PetWindow._handle_backchannel_audio_finished
+
+        def __init__(self) -> None:
+            self.backchannel_settings = BackchannelSettings(enabled=True, tts_enabled=True)
+            self.tts_provider = ProviderStub()
+            self._active_backchannel_audio = None
+            self._backchannel_prepared_audio = {}
+            template = BackchannelTemplate(
+                id="greeting",
+                tone="中性",
+                portrait="高兴满足",
+                variants=(
+                    BackchannelVariant(
+                        ja="……おかえり。",
+                        zh="……欢迎回来。",
+                        audio="line.wav",
+                    ),
+                ),
+                intent="greeting_return",
+                emotion="neutral",
+            )
+            self.backchannel_manifest = BackchannelManifest(
+                templates=(template,),
+                source_path=manifest_path,
+            )
+            self.choice = BackchannelChoice(template, template.variants[0])
+            self.logged: list[tuple[str, dict[str, object] | None]] = []
+
+        def _log_interaction_stage(
+            self,
+            stage: str,
+            payload: dict[str, object] | None = None,
+        ) -> None:
+            self.logged.append((stage, payload))
+
+    window = WindowStub()
+    window._play_backchannel_audio(window.choice)
+
+    assert window.tts_provider.prepared == []
+    assert len(window.tts_provider.spoken) == 1
+    played = window.tts_provider.spoken[0]
+    assert played.audio_path is not None
+    assert played.audio_path != source_audio
+    assert played.audio_path.read_bytes() == source_audio.read_bytes()
+    assert ("backchannel_tts_requested", {"template": "greeting", "tone": "中性"}) in window.logged
+
+
+def test_pet_window_backchannel_unready_audio_plays_subtitle_only() -> None:
+    """缓存里音频未合成完(audio_path=None)时只显示字幕,不在对话中触发补合成,
+    且未就绪句柄留在缓存中等待合成完成。"""
+    from app.backchannel.models import (
+        BackchannelManifest,
+        BackchannelTemplate,
+        BackchannelVariant,
+    )
+    from app.backchannel.resolver import BackchannelChoice
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.prepared: list[str] = []
+            self.spoken: list[str] = []
+
+        def prepare(self, text: str, tone: str | None = None) -> TTSPreparedAudio:
+            self.prepared.append(text)
+            return TTSPreparedAudio(text=text, tone=tone)
+
+        def speak_prepared(self, handle, on_started=None, on_finished=None):  # type: ignore[no-untyped-def]
+            self.spoken.append(handle.text)
+
+    class WindowStub:
+        _backchannel_tts_wanted = PetWindow._backchannel_tts_wanted
+        _backchannel_tts_active = PetWindow._backchannel_tts_active
+        _backchannel_audio_key = PetWindow._backchannel_audio_key
+        _resolve_backchannel_audio_path = PetWindow._resolve_backchannel_audio_path
+        _play_backchannel_audio = PetWindow._play_backchannel_audio
+        _request_backchannel_audio_playback = PetWindow._request_backchannel_audio_playback
+
+        def __init__(self) -> None:
+            self.backchannel_settings = BackchannelSettings(enabled=True, tts_enabled=True)
+            self.tts_provider = ProviderStub()
+            template = BackchannelTemplate(
+                id="greeting",
+                tone="中性",
+                portrait="高兴满足",
+                variants=(BackchannelVariant(ja="……おかえり。", zh="……欢迎回来。"),),
+                intent="greeting_return",
+                emotion="neutral",
+            )
+            self.choice = BackchannelChoice(template, template.variants[0])
+            # 合成尚未完成的句柄(audio_path 为 None)
+            unready = TTSPreparedAudio(text="……おかえり。", tone="中性")
+            self._backchannel_prepared_audio = {
+                ("greeting", "中性", "……おかえり。"): unready
+            }
+
+    window = WindowStub()
+    window._play_backchannel_audio(window.choice)
+
+    assert window.tts_provider.spoken == []      # 未就绪不播
+    assert window.tts_provider.prepared == []    # 对话中不补合成
+    assert len(window._backchannel_prepared_audio) == 1  # 句柄留在缓存继续等合成
+
+
+def test_pet_window_reply_arrival_discards_unready_backchannel_prepares() -> None:
+    """正式回复开始时,未合成完的接话请求让位(discard),已就绪音频保留。"""
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.discarded: list[str] = []
+
+        def discard_prepared(self, handle: TTSPreparedAudio) -> None:
+            self.discarded.append(handle.text)
+
+    class ControllerStub:
+        def cancel(self) -> None:
+            pass
+
+    class WindowStub:
+        _cancel_backchannel = PetWindow._cancel_backchannel
+        _discard_unready_backchannel_audio = PetWindow._discard_unready_backchannel_audio
+        _discard_active_backchannel_audio = PetWindow._discard_active_backchannel_audio
+
+        def __init__(self) -> None:
+            self.tts_provider = ProviderStub()
+            self.backchannel_controller = ControllerStub()
+            self._active_backchannel_audio = None
+            ready = TTSPreparedAudio(text="ready", tone="中性", audio_path=Path("ok.wav"))
+            unready = TTSPreparedAudio(text="unready", tone="中性")
+            failed = TTSPreparedAudio(text="failed", tone="中性")
+            failed.failed = True
+            self._backchannel_prepared_audio = {
+                ("a", "中性", "ready"): ready,
+                ("b", "中性", "unready"): unready,
+                ("c", "中性", "failed"): failed,
+            }
+
+    window = WindowStub()
+    window._cancel_backchannel()
+
+    assert sorted(window.tts_provider.discarded) == ["failed", "unready"]
+    remaining = list(window._backchannel_prepared_audio.values())
+    assert len(remaining) == 1 and remaining[0].text == "ready"
+
+
+def test_pet_window_show_reply_segments_discards_backchannel_before_play() -> None:
+    """回复分段进入串行 TTS 队列前,未就绪的接话 prepare 必须先让位。
+
+    否则回复音频会排在一整队接话 prepare 之后,on_started 迟迟不触发,
+    等待动效停不下来(回复卡在"等待中"),被让位的接话还会反复重排合成。
+    """
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ProviderStub:
+        def __init__(self) -> None:
+            self.discarded: list[str] = []
+
+        def discard_prepared(self, handle: TTSPreparedAudio) -> None:
+            self.discarded.append(handle.text)
+
+    class ControllerStub:
+        def __init__(self) -> None:
+            self.cancelled = 0
+
+        def cancel(self) -> None:
+            self.cancelled += 1
+
+    class SubtitleStub:
+        def __init__(self, provider: ProviderStub) -> None:
+            self._provider = provider
+            self.shown: list[list[ChatSegment]] = []
+            # 记录 show_segments 触发那一刻"已被丢弃的接话",用于验证让位发生在排队之前
+            self.discarded_before_show: list[str] | None = None
+
+        def show_segments(self, segments: list[ChatSegment]) -> None:
+            self.discarded_before_show = list(self._provider.discarded)
+            self.shown.append(segments)
+
+    class WindowStub:
+        _show_reply_segments = PetWindow._show_reply_segments
+        _cancel_backchannel = PetWindow._cancel_backchannel
+        _discard_unready_backchannel_audio = PetWindow._discard_unready_backchannel_audio
+        _discard_active_backchannel_audio = PetWindow._discard_active_backchannel_audio
+
+        def __init__(self) -> None:
+            self.tts_provider = ProviderStub()
+            self.backchannel_controller = ControllerStub()
+            self.subtitle_controller = SubtitleStub(self.tts_provider)
+            self._active_backchannel_audio = None
+            unready = TTSPreparedAudio(text="つなぎ", tone="中性")
+            self._backchannel_prepared_audio = {("b", "中性", "つなぎ"): unready}
+            self._exit_reply_history_review = lambda update_buttons=False: None
+            self._remember_reply_history_segments = lambda segments: None
+
+    window = WindowStub()
+    segment = ChatSegment("本題だよ。", "中性", "正题来了。", "站立待机")
+    window._show_reply_segments([segment])
+
+    # 接话控制器已取消、未就绪 prepare 已丢弃,且二者都发生在 show_segments 之前
+    assert window.backchannel_controller.cancelled == 1
+    assert window.tts_provider.discarded == ["つなぎ"]
+    assert window.subtitle_controller.discarded_before_show == ["つなぎ"]
+    assert window.subtitle_controller.shown == [[segment]]
+
+
+def test_pet_window_backchannel_audio_waits_for_tts_service_ready() -> None:
+    """服务未就绪时预生成被门控跳过,预热成功回调后补做(避免首批 HTTP 静默失败)。"""
+    from app.backchannel.models import (
+        BackchannelManifest,
+        BackchannelTemplate,
+        BackchannelVariant,
+    )
+    from app.ui.pet_window import PetWindow
+    from app.voice.tts import TTSPreparedAudio
+
+    class ColdProviderStub:
+        def __init__(self) -> None:
+            self.service_ready = False
+            self.prepared: list[tuple[str, str | None]] = []
+
+        def prepare(self, text: str, tone: str | None = None) -> TTSPreparedAudio:
+            self.prepared.append((text, tone))
+            return TTSPreparedAudio(text=text, tone=tone, audio_path=Path("ready.wav"))
+
+    class WindowStub:
+        _apply_backchannel_settings = PetWindow._apply_backchannel_settings
+        _backchannel_tts_wanted = PetWindow._backchannel_tts_wanted
+        _backchannel_tts_active = PetWindow._backchannel_tts_active
+        _prepare_backchannel_audio_cache = PetWindow._prepare_backchannel_audio_cache
+        _backchannel_variant_audio_available = PetWindow._backchannel_variant_audio_available
+        _resolve_backchannel_audio_path = PetWindow._resolve_backchannel_audio_path
+        _handle_tts_ready_warmup_succeeded = PetWindow._handle_tts_ready_warmup_succeeded
+
+        def __init__(self) -> None:
+            self.backchannel_settings = BackchannelSettings(enabled=True, tts_enabled=True)
+            self.tts_provider = ColdProviderStub()
+            self._backchannel_prepared_audio: dict = {}
+            self.discarded = 0
+            template = BackchannelTemplate(
+                id="greeting",
+                tone="中性",
+                portrait="高兴满足",
+                variants=(BackchannelVariant(ja="……おかえり。", zh="……欢迎回来。"),),
+                intent="greeting_return",
+                emotion="neutral",
+            )
+            self.backchannel_manifest = BackchannelManifest(templates=(template,))
+
+        def _discard_backchannel_audio_cache(self) -> None:
+            self.discarded += 1
+
+    window = WindowStub()
+    # 服务冷启动中:应用设置不触发任何 prepare,也不丢弃缓存(配置仍然需要语音)。
+    # stub 未提供 _warm_up_tts_playback/_start_tts_ready_warmup:
+    # 调用不抛错即证明 _apply_backchannel_settings 不再重复预热(由调用方负责)。
+    window._apply_backchannel_settings(window.backchannel_settings)
+    assert window.tts_provider.prepared == []
+    assert window.discarded == 0
+
+    # 预热成功 → 回调补做首批合成。
+    window.tts_provider.service_ready = True
+    window._handle_tts_ready_warmup_succeeded("TTS 服务已就绪。")
+    assert window.tts_provider.prepared == [("……おかえり。", "中性")]
+
+
+def test_settings_dialog_backchannel_tts_follows_global_tts_toggle() -> None:
+    """接话语音复选框须与全局 TTS 总开关联动,避免"设置了但不生效"。"""
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("backchannel_tts_linkage_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        backchannel_settings=BackchannelSettings(enabled=True, tts_enabled=False),
+    )
+
+    dialog.tts_enabled_check.setChecked(True)
+    assert dialog.backchannel_tts_enabled_check.isEnabled()
+
+    # 关闭全局 TTS → 接话语音复选框禁用;重新开启 → 恢复。
+    dialog.tts_enabled_check.setChecked(False)
+    assert not dialog.backchannel_tts_enabled_check.isEnabled()
+    dialog.tts_enabled_check.setChecked(True)
+    assert dialog.backchannel_tts_enabled_check.isEnabled()
+
+    # 接话层总开关关闭时,无论全局 TTS 如何都禁用。
+    dialog.backchannel_enabled_check.setChecked(False)
+    assert not dialog.backchannel_tts_enabled_check.isEnabled()
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_adds_plugin_settings_panel() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QLabel", "QListWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
+    from app.plugins.models import SettingsPanelContribution
     from app.ui.settings_dialog import SettingsDialog
-    from sdk.types import SettingsPanelContribution
 
     QApplication = qtwidgets.QApplication
     QLabel = qtwidgets.QLabel
@@ -1672,20 +2974,23 @@ def test_settings_dialog_adds_plugin_settings_panel() -> None:
     nav = dialog.findChild(QListWidget, "settingsNavList")
     assert nav is not None
     assert "插件" in [nav.item(index).text() for index in range(nav.count())]
+    # 设置面板改为按需在独立对话框中构建，这里构建对话框验证贡献已接入。
+    panel_dialog = dialog._build_plugin_settings_dialog("")
+    assert panel_dialog is not None
     assert any(
         isinstance(label, QLabel) and label.text() == "插件设置"
-        for label in dialog.findChildren(QLabel)
+        for label in panel_dialog.findChildren(QLabel)
     )
+    panel_dialog.deleteLater()
 
     dialog.deleteLater()
     app.processEvents()
 
 
 def test_settings_dialog_manages_plugin_enabled_state() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QCheckBox")):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QCheckBox", "QLabel", "QSplitter")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.plugins.discovery import PluginDiscovery
@@ -1694,6 +2999,8 @@ def test_settings_dialog_manages_plugin_enabled_state() -> None:
     QApplication = qtwidgets.QApplication
     QTableWidget = qtwidgets.QTableWidget
     QCheckBox = qtwidgets.QCheckBox
+    QLabel = qtwidgets.QLabel
+    QSplitter = qtwidgets.QSplitter
     Qt = qtcore.Qt
     app = QApplication.instance() or QApplication([])
     root = _ui_runtime_root("plugin_manager_dialog")
@@ -1709,6 +3016,8 @@ version: 1.0.0
 entry: plugin:DemoPlugin
 enabled: true
 priority: 10
+permissions:
+  - settings_panel
 """.strip(),
         encoding="utf-8",
     )
@@ -1727,10 +3036,15 @@ priority: 10
     )
 
     table = dialog.findChild(QTableWidget, "pluginManagerTable")
+    splitter = dialog.findChild(QSplitter, "pluginManagerSplitter")
+    description_label = dialog.findChild(QLabel, "pluginDetailDescriptionLabel")
     assert table is not None
+    assert splitter is not None
+    assert description_label is not None
     assert table.rowCount() == 1
+    assert table.columnCount() == 2
     assert table.item(0, 1).text() == "Demo 插件"
-    assert table.item(0, 5).text() == "用于测试插件管理页。"
+    assert description_label.text() == "用于测试插件管理页。"
 
     checkbox = table.cellWidget(0, 0).findChild(QCheckBox)
     assert checkbox is not None
@@ -1745,8 +3059,233 @@ priority: 10
     app.processEvents()
 
 
+def test_settings_dialog_plugin_detail_switches_settings_panel() -> None:
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QLabel", "QPushButton")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.plugins.models import SettingsPanelContribution
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    QTableWidget = qtwidgets.QTableWidget
+    QLabel = qtwidgets.QLabel
+    QPushButton = qtwidgets.QPushButton
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("plugin_detail_switch")
+    _write_settings_plugin_manifest(
+        root,
+        "demo_a",
+        name="Demo A",
+        description="A 插件介绍",
+        priority=20,
+    )
+    _write_settings_plugin_manifest(
+        root,
+        "demo_b",
+        name="Demo B",
+        description="B 插件介绍",
+        priority=10,
+    )
+
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        settings_panel_contributions=[
+            SettingsPanelContribution(
+                section_id="demo_b_settings",
+                title="Demo B 设置",
+                build=lambda parent=None: QLabel("B 设置内容", parent),
+                plugin_id="demo_b",
+            )
+        ],
+    )
+
+    table = dialog.findChild(QTableWidget, "pluginManagerTable")
+    title_label = dialog.findChild(QLabel, "pluginDetailTitleLabel")
+    settings_button = dialog.findChild(QPushButton, "pluginOpenSettingsButton")
+    description_label = dialog.findChild(QLabel, "pluginDetailDescriptionLabel")
+    assert table is not None
+    assert title_label is not None
+    assert settings_button is not None
+    assert description_label is not None
+    assert table.rowCount() == 2
+    assert title_label.text() == "Demo A"
+    # Demo A 没有设置贡献：按钮禁用
+    assert settings_button.isEnabled() is False
+
+    table.setCurrentCell(1, 1)
+    app.processEvents()
+
+    assert title_label.text() == "Demo B"
+    assert description_label.text() == "B 插件介绍"
+    # Demo B 有设置贡献：按钮启用，打开对话框可见其设置内容
+    assert settings_button.isEnabled() is True
+    panel_dialog = dialog._build_plugin_settings_dialog("demo_b")
+    assert panel_dialog is not None
+    assert any(
+        isinstance(label, QLabel) and label.text() == "B 设置内容"
+        for label in panel_dialog.findChildren(QLabel)
+    )
+    panel_dialog.deleteLater()
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_plugin_detail_shows_disabled_restart_hint() -> None:
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QCheckBox", "QLabel", "QPushButton")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    QTableWidget = qtwidgets.QTableWidget
+    QCheckBox = qtwidgets.QCheckBox
+    QLabel = qtwidgets.QLabel
+    QPushButton = qtwidgets.QPushButton
+    Qt = qtcore.Qt
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("plugin_detail_disabled")
+    _write_settings_plugin_manifest(root, "demo", name="Demo 插件", enabled=False)
+
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+
+    table = dialog.findChild(QTableWidget, "pluginManagerTable")
+    settings_button = dialog.findChild(QPushButton, "pluginOpenSettingsButton")
+    meta_label = dialog.findChild(QLabel, "pluginDetailMetaLabel")
+    assert table is not None
+    assert settings_button is not None
+    assert meta_label is not None
+    # 未启用插件：设置按钮禁用，提示说明需启用并重启
+    assert settings_button.isEnabled() is False
+    assert "未启用" in settings_button.toolTip()
+
+    checkbox = table.cellWidget(0, 0).findChild(QCheckBox)
+    assert checkbox is not None
+    checkbox.setCheckState(Qt.CheckState.Checked)
+    app.processEvents()
+
+    assert "保存并重启" in meta_label.text()
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_plugin_settings_build_failure_has_placeholder() -> None:
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QLabel")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.plugins.models import SettingsPanelContribution
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    QLabel = qtwidgets.QLabel
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("plugin_detail_build_failure")
+    _write_settings_plugin_manifest(root, "demo", name="Demo 插件")
+
+    def build_failure(_parent=None):  # type: ignore[no-untyped-def]
+        raise RuntimeError("boom")
+
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        settings_panel_contributions=[
+            SettingsPanelContribution(
+                section_id="demo_settings",
+                title="Demo 设置",
+                build=build_failure,
+                plugin_id="demo",
+            )
+        ],
+    )
+
+    # 设置面板按需在对话框中构建，构建失败降级为占位提示标签。
+    panel_dialog = dialog._build_plugin_settings_dialog("demo")
+    assert panel_dialog is not None
+    assert any(
+        isinstance(label, QLabel) and label.text() == "Demo 设置 设置加载失败：boom"
+        for label in panel_dialog.findChildren(QLabel)
+    )
+    panel_dialog.deleteLater()
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_plugin_page_empty_state() -> None:
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QTableWidget", "QLabel", "QPushButton")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    QTableWidget = qtwidgets.QTableWidget
+    QLabel = qtwidgets.QLabel
+    QPushButton = qtwidgets.QPushButton
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("plugin_detail_empty")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+
+    table = dialog.findChild(QTableWidget, "pluginManagerTable")
+    title_label = dialog.findChild(QLabel, "pluginDetailTitleLabel")
+    settings_button = dialog.findChild(QPushButton, "pluginOpenSettingsButton")
+    assert table is not None
+    assert title_label is not None
+    assert settings_button is not None
+    assert table.rowCount() == 0
+    assert title_label.text() == "暂无插件"
+    # 无可管理插件：设置按钮禁用
+    assert settings_button.isEnabled() is False
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not all(
         hasattr(qtwidgets, name)
@@ -1830,6 +3369,70 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     app.processEvents()
 
 
+def test_settings_dialog_defers_memory_load_until_memory_tab_selected(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QListWidget")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    QListWidget = qtwidgets.QListWidget
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("settings_memory_lazy_load")
+    load_calls: list[str] = []
+    monkeypatch.setattr(
+        SettingsDialog,
+        "_load_memory_entries",
+        lambda self: load_calls.append("load"),
+    )
+
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        memory_store=object(),  # type: ignore[arg-type]
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+    app.processEvents()
+
+    nav = dialog.findChild(QListWidget, "settingsNavList")
+    assert nav is not None
+    titles = [nav.item(index).text() for index in range(nav.count())]
+    memory_row = titles.index("记忆")
+    assert load_calls == []
+
+    nav.setCurrentRow(memory_row)
+    app.processEvents()
+    assert load_calls == ["load"]
+
+    nav.setCurrentRow(0)
+    nav.setCurrentRow(memory_row)
+    app.processEvents()
+    assert load_calls == ["load"]
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def _open_settings_memory_tab(dialog, qtwidgets, app=None) -> None:  # type: ignore[no-untyped-def]
+    QListWidget = getattr(qtwidgets, "QListWidget", None)
+    if QListWidget is None:
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+    nav = dialog.findChild(QListWidget, "settingsNavList")
+    assert nav is not None
+    memory_row = [nav.item(index).text() for index in range(nav.count())].index("记忆")
+    nav.setCurrentRow(memory_row)
+    if app is not None:
+        app.processEvents()
+
+
 def test_settings_dialog_groupbox_title_indicator_has_vertical_room() -> None:
     from app.ui.theme import DEFAULT_THEME_SETTINGS, build_settings_dialog_stylesheet
 
@@ -1842,7 +3445,6 @@ def test_settings_dialog_groupbox_title_indicator_has_vertical_room() -> None:
 
 
 def test_settings_dialog_insets_advanced_params_group() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QGroupBox")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -1882,13 +3484,12 @@ def test_settings_dialog_insets_advanced_params_group() -> None:
 
 
 def test_pet_window_syncs_plugin_chat_ui_widgets() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QFrame", "QHBoxLayout", "QLineEdit", "QPushButton")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
+    from app.plugins.models import ChatUIWidgetContribution
     from app.ui.pet_window import PetWindow
-    from sdk.types import ChatUIWidgetContribution
 
     QApplication = qtwidgets.QApplication
     QFrame = qtwidgets.QFrame
@@ -1932,7 +3533,6 @@ def test_pet_window_syncs_plugin_chat_ui_widgets() -> None:
 
 
 def test_settings_dialog_exposes_experimental_windows_mcp_restart_setting() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -1972,8 +3572,54 @@ def test_settings_dialog_exposes_experimental_windows_mcp_restart_setting() -> N
     app.processEvents()
 
 
-def test_settings_dialog_exposes_tts_bundle_controls(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_settings_dialog_saves_runtime_loop_settings() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("runtime_loop_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        runtime_loop_settings=RuntimeLoopSettings(
+            max_agent_steps_per_turn=5,
+            max_tool_calls_per_step=4,
+            max_tool_calls_per_turn=9,
+        ),
+    )
+
+    assert dialog.agent_steps_per_turn_spin.value() == 5
+    assert dialog.tool_calls_per_step_spin.value() == 4
+    assert dialog.tool_calls_per_turn_spin.value() == 9
+
+    dialog.agent_steps_per_turn_spin.setValue(6)
+    dialog.tool_calls_per_step_spin.setValue(5)
+    dialog.tool_calls_per_turn_spin.setValue(11)
+    dialog.accept()
+
+    assert dialog.result_runtime_loop_settings == RuntimeLoopSettings(
+        max_agent_steps_per_turn=6,
+        max_tool_calls_per_step=5,
+        max_tool_calls_per_turn=11,
+    )
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_exposes_tts_bundle_controls(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2054,7 +3700,6 @@ def test_settings_dialog_exposes_tts_bundle_controls(monkeypatch) -> None:  # ty
 
 
 def test_settings_dialog_download_success_fills_tts_work_dir(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2109,7 +3754,6 @@ def test_settings_dialog_download_success_fills_tts_work_dir(monkeypatch) -> Non
 
 
 def test_settings_dialog_download_success_fills_genie_provider(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2168,7 +3812,6 @@ def test_settings_dialog_download_success_fills_genie_provider(monkeypatch) -> N
 
 
 def test_settings_dialog_download_success_fills_macos_gptsovits_paths(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2249,7 +3892,6 @@ def test_settings_dialog_download_success_fills_macos_gptsovits_paths(monkeypatc
 
 
 def test_settings_dialog_skips_tts_test_when_tts_disabled(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2286,7 +3928,6 @@ def test_settings_dialog_skips_tts_test_when_tts_disabled(monkeypatch) -> None: 
 
 
 def test_settings_dialog_enabled_tts_skips_test_when_settings_unchanged(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2342,7 +3983,6 @@ def test_settings_dialog_enabled_tts_skips_test_when_settings_unchanged(monkeypa
 
 
 def test_settings_dialog_enabled_tts_tests_when_provider_changes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2385,7 +4025,6 @@ def test_settings_dialog_enabled_tts_tests_when_provider_changes(monkeypatch) ->
 
 
 def test_settings_dialog_enabled_tts_tests_when_character_changes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2434,7 +4073,6 @@ def test_settings_dialog_enabled_tts_tests_when_character_changes(monkeypatch) -
 
 
 def test_settings_dialog_disables_tts_when_selected_character_has_no_voice(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2485,7 +4123,6 @@ def test_settings_dialog_disables_tts_when_selected_character_has_no_voice(monke
 
 
 def test_settings_dialog_tts_test_failure_keeps_enabled_settings(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2536,7 +4173,8 @@ def test_settings_dialog_tts_test_failure_keeps_enabled_settings(monkeypatch) ->
     dialog.accept()
 
     assert warnings and "服务启动失败" in warnings[0]
-    assert "TTS 设置已保留" in warnings[0]
+    assert "TTS 设置会保留" in warnings[0]
+    assert "诊断信息（截图时请保留）" in warnings[0]
     assert dialog.tts_enabled_check.isChecked()
     assert dialog.result_tts_settings is not None
     assert dialog.result_tts_settings.enabled
@@ -2547,7 +4185,6 @@ def test_settings_dialog_tts_test_failure_keeps_enabled_settings(monkeypatch) ->
 
 
 def test_settings_dialog_skips_api_test_when_api_unchanged(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2585,7 +4222,6 @@ def test_settings_dialog_skips_api_test_when_api_unchanged(monkeypatch) -> None:
 
 
 def test_settings_dialog_tests_api_when_api_changes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2627,7 +4263,6 @@ def test_settings_dialog_tests_api_when_api_changes(monkeypatch) -> None:  # typ
 
 
 def test_settings_dialog_model_combo_saves_manual_input(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2645,7 +4280,6 @@ def test_settings_dialog_model_combo_saves_manual_input(monkeypatch) -> None:  #
 
 
 def test_settings_dialog_model_probe_populates_candidates_and_selects_first(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2671,7 +4305,6 @@ def test_settings_dialog_model_probe_populates_candidates_and_selects_first(monk
 
 
 def test_settings_dialog_model_popups_follow_current_theme_stylesheet() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2719,7 +4352,6 @@ def test_settings_dialog_model_popups_follow_current_theme_stylesheet() -> None:
 
 
 def test_settings_dialog_model_probe_keeps_current_input(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2738,7 +4370,6 @@ def test_settings_dialog_model_probe_keeps_current_input(monkeypatch) -> None:  
 
 
 def test_settings_dialog_model_probe_failure_keeps_current_model(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2755,7 +4386,9 @@ def test_settings_dialog_model_probe_failure_keeps_current_model(monkeypatch) ->
 
     dialog._handle_api_model_probe_failed("无法连接")
 
-    assert warnings == ["无法连接"]
+    assert len(warnings) == 1
+    assert "处理建议" in warnings[0]
+    assert "诊断信息（截图时请保留）：\n无法连接" in warnings[0]
     assert dialog.model_edit.currentText() == "current-model"
     assert dialog.result_api_settings is None
     dialog.deleteLater()
@@ -2763,7 +4396,6 @@ def test_settings_dialog_model_probe_failure_keeps_current_model(monkeypatch) ->
 
 
 def test_settings_dialog_model_probe_busy_state_disables_actions() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2791,7 +4423,6 @@ def test_settings_dialog_model_probe_busy_state_disables_actions() -> None:
 
 
 def test_settings_dialog_api_test_failure_blocks_save(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2838,7 +4469,6 @@ def test_settings_dialog_api_test_failure_blocks_save(monkeypatch) -> None:  # t
 
 
 def test_settings_dialog_api_success_continues_to_tts_test(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2894,7 +4524,6 @@ def test_settings_dialog_api_success_continues_to_tts_test(monkeypatch) -> None:
 
 
 def test_settings_dialog_blocks_save_while_tts_test_is_running(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2935,7 +4564,6 @@ def test_settings_dialog_blocks_save_while_tts_test_is_running(monkeypatch) -> N
 
 
 def test_settings_dialog_import_character_archive_refreshes_combo(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -2992,7 +4620,6 @@ def test_settings_dialog_import_character_archive_refreshes_combo(monkeypatch) -
 
 
 def test_settings_dialog_import_voice_less_character_archive_disables_tts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -3061,6 +4688,7 @@ def test_pet_window_retires_tts_provider_by_closing_it() -> None:
 
     class MinimalWindow:
         _retire_tts_provider = PetWindow._retire_tts_provider
+        _close_retired_tts_provider = PetWindow._close_retired_tts_provider
 
     window = MinimalWindow()
     window.retired_tts_providers = []
@@ -3086,6 +4714,7 @@ def test_pet_window_retires_tts_provider_without_stopping_kept_service() -> None
 
     class MinimalWindow:
         _retire_tts_provider = PetWindow._retire_tts_provider
+        _close_retired_tts_provider = PetWindow._close_retired_tts_provider
 
     window = MinimalWindow()
     window.retired_tts_providers = []
@@ -3095,6 +4724,78 @@ def test_pet_window_retires_tts_provider_without_stopping_kept_service() -> None
 
     assert calls == ["detach", "close"]
     assert window.retired_tts_providers == [provider]
+
+
+def test_pet_window_defers_closing_provider_with_inflight_warmup() -> None:
+    # 防御「保存设置闪退」根因:退休的 provider 正被后台预热线程探测时,不能立即 close()
+    # (主线程 close 与预热 ensure_ready 并发拆解服务进程会原生崩溃),应推迟到预热结束。
+    from app.ui.pet_window import PetWindow
+
+    calls: list[str] = []
+
+    class ProviderStub:
+        def close(self) -> None:
+            calls.append("close")
+
+    class MinimalWindow:
+        _retire_tts_provider = PetWindow._retire_tts_provider
+        _close_retired_tts_provider = PetWindow._close_retired_tts_provider
+        _cleanup_tts_ready_warmup_worker = PetWindow._cleanup_tts_ready_warmup_worker
+
+    window = MinimalWindow()
+    window.retired_tts_providers = []
+    window._tts_pending_provider_closes = []
+    provider = ProviderStub()
+    # 模拟该 provider 正有一个在途预热线程。
+    window.tts_ready_warmup_thread = object()
+    window.tts_ready_warmup_worker = object()
+    window._tts_warmup_provider = provider
+
+    window._retire_tts_provider(provider)
+
+    # 预热在途:暂不 close,仅登记引用与待关闭项。
+    assert calls == []
+    assert window.retired_tts_providers == [provider]
+    assert window._tts_pending_provider_closes == [(provider, False)]
+
+    # 预热线程结束 → cleanup 槽补关被推迟的 provider。
+    window._cleanup_tts_ready_warmup_worker()
+
+    assert calls == ["close"]
+    assert window._tts_warmup_provider is None
+    assert window._tts_pending_provider_closes == []
+
+
+def test_pet_window_retires_other_provider_immediately_during_warmup() -> None:
+    # 预热线程绑定的是另一个 provider 时,退休当前 provider 不受影响,应立即 close。
+    from app.ui.pet_window import PetWindow
+
+    calls: list[str] = []
+
+    class ProviderStub:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            calls.append(f"close:{self.name}")
+
+    class MinimalWindow:
+        _retire_tts_provider = PetWindow._retire_tts_provider
+        _close_retired_tts_provider = PetWindow._close_retired_tts_provider
+
+    window = MinimalWindow()
+    window.retired_tts_providers = []
+    window._tts_pending_provider_closes = []
+    warming = ProviderStub("warming")
+    retiring = ProviderStub("retiring")
+    window.tts_ready_warmup_thread = object()
+    window._tts_warmup_provider = warming
+
+    window._retire_tts_provider(retiring)
+
+    assert calls == ["close:retiring"]
+    assert window._tts_pending_provider_closes == []
+    assert window.retired_tts_providers == [retiring]
 
 
 def test_tts_local_service_reuse_requires_same_runtime() -> None:
@@ -3122,6 +4823,35 @@ def test_tts_local_service_reuse_requires_same_runtime() -> None:
     )
 
 
+def test_tts_provider_rebuild_only_when_config_or_character_changed() -> None:
+    """配置与角色都未变时不重建 provider,避免在 TTS 探测期退休正被探测的 provider。"""
+    from app.ui.pet_window import _tts_provider_needs_rebuild
+
+    class ProviderStub:
+        def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
+            self.settings = settings
+
+    class OtherProviderStub:
+        def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
+            self.settings = settings
+
+    settings = replace(_minimal_tts_settings(), enabled=True)
+    old = ProviderStub(settings)
+
+    # 配置等价且角色未变:不重建。
+    assert not _tts_provider_needs_rebuild(old, ProviderStub(settings), character_changed=False)
+    # 角色变化:必须重建(新角色声线)。
+    assert _tts_provider_needs_rebuild(old, ProviderStub(settings), character_changed=True)
+    # TTS 配置变化:必须重建。
+    assert _tts_provider_needs_rebuild(
+        old,
+        ProviderStub(replace(settings, api_url="http://127.0.0.1:9881/tts")),
+        character_changed=False,
+    )
+    # provider 类型变化(如启停 TTS):必须重建。
+    assert _tts_provider_needs_rebuild(old, OtherProviderStub(settings), character_changed=False)
+
+
 def _process_events_until(app, predicate, timeout_ms: int = 1500):  # type: ignore[no-untyped-def]
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
@@ -3145,13 +4875,40 @@ def _ui_runtime_root(name: str) -> Path:
     return root
 
 
+def _write_settings_plugin_manifest(
+    root: Path,
+    plugin_id: str,
+    *,
+    name: str,
+    description: str = "用于测试插件管理页。",
+    enabled: bool = True,
+    priority: int = 10,
+) -> None:
+    plugin_dir = root / "plugins" / plugin_id
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        f"""
+api_version: 1
+id: {plugin_id}
+name: {name}
+description: {description}
+version: 1.0.0
+entry: plugin:DemoPlugin
+enabled: {str(enabled).lower()}
+priority: {priority}
+permissions:
+  - settings_panel
+""".strip(),
+        encoding="utf-8",
+    )
+
+
 def _write_fake_runtime_python(path: Path, content: str = "fake") -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
 
 
 def test_settings_dialog_allows_import_without_existing_character_registry(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -3213,7 +4970,6 @@ def test_settings_dialog_allows_import_without_existing_character_registry(monke
 
 
 def test_settings_dialog_imports_voice_archive_for_selected_character(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -3263,15 +5019,18 @@ def test_settings_dialog_imports_voice_archive_for_selected_character(monkeypatc
     assert imported.voice is not None
     assert imported.voice.gpt_model_path is not None
     assert imported.voice.gpt_model_path.read_bytes() == b"imported-gpt"
-    assert dialog.ref_lang_edit.text() == "zh"
-    assert dialog.text_lang_edit.text() == "zh"
+    assert imported.voice.ref_lang == "zh"
+    assert imported.voice.text_lang == "zh"
+    settings = dialog._validated_tts_settings(show_warnings=False, validate_enabled=False)
+    assert settings is not None
+    assert settings.ref_lang == "zh"
+    assert settings.text_lang == "zh"
 
     dialog.deleteLater()
     app.processEvents()
 
 
 def test_settings_dialog_export_button_uses_menu_actions(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
@@ -3358,12 +5117,12 @@ def test_settings_dialog_export_button_uses_menu_actions(monkeypatch) -> None:  
 
 
 def test_settings_dialog_exports_character_archive_in_background(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     import app.ui.settings_dialog as settings_dialog_module
+    import app.ui.settings.workers as settings_workers
     from app.config.character_loader import CharacterRegistry
     from app.ui.settings_dialog import SettingsDialog
 
@@ -3406,7 +5165,7 @@ def test_settings_dialog_exports_character_archive_in_background(monkeypatch) ->
         lambda *_args, **_kwargs: (str(output_path), ""),
     )
     monkeypatch.setattr(
-        settings_dialog_module,
+        settings_workers,
         "export_character_archive",
         fake_export_character_archive,
     )
@@ -3457,10 +5216,11 @@ def test_settings_dialog_formats_memory_time_as_local_timezone() -> None:
     assert _format_memory_time("2026-06-02T02:42:27+08:00") == expected
 
 
-def test_settings_dialog_loads_memory_on_open_in_background() -> None:
+def test_settings_dialog_loads_memory_after_memory_tab_selected_in_background() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not hasattr(qtwidgets, "QApplication"):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QListWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.ui.settings_dialog import SettingsDialog
@@ -3468,13 +5228,19 @@ def test_settings_dialog_loads_memory_on_open_in_background() -> None:
     class MemoryStoreStub:
         def __init__(self) -> None:
             self.list_calls = 0
+            self.last_limit: int | None = 20
 
-        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+        def list_memories(self, *, limit: int | None = 20):  # type: ignore[no-untyped-def]
             self.list_calls += 1
+            self.last_limit = limit
             return [
                 {
                     "id": "memory-001",
                     "content": "主人喜欢精简的管理界面",
+                    "category": "preference",
+                    "importance": 0.7,
+                    "confidence": 0.9,
+                    "source": "manual",
                     "updated_at": "2026-06-02T01:00:00Z",
                 }
             ]
@@ -3495,19 +5261,65 @@ def test_settings_dialog_loads_memory_on_open_in_background() -> None:
         memory_store=memory_store,  # type: ignore[arg-type]
     )
 
+    assert dialog.memory_status_label.text() == "打开记忆页时读取长期记忆。"
+    assert memory_store.list_calls == 0
+    nav = dialog.findChild(qtwidgets.QListWidget, "settingsNavList")
+    assert nav is not None
+    memory_row = [nav.item(index).text() for index in range(nav.count())].index("记忆")
+    nav.setCurrentRow(memory_row)
+
     assert dialog.memory_status_label.text() == "正在读取长期记忆..."
     assert _process_events_until(app, lambda: memory_store.list_calls == 1)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
     assert dialog.memory_status_label.text() == "已加载 1 条记忆"
+    assert memory_store.last_limit is None
+    assert dialog.memory_table.columnCount() == 4
+    assert [
+        dialog.memory_table.horizontalHeaderItem(column).text()
+        for column in range(dialog.memory_table.columnCount())
+    ] == ["", "内容", "层级", "更新时间"]
     assert dialog.memory_table.item(0, 1).text() == "主人喜欢精简的管理界面"
+    assert "preference" not in [
+        dialog.memory_table.item(0, column).text()
+        for column in range(dialog.memory_table.columnCount())
+        if dialog.memory_table.item(0, column) is not None
+    ]
+    dialog._open_memory_editor(0)
+    assert dialog.memory_category_edit.text() == "preference"
+    assert dialog.memory_source_edit.text() == "manual"
+    # 编辑区是贴合内容的滚动面板:Maximum 纵向策略 + sizeHint 取内容高度,空间充足时贴合
+    # 表单不留空白,窗口压矮时内部滚动而非把各行压重叠。
+    assert isinstance(dialog.memory_editor_container, qtwidgets.QScrollArea)
+    assert dialog.memory_editor_container.widgetResizable()
+    assert (
+        dialog.memory_editor_container.verticalScrollBarPolicy()
+        == qtcore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+    )
+    assert (
+        dialog.memory_editor_container.sizePolicy().verticalPolicy()
+        == qtwidgets.QSizePolicy.Policy.Maximum
+    )
+    # sizeHint 贴合内部表单高度(而非 QScrollArea 默认经验值),才能既不留空白又能随内容收缩。
+    assert (
+        dialog.memory_editor_container.sizeHint().height()
+        >= dialog.memory_editor_content.sizeHint().height()
+    )
+    # 编辑区可见时表格仍不封顶,凭 stretch 随窗口增高。
+    assert not dialog.memory_editor_container.isHidden()
+    assert dialog.memory_table.maximumHeight() == 16777215
+    assert dialog.memory_content_edit.minimumHeight() == 88
+    assert dialog.memory_content_edit.maximumHeight() == 88
+    assert (
+        dialog.memory_content_edit.sizePolicy().verticalPolicy()
+        == qtwidgets.QSizePolicy.Policy.Fixed
+    )
     dialog.deleteLater()
     app.processEvents()
 
 
 def test_settings_dialog_sorts_memory_by_latest_time_on_top() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not hasattr(qtwidgets, "QApplication"):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QListWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.ui.settings_dialog import SettingsDialog
@@ -3539,6 +5351,7 @@ def test_settings_dialog_sorts_memory_by_latest_time_on_top() -> None:
 
     QApplication = qtwidgets.QApplication
     app = QApplication.instance() or QApplication([])
+    memory_store = MemoryStoreStub()
     dialog = SettingsDialog(
         api_settings=ApiSettings(
             base_url="https://api.example.com/v1",
@@ -3549,8 +5362,14 @@ def test_settings_dialog_sorts_memory_by_latest_time_on_top() -> None:
         base_dir=Path("."),
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
-        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+        memory_store=memory_store,  # type: ignore[arg-type]
     )
+
+    assert memory_store.list_calls == 0
+    nav = dialog.findChild(qtwidgets.QListWidget, "settingsNavList")
+    assert nav is not None
+    memory_row = [nav.item(index).text() for index in range(nav.count())].index("记忆")
+    nav.setCurrentRow(memory_row)
 
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
     assert [dialog.memory_table.item(row, 1).text() for row in range(4)] == [
@@ -3563,10 +5382,84 @@ def test_settings_dialog_sorts_memory_by_latest_time_on_top() -> None:
     app.processEvents()
 
 
-def test_settings_dialog_memory_loader_thread_is_not_dialog_child() -> None:
+def test_settings_dialog_pins_edited_memory_to_top() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not hasattr(qtwidgets, "QApplication"):
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QListWidget")):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.list_calls = 0
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            self.list_calls += 1
+            return [
+                {
+                    "id": f"memory-{i:02d}",
+                    "content": f"记忆内容 {i}",
+                    "updated_at": f"2026-06-{20 - i:02d}T10:00:00+08:00",
+                }
+                for i in range(6)
+            ]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    memory_store = MemoryStoreStub()
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    nav = dialog.findChild(qtwidgets.QListWidget, "settingsNavList")
+    memory_row = [nav.item(index).text() for index in range(nav.count())].index("记忆")
+    nav.setCurrentRow(memory_row)
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    # 列表与编辑区由竖直 QSplitter 隔开,可手动拖动加长。
+    assert isinstance(dialog.memory_list_splitter, qtwidgets.QSplitter)
+    assert dialog.memory_list_splitter.orientation() == qtcore.Qt.Orientation.Vertical
+    assert dialog.memory_list_splitter.count() == 2
+
+    # 初始按时间倒序:memory-00 最新在首行,memory-05 在末行。
+    initial_ids = [str(m.get("id")) for m in dialog._visible_memories]
+    assert initial_ids[0] == "memory-00"
+    assert initial_ids[-1] == "memory-05"
+
+    # 点击末行进入编辑:该项被钉到首行,详情面板展开,不再被遮挡。
+    last_row = len(dialog._visible_memories) - 1
+    dialog._switch_memory_single_selection(last_row)
+    app.processEvents()
+    assert str(dialog._visible_memories[0].get("id")) == "memory-05"
+    assert dialog.memory_table.item(0, 1).text() == "记忆内容 5"
+    assert dialog._active_memory_id == "memory-05"
+    assert not dialog.memory_editor_container.isHidden()
+
+    # 退出编辑后恢复原有时间倒序,不再置顶。
+    dialog._clear_memory_selection()
+    app.processEvents()
+    restored_ids = [str(m.get("id")) for m in dialog._visible_memories]
+    assert restored_ids == initial_ids
+    assert dialog.memory_editor_container.isHidden()
+
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_memory_loader_thread_is_not_dialog_child() -> None:
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QListWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.ui.settings_dialog import SettingsDialog
@@ -3598,6 +5491,10 @@ def test_settings_dialog_memory_loader_thread_is_not_dialog_child() -> None:
     )
 
     try:
+        nav = dialog.findChild(qtwidgets.QListWidget, "settingsNavList")
+        assert nav is not None
+        memory_row = [nav.item(index).text() for index in range(nav.count())].index("记忆")
+        nav.setCurrentRow(memory_row)
         assert _process_events_until(app, lambda: memory_store.started.is_set())
         assert dialog._memory_list_thread is not None
         assert dialog._memory_list_thread.parent() is None
@@ -3610,9 +5507,8 @@ def test_settings_dialog_memory_loader_thread_is_not_dialog_child() -> None:
 
 
 def test_settings_dialog_shows_memory_dependency_download_hint() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not hasattr(qtwidgets, "QApplication"):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QListWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.ui.settings_dialog import SettingsDialog
@@ -3645,6 +5541,13 @@ def test_settings_dialog_shows_memory_dependency_download_hint() -> None:
     )
 
     expected = "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。"
+    assert dialog.memory_status_label.text() == "打开记忆页时读取长期记忆。"
+    assert memory_store.list_calls == 0
+    nav = dialog.findChild(qtwidgets.QListWidget, "settingsNavList")
+    assert nav is not None
+    memory_row = [nav.item(index).text() for index in range(nav.count())].index("记忆")
+    nav.setCurrentRow(memory_row)
+
     assert dialog.memory_status_label.text() == expected
     assert dialog.memory_table.item(0, 1).text() == expected
     assert _process_events_until(app, lambda: memory_store.list_calls == 1)
@@ -3655,9 +5558,8 @@ def test_settings_dialog_shows_memory_dependency_download_hint() -> None:
 
 
 def test_settings_dialog_imports_memory_model_archive(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
-    if not hasattr(qtwidgets, "QApplication"):
+    if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QListWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     from app.ui import settings_dialog as settings_dialog_module
@@ -3711,6 +5613,10 @@ def test_settings_dialog_imports_memory_model_archive(monkeypatch) -> None:  # t
     )
 
     assert hasattr(dialog, "memory_import_model_button")
+    nav = dialog.findChild(qtwidgets.QListWidget, "settingsNavList")
+    assert nav is not None
+    memory_row = [nav.item(index).text() for index in range(nav.count())].index("记忆")
+    nav.setCurrentRow(memory_row)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
 
     dialog.memory_import_model_button.click()
@@ -3723,8 +5629,232 @@ def test_settings_dialog_imports_memory_model_archive(monkeypatch) -> None:  # t
     app.processEvents()
 
 
+def test_settings_dialog_downloads_memory_model(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    class DownloadResult:
+        model_name = "sentence-transformers/all-MiniLM-L6-v2"
+        cache_folder = Path("runtime/hf-cache/hub")
+        snapshot_count = 1
+
+    class MemoryStoreStub:
+        def __init__(self) -> None:
+            self.list_calls = 0
+            self.download_calls = 0
+
+        def needs_embedding_model_download(self) -> bool:
+            return self.download_calls == 0
+
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            self.list_calls += 1
+            return []
+
+        def download_embedding_model(self) -> DownloadResult:
+            self.download_calls += 1
+            return DownloadResult()
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    memory_store = MemoryStoreStub()
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "warning", lambda *_args, **_kwargs: None)
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=_ui_runtime_root("memory_model_download_dialog"),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=memory_store,  # type: ignore[arg-type]
+    )
+
+    assert hasattr(dialog, "memory_download_model_button")
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog.memory_download_model_button.click()
+
+    assert _process_events_until(app, lambda: dialog._memory_model_download_thread is None)
+    assert memory_store.download_calls == 1
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+    assert memory_store.list_calls >= 2
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_memory_model_download_failure_shows_release_link(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        settings_dialog_module.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+    dialog = type("DialogStub", (), {})()
+    dialog.memory_status_label = type("LabelStub", (), {"setText": lambda self, _text: None})()
+
+    SettingsDialog._handle_memory_model_download_failed(dialog, "HTTP 403")
+
+    assert len(warnings) == 1
+    assert "models--sentence-transformers--all-MiniLM-L6-v2.zip" in warnings[0]
+    assert "诊断信息（截图时请保留）：\nHTTP 403" in warnings[0]
+
+
+def test_settings_dialog_imports_backchannel_model_archive(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    class ImportResult:
+        model_name = "BAAI/bge-small-zh-v1.5"
+        cache_folder = Path("runtime/hf-cache/hub")
+        snapshot_count = 1
+
+    imported_paths: list[Path] = []
+
+    def fake_import(archive_path: Path, _base_dir: Path) -> ImportResult:
+        imported_paths.append(archive_path)
+        return ImportResult()
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("backchannel_model_import_dialog")
+    archive_path = root / "models--BAAI--bge-small-zh-v1.5.zip"
+    archive_path.write_bytes(b"zip")
+    monkeypatch.setattr(settings_dialog_module, "backchannel_model_cached", lambda _base_dir: False)
+    monkeypatch.setattr(settings_dialog_module, "import_backchannel_model_archive", fake_import)
+    monkeypatch.setattr(
+        settings_dialog_module.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: (str(archive_path), "接话模型 ZIP (*.zip)"),
+    )
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "warning", lambda *_args, **_kwargs: None)
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+
+    assert hasattr(dialog, "backchannel_import_model_button")
+    dialog.backchannel_import_model_button.click()
+
+    assert _process_events_until(app, lambda: dialog._backchannel_model_import_thread is None)
+    assert imported_paths == [archive_path]
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_downloads_backchannel_model(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    class DownloadResult:
+        model_name = "BAAI/bge-small-zh-v1.5"
+        cache_folder = Path("runtime/hf-cache/hub")
+        snapshot_count = 1
+
+    cached = {"ready": False}
+    download_calls: list[Path] = []
+
+    def fake_download(base_dir: Path) -> DownloadResult:
+        download_calls.append(base_dir)
+        cached["ready"] = True
+        return DownloadResult()
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("backchannel_model_download_dialog")
+    monkeypatch.setattr(settings_dialog_module, "backchannel_model_cached", lambda _base_dir: cached["ready"])
+    monkeypatch.setattr(settings_dialog_module, "download_backchannel_model", fake_download)
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "information", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(settings_dialog_module.QMessageBox, "warning", lambda *_args, **_kwargs: None)
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        backchannel_settings=BackchannelSettings(enabled=True, mode="hybrid"),
+    )
+
+    assert hasattr(dialog, "backchannel_download_model_button")
+    dialog.backchannel_download_model_button.click()
+
+    assert _process_events_until(app, lambda: dialog._backchannel_model_download_thread is None)
+    assert download_calls == [root]
+    assert "模型增强可用" in dialog.backchannel_model_status_label.text()
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_refreshes_backchannel_setup_status(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui import settings_dialog as settings_dialog_module
+    from app.ui.settings_dialog import SettingsDialog
+
+    cached = {"ready": False}
+
+    def fake_cached(_base_dir: Path) -> bool:
+        return cached["ready"]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("backchannel_setup_refresh_dialog")
+    monkeypatch.setattr(settings_dialog_module, "backchannel_model_cached", fake_cached)
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        backchannel_settings=BackchannelSettings(enabled=True, mode="hybrid"),
+    )
+
+    assert "未导入模型" in dialog.backchannel_model_status_label.text()
+    cached["ready"] = True
+    dialog.backchannel_refresh_status_button.click()
+
+    assert "模型增强可用" in dialog.backchannel_model_status_label.text()
+    assert "缺模型" not in dialog.backchannel_setup_hint_label.text()
+    dialog.deleteLater()
+    app.processEvents()
+
+
 def test_settings_dialog_filters_memory_locally() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -3758,6 +5888,7 @@ def test_settings_dialog_filters_memory_locally() -> None:
         memory_store=memory_store,  # type: ignore[arg-type]
     )
 
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
     assert memory_store.list_calls == 1
 
@@ -3772,7 +5903,6 @@ def test_settings_dialog_filters_memory_locally() -> None:
 
 
 def test_settings_dialog_deletes_selected_memories(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -3818,6 +5948,7 @@ def test_settings_dialog_deletes_selected_memories(monkeypatch) -> None:  # type
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
         memory_store=memory_store,  # type: ignore[arg-type]
     )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
 
     dialog._set_memory_checked(0, True)
@@ -3836,7 +5967,6 @@ def test_settings_dialog_deletes_selected_memories(monkeypatch) -> None:  # type
 
 
 def test_settings_dialog_reports_partial_memory_delete_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -3886,6 +6016,7 @@ def test_settings_dialog_reports_partial_memory_delete_failure(monkeypatch) -> N
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
         memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
     )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
 
     dialog._set_memory_checked(0, True)
@@ -3893,7 +6024,8 @@ def test_settings_dialog_reports_partial_memory_delete_failure(monkeypatch) -> N
     dialog._delete_memory_entry()
 
     assert warnings
-    assert "已删除 1 条，失败 1 条" in warnings[-1]
+    assert "已删除 1 条记忆，另有 1 条删除失败" in warnings[-1]
+    assert "诊断信息（截图时请保留）" in warnings[-1]
     assert "后端删除失败" in warnings[-1]
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
     dialog.deleteLater()
@@ -3901,7 +6033,6 @@ def test_settings_dialog_reports_partial_memory_delete_failure(monkeypatch) -> N
 
 
 def test_settings_dialog_selects_all_visible_memories_without_native_selection() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -3929,6 +6060,7 @@ def test_settings_dialog_selects_all_visible_memories_without_native_selection()
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
         memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
     )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
 
     dialog._toggle_select_all_visible_memories()
@@ -3945,7 +6077,6 @@ def test_settings_dialog_selects_all_visible_memories_without_native_selection()
 
 
 def test_settings_dialog_select_all_only_affects_filtered_results() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -3973,6 +6104,7 @@ def test_settings_dialog_select_all_only_affects_filtered_results() -> None:
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
         memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
     )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
 
     dialog.memory_search_edit.setText("批量")
@@ -3986,7 +6118,6 @@ def test_settings_dialog_select_all_only_affects_filtered_results() -> None:
 
 
 def test_settings_dialog_single_selection_opens_editor_and_updates_memory(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -4029,6 +6160,7 @@ def test_settings_dialog_single_selection_opens_editor_and_updates_memory(monkey
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
         memory_store=memory_store,  # type: ignore[arg-type]
     )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
 
     dialog._open_memory_editor(0)
@@ -4051,7 +6183,6 @@ def test_settings_dialog_single_selection_opens_editor_and_updates_memory(monkey
 
 
 def test_settings_dialog_content_click_switches_to_single_selection() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -4079,6 +6210,7 @@ def test_settings_dialog_content_click_switches_to_single_selection() -> None:
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
         memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
     )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
 
     dialog._set_memory_checked(0, True)
@@ -4093,6 +6225,43 @@ def test_settings_dialog_content_click_switches_to_single_selection() -> None:
 
 
 def test_settings_dialog_first_column_click_toggles_check_only() -> None:
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    class MemoryStoreStub:
+        def list_memories(self, *, limit: int = 20):  # type: ignore[no-untyped-def]
+            return [{"id": "memory-001", "content": "第一条记忆"}]
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=Path("."),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+        memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
+    )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
+    assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
+
+    dialog._handle_memory_item_clicked(dialog.memory_table.item(0, 0))
+
+    assert dialog._selected_memory_ids == {"memory-001"}
+    assert dialog._editing_memory_id is None
+    assert dialog.memory_editor_container.isHidden()
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_unchecking_last_selected_memory_collapses_editor() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
@@ -4118,11 +6287,16 @@ def test_settings_dialog_first_column_click_toggles_check_only() -> None:
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
         memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
     )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
 
-    dialog._handle_memory_item_clicked(dialog.memory_table.item(0, 0))
-
+    dialog._handle_memory_item_clicked(dialog.memory_table.item(0, 1))
     assert dialog._selected_memory_ids == {"memory-001"}
+    assert not dialog.memory_editor_container.isHidden()
+
+    dialog._set_memory_checked(0, False)
+
+    assert dialog._selected_memory_ids == set()
     assert dialog._editing_memory_id is None
     assert dialog.memory_editor_container.isHidden()
     dialog.deleteLater()
@@ -4130,7 +6304,6 @@ def test_settings_dialog_first_column_click_toggles_check_only() -> None:
 
 
 def test_settings_dialog_multiple_checked_rows_keep_current_editor() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -4158,6 +6331,7 @@ def test_settings_dialog_multiple_checked_rows_keep_current_editor() -> None:
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
         memory_store=MemoryStoreStub(),  # type: ignore[arg-type]
     )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
 
     dialog._open_memory_editor(0)
@@ -4174,7 +6348,6 @@ def test_settings_dialog_multiple_checked_rows_keep_current_editor() -> None:
 
 
 def test_settings_dialog_collapses_manual_memory_entry_after_save(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -4211,6 +6384,7 @@ def test_settings_dialog_collapses_manual_memory_entry_after_save(monkeypatch) -
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
         memory_store=memory_store,  # type: ignore[arg-type]
     )
+    _open_settings_memory_tab(dialog, qtwidgets, app)
     assert _process_events_until(app, lambda: dialog._memory_list_thread is None)
     assert not dialog.memory_editor_container.isVisible()
 
@@ -4276,8 +6450,9 @@ def test_show_settings_does_not_save_or_reload_api_when_unchanged(monkeypatch) -
         def reload_api_settings(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             calls["reload_memory"] += 1
 
-    class DialogStub:
+    class DialogStub(_NonModalSettingsDialogStub):
         def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
             self.result_api_settings = api_settings
             self.result_tts_settings = tts_settings
             self.result_character_id = "sakura"
@@ -4285,9 +6460,6 @@ def test_show_settings_does_not_save_or_reload_api_when_unchanged(monkeypatch) -
             self.result_mcp_settings = MCPRuntimeSettings(windows_enabled=False)
             self.result_debug_log_settings = DebugLogSettings()
             self.result_portrait_scale_percent = 100
-
-        def exec(self):  # type: ignore[no-untyped-def]
-            return pet_window_module.QDialog.DialogCode.Accepted
 
     window = _minimal_settings_window(
         PetWindow,
@@ -4301,6 +6473,87 @@ def test_show_settings_does_not_save_or_reload_api_when_unchanged(monkeypatch) -
     window.show_settings()
 
     assert calls == {"save_api": 0, "update_api": 0, "reload_memory": 0}
+
+
+def test_show_settings_saves_and_applies_runtime_loop_settings(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    api_settings = ApiSettings("https://api.example.com/v1", "test-key", "test-model")
+    tts_settings = _minimal_tts_settings()
+    runtime_settings = RuntimeLoopSettings(
+        max_agent_steps_per_turn=6,
+        max_tool_calls_per_step=5,
+        max_tool_calls_per_turn=11,
+    )
+    saved_runtime_settings: list[RuntimeLoopSettings] = []
+
+    class SettingsServiceStub:
+        def load_tts_settings(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return tts_settings
+
+        def save_api_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_tts_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_current_character_id(self, *_args):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_proactive_care_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_mcp_runtime_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_runtime_loop_settings(self, settings):  # type: ignore[no-untyped-def]
+            saved_runtime_settings.append(settings)
+
+        def save_debug_log_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_bubble_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+        def save_system_values(self, *_args):  # type: ignore[no-untyped-def]
+            pass
+
+    class ApiClientStub:
+        settings = api_settings
+
+        def update_settings(self, _settings):  # type: ignore[no-untyped-def]
+            pass
+
+    class MemoryStoreStub:
+        def reload_api_settings(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            pass
+
+    class DialogStub(_NonModalSettingsDialogStub):
+        def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
+            self.result_api_settings = api_settings
+            self.result_tts_settings = tts_settings
+            self.result_character_id = "sakura"
+            self.result_proactive_care_settings = ProactiveCareSettings(screen_context_enabled=True)
+            self.result_mcp_settings = MCPRuntimeSettings(windows_enabled=False)
+            self.result_runtime_loop_settings = runtime_settings
+            self.result_debug_log_settings = DebugLogSettings()
+            self.result_portrait_scale_percent = 100
+
+    window = _minimal_settings_window(
+        PetWindow,
+        SettingsServiceStub(),
+        ApiClientStub(),
+        MemoryStoreStub(),
+    )
+    monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
+    monkeypatch.setattr(pet_window_module, "show_themed_information", lambda *_args, **_kwargs: None)
+
+    window.show_settings()
+
+    assert saved_runtime_settings == [runtime_settings]
+    assert window.agent_runtime.runtime_loop_settings == runtime_settings
 
 
 def test_show_settings_applies_launch_at_login_change(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -4353,8 +6606,9 @@ def test_show_settings_applies_launch_at_login_change(monkeypatch) -> None:  # t
         def reload_api_settings(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             pass
 
-    class DialogStub:
+    class DialogStub(_NonModalSettingsDialogStub):
         def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
             self.result_api_settings = api_settings
             self.result_tts_settings = tts_settings
             self.result_character_id = "sakura"
@@ -4363,9 +6617,6 @@ def test_show_settings_applies_launch_at_login_change(monkeypatch) -> None:  # t
             self.result_debug_log_settings = DebugLogSettings()
             self.result_startup_settings = StartupSettings(launch_at_login=True)
             self.result_portrait_scale_percent = 100
-
-        def exec(self):  # type: ignore[no-untyped-def]
-            return pet_window_module.QDialog.DialogCode.Accepted
 
     window = _minimal_settings_window(
         PetWindow,
@@ -4411,8 +6662,10 @@ def test_show_settings_reuses_active_dialog_from_tray(monkeypatch) -> None:  # t
     class DialogStub:
         def __init__(self, *_args, **_kwargs) -> None:
             events.append("dialog_init")
+            self.finished = _NonModalSettingsDialogStub._FinishedSignal()
 
         def show(self) -> None:
+            # 非模态：show 后窗口保持打开，不触发 finished（不清空 settings_dialog）。
             events.append("show")
 
         def raise_(self) -> None:
@@ -4420,11 +6673,6 @@ def test_show_settings_reuses_active_dialog_from_tray(monkeypatch) -> None:  # t
 
         def activateWindow(self) -> None:
             events.append("activate")
-
-        def exec(self):  # type: ignore[no-untyped-def]
-            events.append("exec")
-            window.show_settings()
-            return pet_window_module.QDialog.DialogCode.Rejected
 
     window = _minimal_settings_window(
         PetWindow,
@@ -4434,10 +6682,151 @@ def test_show_settings_reuses_active_dialog_from_tray(monkeypatch) -> None:  # t
     )
     monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
 
+    # 第一次打开：非模态创建并显示窗口。
+    window.show_settings()
+    # 第二次打开（窗口仍开着）：应激活已有窗口，而不是再建一个。
     window.show_settings()
 
-    assert events == ["load_tts", "dialog_init", "exec", "show", "raise", "activate"]
-    assert getattr(window, "settings_dialog", None) is None
+    assert events == [
+        "load_tts",
+        "dialog_init",
+        "show",
+        "raise",
+        "activate",
+        "show",
+        "raise",
+        "activate",
+    ]
+    # 窗口仍打开（非模态未关闭），settings_dialog 持有引用。
+    assert getattr(window, "settings_dialog", None) is not None
+
+
+def test_show_settings_hides_input_bar_and_temporarily_suppresses_topmost_without_reapplying_flags(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    api_settings = ApiSettings("https://api.example.com/v1", "test-key", "test-model")
+    tts_settings = _minimal_tts_settings()
+    input_hidden_events: list[bool] = []
+    native_sync_events: list[bool] = []
+    apply_flag_events: list[str] = []
+    raise_events: list[str] = []
+
+    class SettingsServiceStub:
+        def load_tts_settings(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return tts_settings
+
+    class ApiClientStub:
+        settings = api_settings
+
+    class MemoryStoreStub:
+        pass
+
+    class InputBarAnimatorStub:
+        def set_force_hidden(self, value: bool) -> None:
+            input_hidden_events.append(value)
+
+    class DialogStub(_NonModalSettingsDialogStub):
+        _dialog_result = pet_window_module.QDialog.DialogCode.Rejected
+
+    window = _minimal_settings_window(
+        PetWindow,
+        SettingsServiceStub(),
+        ApiClientStub(),
+        MemoryStoreStub(),
+    )
+    window.always_on_top_enabled = True
+    window.input_bar_animator = InputBarAnimatorStub()
+    window._sync_native_topmost_state = (
+        lambda: native_sync_events.append(window._secondary_windows_suppress_topmost)
+    )
+    window._apply_window_flags = lambda: apply_flag_events.append("apply_flags")
+    window.isVisible = lambda: True
+    window.raise_ = lambda: raise_events.append("raise")
+    monkeypatch.setattr(pet_window_module, "SettingsDialog", DialogStub)
+
+    window.show_settings()
+
+    assert input_hidden_events == [True, False]
+    assert native_sync_events == [True, False]
+    assert apply_flag_events == []
+    assert raise_events == ["raise"]
+    assert window._secondary_windows_suppress_topmost is False
+
+
+def test_registered_secondary_window_suppresses_topmost_and_input_until_hidden() -> None:
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    input_hidden_events: list[bool] = []
+    native_sync_events: list[bool] = []
+    raise_events: list[str] = []
+
+    class InputBarAnimatorStub:
+        def set_force_hidden(self, value: bool) -> None:
+            input_hidden_events.append(value)
+
+    class SecondaryWindowStub:
+        visible = False
+
+        def show(self) -> None:
+            self.visible = True
+
+        def isMinimized(self) -> bool:  # noqa: N802 - 匹配 Qt 接口名
+            return False
+
+        def windowState(self):  # noqa: N802 - 匹配 Qt 接口名
+            return pet_window_module.Qt.WindowState.WindowNoState
+
+        def setWindowState(self, _state) -> None:  # noqa: N802 - 匹配 Qt 接口名
+            pass
+
+        def raise_(self) -> None:  # noqa: N802 - 匹配 Qt 接口名
+            pass
+
+        def activateWindow(self) -> None:  # noqa: N802 - 匹配 Qt 接口名
+            pass
+
+    class Host:
+        _present_registered_secondary_window = PetWindow._present_registered_secondary_window
+        _register_secondary_window = PetWindow._register_secondary_window
+        _sync_secondary_window_state = PetWindow._sync_secondary_window_state
+        _is_secondary_window_visible = PetWindow._is_secondary_window_visible
+        _set_secondary_windows_input_bar_hidden = PetWindow._set_secondary_windows_input_bar_hidden
+        _set_secondary_windows_topmost_suppressed = PetWindow._set_secondary_windows_topmost_suppressed
+
+        always_on_top_enabled = True
+        input_bar_animator = InputBarAnimatorStub()
+
+        def __init__(self) -> None:
+            self._registered_secondary_windows = set()
+            self._secondary_windows_suppress_topmost = False
+            self._secondary_windows_hide_input_bar = False
+
+        def _sync_native_topmost_state(self) -> None:
+            native_sync_events.append(self._secondary_windows_suppress_topmost)
+
+        def isVisible(self) -> bool:
+            return True
+
+        def raise_(self) -> None:
+            raise_events.append("raise")
+
+    host = Host()
+    window = SecondaryWindowStub()
+
+    host._register_secondary_window(window)  # type: ignore[arg-type]
+    host._present_registered_secondary_window(window)  # type: ignore[arg-type]
+
+    assert input_hidden_events == [True]
+    assert native_sync_events == [True]
+
+    window.visible = False
+    host._sync_secondary_window_state()
+
+    assert input_hidden_events == [True, False]
+    assert native_sync_events == [True, False]
+    assert raise_events == ["raise"]
 
 
 def test_show_settings_saves_and_applies_subtitle_display_speed(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -4487,8 +6876,9 @@ def test_show_settings_saves_and_applies_subtitle_display_speed(monkeypatch) -> 
         def reload_api_settings(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             pass
 
-    class DialogStub:
+    class DialogStub(_NonModalSettingsDialogStub):
         def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
             self.result_api_settings = api_settings
             self.result_tts_settings = tts_settings
             self.result_character_id = "sakura"
@@ -4498,9 +6888,6 @@ def test_show_settings_saves_and_applies_subtitle_display_speed(monkeypatch) -> 
             self.result_portrait_scale_percent = 100
             self.result_subtitle_typing_interval_ms = 80
             self.result_reply_segment_pause_ms = 900
-
-        def exec(self):  # type: ignore[no-untyped-def]
-            return pet_window_module.QDialog.DialogCode.Accepted
 
     window = _minimal_settings_window(
         PetWindow,
@@ -4522,274 +6909,6 @@ def test_show_settings_saves_and_applies_subtitle_display_speed(monkeypatch) -> 
     assert window.reply_segment_pause_ms == 900
     assert window.subtitle_controller.display_speeds == [(80, 900)]
 
-
-def test_history_clear_keeps_history_when_memory_curation_returns_nothing(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.ui.pet_window as pet_window_module
-    from app.agent.memory_curator import MemoryCurationResult
-    from app.ui.pet_window import PetWindow
-
-    warnings: list[tuple[str, str]] = []
-
-    class HistoryStoreStub:
-        def __init__(self) -> None:
-            self.clear_calls = 0
-
-        def clear(self) -> None:
-            self.clear_calls += 1
-
-    class MemoryCurationStateStub:
-        def __init__(self) -> None:
-            self.cleared = False
-
-        def mark_history_cleared(self) -> None:
-            self.cleared = True
-
-    class WindowStub:
-        _handle_memory_curation_finished = PetWindow._handle_memory_curation_finished
-
-    window = WindowStub()
-    window.memory_curation_mode = "history_clear"
-    window.memory_curation_target_history_count = 3
-    window.memory_curation_consumed_turns = 0
-    window.history_store = HistoryStoreStub()
-    window.memory_curation_state = MemoryCurationStateStub()
-    window.history_window = None
-
-    monkeypatch.setattr(
-        pet_window_module,
-        "show_themed_warning",
-        lambda _parent, title, text: warnings.append((title, text)),
-    )
-    monkeypatch.setattr(pet_window_module, "show_themed_information", lambda *_args, **_kwargs: None)
-
-    window._handle_memory_curation_finished(
-        MemoryCurationResult(ignored=3, processed_entries=3, returned=0)
-    )
-
-    assert window.history_store.clear_calls == 0
-    assert window.memory_curation_state.cleared is False
-    assert warnings == [("整理失败", "记忆整理没有写入任何结果，已保留聊天历史。请检查日志后再重试。")]
-
-
-def test_history_clear_queues_while_auto_memory_curation_is_running(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.ui.pet_window as pet_window_module
-    from app.ui.pet_window import PetWindow
-
-    messages: list[tuple[str, str]] = []
-
-    class HistoryWindowStub:
-        def __init__(self) -> None:
-            self.busy_calls: list[bool] = []
-
-        def set_memory_save_busy(self, busy: bool) -> None:
-            self.busy_calls.append(busy)
-
-    class WindowStub:
-        _save_history_to_memory_and_clear = PetWindow._save_history_to_memory_and_clear
-
-        def __init__(self) -> None:
-            self.memory_curation_thread = object()
-            self.memory_curation_mode = "backfill"
-            self.pending_history_clear_after_curation = False
-            self.history_window = HistoryWindowStub()
-            self.worker_thread = None
-
-    monkeypatch.setattr(
-        pet_window_module,
-        "show_themed_information",
-        lambda _parent, title, text, **_kwargs: messages.append((title, text)),
-    )
-
-    window = WindowStub()
-    window._save_history_to_memory_and_clear()
-
-    assert window.pending_history_clear_after_curation is True
-    assert window.history_window.busy_calls == []
-    assert messages == [("整理中", "当前正在自动整理记忆，结束后会继续清空并保存历史。")]
-
-
-def test_queued_history_clear_starts_after_auto_curation_cleanup(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.ui.pet_window as pet_window_module
-    from app.ui.pet_window import PetWindow
-
-    timer_calls: list[tuple[object, object]] = []
-    monkeypatch.setattr(
-        pet_window_module.QTimer,
-        "singleShot",
-        lambda delay, callback: timer_calls.append((delay, callback)),
-    )
-
-    class DisposableStub:
-        def deleteLater(self) -> None:
-            pass
-
-    class HistoryStoreStub:
-        def load(self) -> list[object]:
-            return [object()]
-
-    class MemoryStoreStub:
-        def is_ready(self) -> bool:
-            return True
-
-    class MemoryCurationStateStub:
-        def pending_turns(self) -> int:
-            return 2
-
-    class HistoryWindowStub:
-        def __init__(self) -> None:
-            self.busy_calls: list[bool] = []
-
-        def set_memory_save_busy(self, busy: bool) -> None:
-            self.busy_calls.append(busy)
-
-    class WindowStub:
-        _cleanup_memory_curation_worker = PetWindow._cleanup_memory_curation_worker
-        _start_pending_history_clear_after_curation = PetWindow._start_pending_history_clear_after_curation
-        _memory_store_ready_for_history_clear = PetWindow._memory_store_ready_for_history_clear
-        _reset_memory_curation_cache_for_history_clear = (
-            PetWindow._reset_memory_curation_cache_for_history_clear
-        )
-
-        def __init__(self) -> None:
-            self.memory_curation_worker = DisposableStub()
-            self.memory_curation_thread = DisposableStub()
-            self.memory_curation_mode = "backfill"
-            self.memory_curation_target_history_count = 5
-            self.memory_curation_consumed_turns = 0
-            self.pending_history_clear_after_curation = True
-            self.history_window = HistoryWindowStub()
-            self.history_store = HistoryStoreStub()
-            self.memory_store = MemoryStoreStub()
-            self.memory_curation_state = MemoryCurationStateStub()
-            self.start_calls: list[dict[str, object]] = []
-
-        def _memory_curation_can_start(self) -> bool:
-            return True
-
-        def _start_memory_curation(self, entries, *, mode, target_history_count, consumed_turns):  # type: ignore[no-untyped-def]
-            self.start_calls.append(
-                {
-                    "entry_count": len(entries),
-                    "mode": mode,
-                    "target_history_count": target_history_count,
-                    "consumed_turns": consumed_turns,
-                }
-            )
-            self.memory_curation_thread = object()
-
-    window = WindowStub()
-    window._cleanup_memory_curation_worker()
-
-    assert window.pending_history_clear_after_curation is False
-    assert window.start_calls == [
-        {
-            "entry_count": 1,
-            "mode": "history_clear",
-            "target_history_count": 1,
-            "consumed_turns": 2,
-        }
-    ]
-    assert window.history_window.busy_calls == []
-    assert timer_calls == []
-
-
-def test_history_clear_reports_when_memory_store_is_not_ready(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    import app.ui.pet_window as pet_window_module
-    from app.ui.pet_window import PetWindow
-
-    messages: list[tuple[str, str]] = []
-
-    class HistoryStoreStub:
-        def load(self) -> list[object]:
-            return [object()]
-
-    class MemoryStoreStub:
-        def is_ready(self) -> bool:
-            return False
-
-    class HistoryWindowStub:
-        def __init__(self) -> None:
-            self.busy_calls: list[bool] = []
-
-        def set_memory_save_busy(self, busy: bool) -> None:
-            self.busy_calls.append(busy)
-
-    class WindowStub:
-        _save_history_to_memory_and_clear = PetWindow._save_history_to_memory_and_clear
-        _memory_store_ready_for_history_clear = PetWindow._memory_store_ready_for_history_clear
-        _show_memory_not_ready_for_history_clear = PetWindow._show_memory_not_ready_for_history_clear
-
-        def __init__(self) -> None:
-            self.memory_curation_thread = None
-            self.memory_curation_mode = ""
-            self.worker_thread = None
-            self.history_store = HistoryStoreStub()
-            self.memory_store = MemoryStoreStub()
-            self.history_window = HistoryWindowStub()
-            self.memory_status_last_message = "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。"
-            self.start_calls = 0
-
-        def _start_memory_curation(self, *_args, **_kwargs) -> None:
-            self.start_calls += 1
-
-    monkeypatch.setattr(
-        pet_window_module,
-        "show_themed_information",
-        lambda _parent, title, text, **_kwargs: messages.append((title, text)),
-    )
-
-    window = WindowStub()
-    window._save_history_to_memory_and_clear()
-
-    assert window.start_calls == 0
-    assert window.history_window.busy_calls == [False]
-    assert messages == [("记忆初始化中", "长期记忆系统正在初始化，首次启动可能需要下载本地嵌入模型，请稍等。")]
-
-
-def test_history_clear_resets_mem0_curation_cache_before_start() -> None:  # type: ignore[no-untyped-def]
-    from app.ui.pet_window import PetWindow
-
-    events: list[str] = []
-
-    class HistoryStoreStub:
-        def load(self) -> list[object]:
-            return [object()]
-
-    class MemoryStoreStub:
-        def is_ready(self) -> bool:
-            return True
-
-        def reset_curation_cache(self) -> dict[str, int]:
-            events.append("reset")
-            return {"messages": 1, "history": 0}
-
-    class MemoryCurationStateStub:
-        def pending_turns(self) -> int:
-            return 2
-
-    class WindowStub:
-        _save_history_to_memory_and_clear = PetWindow._save_history_to_memory_and_clear
-        _memory_store_ready_for_history_clear = PetWindow._memory_store_ready_for_history_clear
-        _reset_memory_curation_cache_for_history_clear = (
-            PetWindow._reset_memory_curation_cache_for_history_clear
-        )
-
-        def __init__(self) -> None:
-            self.memory_curation_thread = None
-            self.memory_curation_mode = ""
-            self.worker_thread = None
-            self.history_store = HistoryStoreStub()
-            self.memory_store = MemoryStoreStub()
-            self.history_window = None
-            self.memory_curation_state = MemoryCurationStateStub()
-
-        def _start_memory_curation(self, *_args, **_kwargs) -> None:
-            events.append("start")
-
-    window = WindowStub()
-    window._save_history_to_memory_and_clear()
-
-    assert events == ["reset", "start"]
 
 
 def test_show_settings_reloads_memory_in_background_when_api_changes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -4842,8 +6961,9 @@ def test_show_settings_reloads_memory_in_background_when_api_changes(monkeypatch
             calls["reloaded"] = settings
             calls["wait"] = wait
 
-    class DialogStub:
+    class DialogStub(_NonModalSettingsDialogStub):
         def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
             self.result_api_settings = new_settings
             self.result_tts_settings = tts_settings
             self.result_character_id = "sakura"
@@ -4851,9 +6971,6 @@ def test_show_settings_reloads_memory_in_background_when_api_changes(monkeypatch
             self.result_mcp_settings = MCPRuntimeSettings(windows_enabled=False)
             self.result_debug_log_settings = DebugLogSettings()
             self.result_portrait_scale_percent = 100
-
-        def exec(self):  # type: ignore[no-untyped-def]
-            return pet_window_module.QDialog.DialogCode.Accepted
 
     messages: list[str] = []
     window = _minimal_settings_window(
@@ -4938,8 +7055,9 @@ def test_show_settings_uses_dialog_refreshed_character_registry(monkeypatch) -> 
         def reload_api_settings(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             pass
 
-    class DialogStub:
+    class DialogStub(_NonModalSettingsDialogStub):
         def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
             self.character_registry = imported_registry
             self.result_api_settings = api_settings
             self.result_tts_settings = tts_settings
@@ -4948,9 +7066,6 @@ def test_show_settings_uses_dialog_refreshed_character_registry(monkeypatch) -> 
             self.result_mcp_settings = MCPRuntimeSettings(windows_enabled=False)
             self.result_debug_log_settings = DebugLogSettings()
             self.result_portrait_scale_percent = 100
-
-        def exec(self):  # type: ignore[no-untyped-def]
-            return pet_window_module.QDialog.DialogCode.Accepted
 
     window = _minimal_settings_window(
         PetWindow,
@@ -4978,6 +7093,44 @@ def test_main_detects_missing_character_packages() -> None:
     character_dir.mkdir()
     (character_dir / "character.json").write_text("{}", encoding="utf-8")
     assert not sakura_main._character_packages_missing(root)
+
+
+def test_main_selfcheck_runs_before_single_instance_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    import main as sakura_main
+
+    root = _ui_runtime_root("selfcheck_before_lock")
+    (root / "data").write_text("not a directory", encoding="utf-8")
+    critical_messages: list[str] = []
+
+    class AppStub:
+        def __init__(self, _argv):  # type: ignore[no-untyped-def]
+            pass
+
+        def setApplicationName(self, _name):  # type: ignore[no-untyped-def]
+            pass
+
+        def setQuitOnLastWindowClosed(self, _enabled):  # type: ignore[no-untyped-def]
+            pass
+
+    class GuardShouldNotRun:
+        def __init__(self, _base_dir):  # type: ignore[no-untyped-def]
+            raise AssertionError("SingleInstanceGuard should not run before fatal selfcheck")
+
+    monkeypatch.setattr(sakura_main, "BASE_DIR", root)
+    monkeypatch.setattr(sakura_main, "QApplication", AppStub)
+    monkeypatch.setattr(sakura_main, "_configure_windows_high_dpi", lambda: None)
+    monkeypatch.setattr(sakura_main, "_force_light_palette", lambda _app: None)
+    monkeypatch.setattr(sakura_main, "qInstallMessageHandler", lambda _handler: None)
+    monkeypatch.setattr(sakura_main, "SingleInstanceGuard", GuardShouldNotRun)
+    monkeypatch.setattr(
+        sakura_main.QMessageBox,
+        "critical",
+        lambda _parent, _title, message: critical_messages.append(message),
+    )
+
+    assert sakura_main.main() == 1
+    assert critical_messages
+    assert "目录无法写入" in critical_messages[0]
 
 
 def test_main_detects_legacy_tts_migration_even_when_tts_disabled() -> None:
@@ -5060,7 +7213,6 @@ tts:
 
 
 def test_tts_migration_dialog_shows_concise_copy_and_progress() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QLabel", "QProgressBar", "QWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5101,7 +7253,6 @@ def test_tts_migration_dialog_shows_concise_copy_and_progress() -> None:
 
 
 def test_tts_migration_dialog_marks_fast_migration_done() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not all(hasattr(qtwidgets, name) for name in ("QApplication", "QLabel", "QProgressBar", "QPushButton", "QWidget")):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5151,6 +7302,7 @@ def test_main_first_run_settings_saves_imported_character_and_builds_context(mon
             self.result_character_id = "imported"
             self.result_proactive_care_settings = ProactiveCareSettings(screen_context_enabled=True)
             self.result_mcp_settings = MCPRuntimeSettings(windows_enabled=False)
+            self.result_runtime_loop_settings = RuntimeLoopSettings()
             self.result_debug_log_settings = DebugLogSettings(enabled=True, body_enabled=False)
             self.result_startup_settings = StartupSettings()
             self.result_portrait_scale_percent = 125
@@ -5179,7 +7331,6 @@ def test_main_first_run_settings_saves_imported_character_and_builds_context(mon
 
 
 def test_settings_dialog_returns_portrait_scale_percent() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5233,7 +7384,6 @@ def test_settings_dialog_returns_portrait_scale_percent() -> None:
 
 
 def test_settings_dialog_returns_control_panel_layout() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5278,7 +7428,6 @@ def test_settings_dialog_returns_control_panel_layout() -> None:
 
 
 def test_settings_dialog_emits_control_panel_layout_preview() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5330,7 +7479,6 @@ def test_settings_dialog_emits_control_panel_layout_preview() -> None:
 
 
 def test_settings_dialog_returns_subtitle_display_speed() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5369,7 +7517,6 @@ def test_settings_dialog_returns_subtitle_display_speed() -> None:
 
 
 def test_settings_dialog_returns_launch_at_login_setting(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5442,7 +7589,6 @@ def _theme_json() -> str:
 
 
 def test_settings_dialog_returns_theme_settings() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5504,7 +7650,6 @@ def test_settings_dialog_returns_theme_settings() -> None:
 
 
 def test_settings_dialog_downgrades_saved_windows_acrylic_to_gaussian(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5550,7 +7695,6 @@ def test_settings_dialog_downgrades_saved_windows_acrylic_to_gaussian(monkeypatc
 
 
 def test_settings_dialog_character_selection_loads_character_theme() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5607,7 +7751,6 @@ def test_settings_dialog_character_selection_loads_character_theme() -> None:
 
 
 def test_settings_dialog_resets_default_theme_colors() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5649,7 +7792,6 @@ def test_settings_dialog_resets_default_theme_colors() -> None:
 
 
 def test_settings_dialog_resets_to_character_package_theme() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -5730,7 +7872,6 @@ def test_theme_write_rule_persists_manual_and_ai_theme() -> None:
 
 
 def test_theme_ai_worker_sends_portrait_image_and_prompt(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6.QtCore")
     import app.ui.settings_dialog as settings_dialog
 
@@ -5748,9 +7889,10 @@ def test_theme_ai_worker_sends_portrait_image_and_prompt(monkeypatch) -> None:  
             calls["kwargs"] = kwargs
             return _theme_json()
 
-    monkeypatch.setattr(settings_dialog, "OpenAICompatibleClient", FakeClient)
+    import app.ui.settings.workers as settings_workers
+    monkeypatch.setattr(settings_workers, "OpenAICompatibleClient", FakeClient)
     events: list[ThemeSettings] = []
-    worker = settings_dialog.ThemeAiWorker(
+    worker = settings_workers.ThemeAiWorker(
         ApiSettings("https://api.example.com/v1", "test-key", "test-model"),
         profile,
         ai_enabled=True,
@@ -5767,7 +7909,6 @@ def test_theme_ai_worker_sends_portrait_image_and_prompt(monkeypatch) -> None:  
 
 
 def test_settings_dialog_ai_theme_success_and_failure_keep_current(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtcore = pytest.importorskip("PySide6.QtCore")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
@@ -5839,7 +7980,7 @@ def test_settings_dialog_ai_theme_success_and_failure_keep_current(monkeypatch) 
         ),
     )
     monkeypatch.setattr("app.ui.settings_dialog.QThread", FakeThread)
-    monkeypatch.setattr("app.ui.settings_dialog.ThemeAiWorker", SuccessWorker)
+    monkeypatch.setattr("app.ui.settings.workers.ThemeAiWorker", SuccessWorker)
 
     dialog._generate_ai_theme()
 
@@ -5847,7 +7988,7 @@ def test_settings_dialog_ai_theme_success_and_failure_keep_current(monkeypatch) 
     assert dialog.theme_accent_edit.text() == "#445566"
     assert dialog.theme_text_edit.text() == "#070809"
 
-    monkeypatch.setattr("app.ui.settings_dialog.ThemeAiWorker", FailedWorker)
+    monkeypatch.setattr("app.ui.settings.workers.ThemeAiWorker", FailedWorker)
     dialog.theme_primary_edit.setText("#aabbcc")
     dialog.theme_accent_edit.setText("#bbccdd")
     dialog.theme_text_edit.setText("#111111")
@@ -5876,20 +8017,27 @@ def test_proactive_care_batches_screenshots_until_cooldown(monkeypatch) -> None:
         history=history,
     )
 
+    observations: list[ScreenObservation] = []
+
     def fake_capture(_window):  # type: ignore[no-untyped-def]
         index = len(captures) + 1
         data_url = f"data:image/jpeg;base64,{index}"
         captures.append(data_url)
-        return ScreenObservation(
+        observation = ScreenObservation(
             data_url=data_url,
             width=800,
             height=600,
             captured_at=f"2026-05-30T12:0{index}:00+08:00",
             screen_name="DISPLAY1",
         )
+        observations.append(observation)
+        return object()
 
     monkeypatch.setattr(pet_window_module.time, "perf_counter", lambda: current_time["value"])
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", fake_capture)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", fake_capture)
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_proactive_screen_context(context, observations[-1]) or True
+    )
 
     current_time["value"] = 60
     window._check_proactive_care()
@@ -5914,6 +8062,83 @@ def test_proactive_care_batches_screenshots_until_cooldown(monkeypatch) -> None:
     assert events[0].payload["screen_context_count"] == 3
     assert history
     assert window.proactive_screen_contexts == []
+
+
+def test_screen_awareness_batches_screenshots_until_cooldown(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+
+    current_time = {"value": 0.0}
+    captures: list[str] = []
+    events = []
+    history = []
+    window = _build_minimal_screen_awareness_window(
+        screen_context_enabled=True,
+        check_interval_minutes=1,
+        cooldown_minutes=2,
+        events=events,
+        history=history,
+    )
+
+    observations: list[ScreenObservation] = []
+
+    def fake_capture(_window):  # type: ignore[no-untyped-def]
+        index = len(captures) + 1
+        data_url = f"data:image/jpeg;base64,{index}"
+        captures.append(data_url)
+        observation = ScreenObservation(
+            data_url=data_url,
+            width=800,
+            height=600,
+            captured_at=f"2026-05-30T12:0{index}:00+08:00",
+            screen_name="DISPLAY1",
+        )
+        observations.append(observation)
+        return object()
+
+    monkeypatch.setattr(pet_window_module.time, "perf_counter", lambda: current_time["value"])
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", fake_capture)
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_screen_awareness_context(context, observations[-1]) or True
+    )
+
+    current_time["value"] = 60
+    window._check_screen_awareness()
+    assert captures == ["data:image/jpeg;base64,1"]
+    assert events == []
+
+    current_time["value"] = 120
+    window._check_screen_awareness()
+    assert captures == ["data:image/jpeg;base64,1", "data:image/jpeg;base64,2"]
+    assert events == []
+
+    current_time["value"] = 180
+    window._check_screen_awareness()
+
+    assert events[0].type == "screen_awareness_check"
+    assert [context["data_url"] for context in events[0].payload["screen_contexts"]] == captures
+    assert events[0].payload["screen_context_count"] == 3
+    assert history
+    assert window.screen_awareness_contexts == []
+
+
+def test_screen_awareness_capture_uses_selected_resolution(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+
+    contexts: list[dict[str, object]] = []
+    window = _build_minimal_screen_awareness_window(
+        screen_context_enabled=True,
+        check_interval_minutes=1,
+        cooldown_minutes=2,
+    )
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", lambda _window: object())
+    window._start_screen_observation_encode = lambda _captured, context: (
+        contexts.append(context) or True
+    )
+
+    window._capture_screen_awareness_context(60)
+
+    assert contexts[0]["preserve_original_resolution"] is True
+    assert contexts[0]["detail"] == "high"
 
 
 def test_proactive_care_event_includes_recent_conversation() -> None:
@@ -6039,18 +8264,25 @@ def test_proactive_care_keeps_recent_screenshot_batch(monkeypatch) -> None:  # t
         cooldown_minutes=10,
     )
 
+    observations: list[ScreenObservation] = []
+
     def fake_capture(_window):  # type: ignore[no-untyped-def]
         index = len(captures) + 1
         captures.append(index)
-        return ScreenObservation(
+        observation = ScreenObservation(
             data_url=f"data:image/jpeg;base64,{index}",
             width=800,
             height=600,
             captured_at=f"2026-05-30T12:{index:02d}:00+08:00",
             screen_name="DISPLAY1",
         )
+        observations.append(observation)
+        return object()
 
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", fake_capture)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", fake_capture)
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_proactive_screen_context(context, observations[-1]) or True
+    )
 
     for index in range(8):
         window._capture_proactive_screen_context(float(index * 60))
@@ -6078,18 +8310,25 @@ def test_proactive_care_uses_configured_screenshot_batch_limit(monkeypatch) -> N
         screen_context_batch_limit=3,
     )
 
+    observations: list[ScreenObservation] = []
+
     def fake_capture(_window):  # type: ignore[no-untyped-def]
         index = len(captures) + 1
         captures.append(index)
-        return ScreenObservation(
+        observation = ScreenObservation(
             data_url=f"data:image/jpeg;base64,{index}",
             width=800,
             height=600,
             captured_at=f"2026-05-30T12:{index:02d}:00+08:00",
             screen_name="DISPLAY1",
         )
+        observations.append(observation)
+        return object()
 
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", fake_capture)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", fake_capture)
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_proactive_screen_context(context, observations[-1]) or True
+    )
 
     for index in range(5):
         window._capture_proactive_screen_context(float(index * 60))
@@ -6119,12 +8358,75 @@ def test_proactive_care_disabled_does_not_capture_or_send(monkeypatch) -> None: 
         raise AssertionError("关闭主动屏幕获取时不应该截图")
 
     monkeypatch.setattr(pet_window_module.time, "perf_counter", lambda: current_time["value"])
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", fail_capture)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", fail_capture)
 
     window._check_proactive_care()
 
     assert events == []
     assert window.proactive_screen_contexts == []
+
+
+def test_screen_awareness_redirects_limited_night_health_reminders(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    runtime_root = (
+        Path(__file__).resolve().parents[2]
+        / "temp"
+        / "test_runtime"
+        / "screen_awareness_health"
+        / uuid.uuid4().hex
+    )
+
+    class MinimalWindow:
+        _filter_screen_awareness_reply = PetWindow._filter_screen_awareness_reply
+        _screen_awareness_health_reminder_seen = PetWindow._screen_awareness_health_reminder_seen
+        _record_screen_awareness_health_reminder = PetWindow._record_screen_awareness_health_reminder
+        _screen_awareness_state_path = PetWindow._screen_awareness_state_path
+        _load_screen_awareness_state = PetWindow._load_screen_awareness_state
+        _save_screen_awareness_state = PetWindow._save_screen_awareness_state
+
+        def __init__(self) -> None:
+            self.base_dir = runtime_root
+            self._logged = []
+
+        def _log_interaction_stage(self, *args):  # type: ignore[no-untyped-def]
+            self._logged.append(args)
+
+    monkeypatch.setattr(pet_window_module, "_screen_awareness_night_key", lambda: "2026-06-12")
+    window = MinimalWindow()
+    event = AgentEvent(
+        type="screen_awareness_check",
+        payload={
+            "visual_contexts": [
+                {
+                    "summary": "用户正在查看代码编辑器和 Git 客户端。",
+                    "visible_texts": ["event_result_received", "GitHub Desktop"],
+                    "notable_elements": ["代码窗口", "提交列表"],
+                }
+            ],
+        },
+    )
+    result = AgentResult(
+        reply=ChatReply(
+            [
+                ChatSegment(
+                    text="少し休んでもいいよ。",
+                    translation="稍微休息一下也可以。",
+                )
+            ]
+        ),
+        actions=[],
+    )
+
+    first = window._filter_screen_awareness_reply(result, event)
+    second = window._filter_screen_awareness_reply(result, event)
+
+    assert first.reply.translation == "稍微休息一下也可以。"
+    assert second.reply.segments
+    assert "用户正在查看代码编辑器和 Git 客户端" in second.reply.translation
+    assert "event_result_received" in second.reply.translation
+    assert "休息" not in second.reply.translation
 
 
 def test_user_activity_keeps_pending_proactive_screenshot_batch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -6381,6 +8683,9 @@ def test_set_busy_disables_manual_screenshot_button() -> None:
     class MinimalBusyWindow:
         _set_busy = PetWindow._set_busy
         _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _release_empty_input_focus_after_reply_waiting = (
+            PetWindow._release_empty_input_focus_after_reply_waiting
+        )
         _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
         _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
         _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
@@ -6417,12 +8722,104 @@ def test_set_busy_disables_manual_screenshot_button() -> None:
     assert window.input_bar_animator.sync_count == 2
 
 
-def test_input_bar_pinned_while_waiting_reply() -> None:
+def test_reply_waiting_state_releases_empty_input_focus() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class FocusedInput(_DummyEditableInput):
+        def __init__(self, text: str) -> None:
+            super().__init__(text)
+            self.focused = True
+            self.clear_focus_count = 0
+
+        def hasFocus(self) -> bool:
+            return self.focused
+
+        def clearFocus(self) -> None:
+            self.focused = False
+            self.clear_focus_count += 1
+
+    class MinimalReplyWaitingWindow:
+        _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _release_empty_input_focus_after_reply_waiting = (
+            PetWindow._release_empty_input_focus_after_reply_waiting
+        )
+        _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
+        _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
+        _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
+        _set_widget_dynamic_property = PetWindow._set_widget_dynamic_property
+
+    window = MinimalReplyWaitingWindow()
+    window.character_profile = type("CharacterProfile", (), {"display_name": "Sakura"})()
+    window.startup_initializing = False
+    window.input_edit = FocusedInput("")
+    window.send_button = _DummyButton()
+    window.input_bar_animator = _DummyInputBarAnimator()
+    window.reply_waiting_ui_active = False
+
+    window._set_reply_waiting_ui(True)
+
+    assert not window.input_edit.focused
+    assert window.input_edit.clear_focus_count == 1
+    assert window.input_bar_animator.sync_count == 1
+
+    window.input_edit.focused = True
+    window.reply_waiting_ui_active = True
+
+    window._set_reply_waiting_ui(False)
+
+    assert not window.input_edit.focused
+    assert window.input_edit.clear_focus_count == 2
+    assert window.input_bar_animator.sync_count == 2
+
+
+def test_reply_waiting_end_keeps_focus_when_next_input_exists() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class FocusedInput(_DummyEditableInput):
+        def __init__(self, text: str) -> None:
+            super().__init__(text)
+            self.focused = True
+            self.clear_focus_count = 0
+
+        def hasFocus(self) -> bool:
+            return self.focused
+
+        def clearFocus(self) -> None:
+            self.focused = False
+            self.clear_focus_count += 1
+
+    class MinimalReplyWaitingWindow:
+        _set_reply_waiting_ui = PetWindow._set_reply_waiting_ui
+        _release_empty_input_focus_after_reply_waiting = (
+            PetWindow._release_empty_input_focus_after_reply_waiting
+        )
+        _normal_input_placeholder_text = PetWindow._normal_input_placeholder_text
+        _reply_waiting_placeholder_text = PetWindow._reply_waiting_placeholder_text
+        _sync_input_bar_waiting_visibility = PetWindow._sync_input_bar_waiting_visibility
+        _set_widget_dynamic_property = PetWindow._set_widget_dynamic_property
+
+    window = MinimalReplyWaitingWindow()
+    window.character_profile = type("CharacterProfile", (), {"display_name": "Sakura"})()
+    window.startup_initializing = False
+    window.input_edit = FocusedInput("下一句")
+    window.send_button = _DummyButton()
+    window.input_bar_animator = _DummyInputBarAnimator()
+    window.reply_waiting_ui_active = True
+
+    window._set_reply_waiting_ui(False)
+
+    assert window.input_edit.focused
+    assert window.input_edit.clear_focus_count == 0
+    assert window.input_bar_animator.sync_count == 1
+
+
+def test_input_bar_not_pinned_just_because_reply_is_waiting() -> None:
     from app.ui.pet_window import PetWindow
 
     class MinimalInputBarWindow:
         _input_bar_pinned = PetWindow._input_bar_pinned
         _any_dialog_open = lambda _self: False
+        _input_bar_foreground_allowed = lambda _self: True
 
     window = MinimalInputBarWindow()
     window.input_edit = _DummyEditableInput("")
@@ -6433,18 +8830,20 @@ def test_input_bar_pinned_while_waiting_reply() -> None:
 
     window.reply_waiting_ui_active = True
 
-    assert window._input_bar_pinned()
+    assert not window._input_bar_pinned()
 
 
 def test_progress_reply_displays_and_records_assistant_message() -> None:
     from app.agent import AgentProgress
     from app.llm.chat_reply import parse_chat_reply
-    from app.ui.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 
     class MinimalProgressWindow:
         _handle_progress_reply = PetWindow._handle_progress_reply
 
     window = MinimalProgressWindow()
+    from app.ui.state import PetUiStateStore
+    window.ui_state = PetUiStateStore()
     history = []
     window.messages = [{"role": "user", "content": "查一下"}]
     window._log_interaction_stage = lambda *_args, **_kwargs: None
@@ -6461,20 +8860,24 @@ def test_progress_reply_displays_and_records_assistant_message() -> None:
         )
     )
 
-    assert window.messages[-1] == {"role": "assistant", "content": "調べるね。"}
+    assert window.messages[-1]["role"] == "assistant"
+    assert window.messages[-1]["content"] == "調べるね。"
+    assert window.messages[-1][TRANSIENT_PROGRESS_MESSAGE_KEY] is True
     assert history[-1] == ("assistant", "調べるね。", "我查一下。", "中性", "")
 
 
 def test_progress_reply_records_segments_as_separate_history_entries() -> None:
     from app.agent import AgentProgress
     from app.llm.chat_reply import parse_chat_reply
-    from app.ui.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 
     class MinimalProgressWindow:
         _handle_progress_reply = PetWindow._handle_progress_reply
         _record_assistant_reply_history = PetWindow._record_assistant_reply_history
 
     window = MinimalProgressWindow()
+    from app.ui.state import PetUiStateStore
+    window.ui_state = PetUiStateStore()
     history = []
     window.messages = [{"role": "user", "content": "查一下"}]
     window._log_interaction_stage = lambda *_args, **_kwargs: None
@@ -6491,7 +8894,9 @@ def test_progress_reply_records_segments_as_separate_history_entries() -> None:
         )
     )
 
-    assert window.messages[-1] == {"role": "assistant", "content": "一つ目。\n二つ目。"}
+    assert window.messages[-1]["role"] == "assistant"
+    assert window.messages[-1]["content"] == "一つ目。\n二つ目。"
+    assert window.messages[-1][TRANSIENT_PROGRESS_MESSAGE_KEY] is True
     assert history == [
         ("assistant", "一つ目。", "第一段。", "中性", ""),
         ("assistant", "二つ目。", "第二段。", "中性", ""),
@@ -6730,7 +9135,7 @@ def test_reply_history_buttons_review_segments_without_tts_or_history() -> None:
 def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
     from app.agent import AgentResult
     from app.llm.chat_reply import ChatReply
-    from app.ui.pet_window import PetWindow
+    from app.ui.pet_window import PetWindow, TRANSIENT_PROGRESS_MESSAGE_KEY
 
     class MinimalConsumeWindow:
         _consume_agent_result = PetWindow._consume_agent_result
@@ -6740,7 +9145,13 @@ def test_consume_agent_result_shows_segments_for_tts_flow() -> None:
     shown_segments = []
     applied_results = []
     history = []
-    window.messages = []
+    window.messages = [
+        {
+            "role": "assistant",
+            "content": "途中経過。",
+            TRANSIENT_PROGRESS_MESSAGE_KEY: True,
+        }
+    ]
     window._log_interaction_stage = lambda *_args, **_kwargs: None
     window._record_assistant_reply_history = lambda reply, _debug=None: history.append((reply, _debug))
     window._show_reply_segments = lambda segments: shown_segments.append(segments)
@@ -6827,6 +9238,7 @@ def test_pet_window_toggle_always_on_top_saves_and_applies() -> None:
 
     class MinimalWindow:
         _toggle_always_on_top = PetWindow._toggle_always_on_top
+        _sync_secondary_windows_topmost = PetWindow._sync_secondary_windows_topmost
 
         def __init__(self) -> None:
             self.always_on_top_enabled = False
@@ -7058,6 +9470,8 @@ def test_screen_observation_followup_uses_last_user_message_after_progress(monke
 
     class MinimalScreenFollowupWindow:
         _queue_screen_observation_followup = PetWindow._queue_screen_observation_followup
+        _finish_chat_screen_observation_followup = PetWindow._finish_chat_screen_observation_followup
+        _resume_screen_observation_followup_cleanup = lambda self: None
 
     window = MinimalScreenFollowupWindow()
     history = []
@@ -7071,6 +9485,9 @@ def test_screen_observation_followup_uses_last_user_message_after_progress(monke
     window._log_interaction_stage = lambda *_args, **_kwargs: None
     window._record_history = lambda *args: history.append(args)
     window._consume_agent_result = lambda _result: None
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_chat_screen_observation_followup(context, observation) or True
+    )
     observation = ScreenObservation(
         data_url="data:image/jpeg;base64,screen",
         width=640,
@@ -7078,7 +9495,7 @@ def test_screen_observation_followup_uses_last_user_message_after_progress(monke
         captured_at="2026-05-31T12:00:00+08:00",
         screen_name="DISPLAY1",
     )
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", lambda _window: observation)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", lambda _window: object())
 
     queued = window._queue_screen_observation_followup(
         AgentResult(
@@ -7106,6 +9523,8 @@ def test_screen_observation_followup_keeps_large_image_after_progress(monkeypatc
 
     class MinimalScreenFollowupWindow:
         _queue_screen_observation_followup = PetWindow._queue_screen_observation_followup
+        _finish_chat_screen_observation_followup = PetWindow._finish_chat_screen_observation_followup
+        _resume_screen_observation_followup_cleanup = lambda self: None
 
     window = MinimalScreenFollowupWindow()
     window.messages = [
@@ -7118,6 +9537,9 @@ def test_screen_observation_followup_keeps_large_image_after_progress(monkeypatc
     window._log_interaction_stage = lambda *_args, **_kwargs: None
     window._record_history = lambda *_args: None
     window._consume_agent_result = lambda _result: None
+    window._start_screen_observation_encode = lambda _captured, context: (
+        window._finish_chat_screen_observation_followup(context, observation) or True
+    )
     observation = ScreenObservation(
         data_url=f"data:image/jpeg;base64,{'a' * 50000}",
         width=640,
@@ -7125,7 +9547,7 @@ def test_screen_observation_followup_keeps_large_image_after_progress(monkeypatc
         captured_at="2026-05-31T12:00:00+08:00",
         screen_name="DISPLAY1",
     )
-    monkeypatch.setattr(pet_window_module, "capture_screen_observation", lambda _window: observation)
+    monkeypatch.setattr(pet_window_module, "capture_screen_image", lambda _window: object())
 
     queued = window._queue_screen_observation_followup(
         AgentResult(
@@ -7208,12 +9630,15 @@ def _build_minimal_proactive_window(
     from app.ui.pet_window import PetWindow
 
     class MinimalProactiveWindow:
+        _current_screen_awareness_settings = PetWindow._current_screen_awareness_settings
+        _screen_awareness_encode_options = PetWindow._screen_awareness_encode_options
         _can_run_proactive_care = PetWindow._can_run_proactive_care
         _check_proactive_care = PetWindow._check_proactive_care
         _should_capture_proactive_screen_context = (
             PetWindow._should_capture_proactive_screen_context
         )
         _capture_proactive_screen_context = PetWindow._capture_proactive_screen_context
+        _finish_proactive_screen_context = PetWindow._finish_proactive_screen_context
         _should_send_proactive_care_batch = PetWindow._should_send_proactive_care_batch
         _build_proactive_care_event = PetWindow._build_proactive_care_event
         _proactive_screen_context_allowed = PetWindow._proactive_screen_context_allowed
@@ -7234,6 +9659,7 @@ def _build_minimal_proactive_window(
     window.pending_tool_action = None
     window.pending_screen_observation_messages = None
     window.screen_observation_followup_in_progress = False
+    window.screen_observation_encode_thread = None
     window.active_interaction_id = ""
     window.input_edit = _DummyTextInput()
     window.speech_timer = _DummyTimer()
@@ -7248,6 +9674,66 @@ def _build_minimal_proactive_window(
     window.proactive_screen_context_dropped_count = 0
     window.confirm_action_button = _DummyButton()
     window.cancel_action_button = _DummyButton()
+    captured_events = events if events is not None else []
+    captured_history = history if history is not None else []
+    window._run_event_worker = lambda event, reminder_id=None: captured_events.append(event)
+    window._record_history = lambda *args: captured_history.append(args)
+    return window
+
+
+def _build_minimal_screen_awareness_window(
+    *,
+    screen_context_enabled: bool,
+    check_interval_minutes: int,
+    cooldown_minutes: int,
+    screen_context_batch_limit: int = 6,
+    events=None,  # type: ignore[no-untyped-def]
+    history=None,  # type: ignore[no-untyped-def]
+):
+    from app.ui.pet_window import PetWindow
+
+    class MinimalScreenAwarenessWindow:
+        _current_screen_awareness_settings = PetWindow._current_screen_awareness_settings
+        _can_run_screen_awareness = PetWindow._can_run_screen_awareness
+        _check_screen_awareness = PetWindow._check_screen_awareness
+        _should_capture_screen_awareness_context = (
+            PetWindow._should_capture_screen_awareness_context
+        )
+        _capture_screen_awareness_context = PetWindow._capture_screen_awareness_context
+        _finish_screen_awareness_context = PetWindow._finish_screen_awareness_context
+        _should_send_screen_awareness_batch = PetWindow._should_send_screen_awareness_batch
+        _build_screen_awareness_event = PetWindow._build_screen_awareness_event
+        _screen_awareness_context_allowed = PetWindow._screen_awareness_context_allowed
+        _screen_awareness_encode_options = PetWindow._screen_awareness_encode_options
+        _clear_screen_awareness_context_batch = PetWindow._clear_screen_awareness_context_batch
+
+    window = MinimalScreenAwarenessWindow()
+    window.screen_awareness_settings = ScreenAwarenessSettings(
+        enabled=screen_context_enabled,
+        screen_context_enabled=screen_context_enabled,
+        check_interval_minutes=check_interval_minutes,
+        cooldown_minutes=cooldown_minutes,
+        screen_context_batch_limit=screen_context_batch_limit,
+    )
+    window.worker_thread = None
+    window.active_reminder_id = None
+    window.active_event_type = ""
+    window.pending_tool_action = None
+    window.pending_screen_observation_messages = None
+    window.screen_observation_followup_in_progress = False
+    window.screen_observation_encode_thread = None
+    window.active_interaction_id = ""
+    window.input_edit = _DummyTextInput()
+    window.speech_timer = _DummyTimer()
+    window.current_segment_sequence_id = None
+    window.current_segment_speech_done = True
+    window.current_segment_tts_done = True
+    window.last_user_activity_at = 0.0
+    window.last_screen_awareness_at = None
+    window.last_screen_awareness_context_at = None
+    window.screen_awareness_context_batch_started_at = None
+    window.screen_awareness_contexts = []
+    window.screen_awareness_context_dropped_count = 0
     captured_events = events if events is not None else []
     captured_history = history if history is not None else []
     window._run_event_worker = lambda event, reminder_id=None: captured_events.append(event)
@@ -7403,6 +9889,48 @@ def _build_settings_dialog_voice_archive(root: Path) -> Path:
     return archive_path
 
 
+class _NonModalSettingsDialogStub:
+    """非模态设置窗口的测试桩：模拟 finished 信号与 show/raise_ 等接口。
+
+    show_settings 已从模态 exec() 改为非模态 show() + finished 信号回调，
+    这里在 show() 时同步 emit finished(Accepted)，保持「调用 show_settings 后
+    结果处理同步完成」的测试语义。子类只需在 __init__ 里填好 result_* 属性。
+    """
+
+    class _FinishedSignal:
+        def __init__(self) -> None:
+            self._slots: list = []
+
+        def connect(self, slot) -> None:  # type: ignore[no-untyped-def]
+            self._slots.append(slot)
+
+        def emit(self, result: int) -> None:
+            for slot in list(self._slots):
+                slot(result)
+
+    _dialog_result = None  # 子类可覆盖；None 表示用 QDialog.DialogCode.Accepted
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.finished = _NonModalSettingsDialogStub._FinishedSignal()
+
+    def _resolved_result(self) -> int:
+        import app.ui.pet_window as pet_window_module
+
+        if self._dialog_result is not None:
+            return self._dialog_result
+        return pet_window_module.QDialog.DialogCode.Accepted
+
+    def show(self) -> None:
+        # 非模态打开后立即「关闭」，同步触发结果处理回调。
+        self.finished.emit(self._resolved_result())
+
+    def raise_(self) -> None:  # noqa: N802 - 匹配 Qt 接口名
+        pass
+
+    def activateWindow(self) -> None:  # noqa: N802 - 匹配 Qt 接口名
+        pass
+
+
 def _settings_dialog_character_kwargs(root: Path) -> dict[str, object]:
     from app.config.character_loader import CharacterRegistry
 
@@ -7458,7 +9986,6 @@ def _minimal_tts_settings() -> GPTSoVITSTTSSettings:
 
 
 def test_tts_ready_warmup_worker_calls_ensure_ready_success() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6.QtCore")
     from app.ui.pet_window import TTSReadyWarmupWorker
 
@@ -7480,7 +10007,6 @@ def test_tts_ready_warmup_worker_calls_ensure_ready_success() -> None:
 
 
 def test_tts_ready_warmup_worker_reports_failure() -> None:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6.QtCore")
     from app.ui.pet_window import TTSReadyWarmupWorker
 
@@ -7501,11 +10027,11 @@ def test_tts_ready_warmup_worker_reports_failure() -> None:
 
 
 def test_tts_test_worker_keeps_provider_after_success(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6.QtCore")
     import app.ui.settings_dialog as settings_dialog
 
     closed: list[bool] = []
+    created: list[tuple[GPTSoVITSTTSSettings, Path | None, bool]] = []
 
     class FakeProvider:
         def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
@@ -7517,20 +10043,34 @@ def test_tts_test_worker_keeps_provider_after_success(monkeypatch) -> None:  # t
         def close(self) -> None:
             closed.append(True)
 
-    monkeypatch.setattr(settings_dialog, "GPTSoVITSTTSProvider", FakeProvider)
+    import app.ui.settings.workers as settings_workers
+    base_dir = Path("runtime-root")
 
-    worker = settings_dialog.TTSTestWorker(_minimal_tts_settings())
+    def fake_create_tts_provider(
+        settings: GPTSoVITSTTSSettings,
+        *,
+        base_dir: Path | None = None,
+        adopt_existing_service: bool = True,
+    ) -> FakeProvider:
+        created.append((settings, base_dir, adopt_existing_service))
+        return FakeProvider(settings)
+
+    monkeypatch.setattr(settings_workers, "create_tts_provider", fake_create_tts_provider)
+
+    worker = settings_workers.TTSTestWorker(_minimal_tts_settings(), base_dir=base_dir)
     worker.run()
 
     assert closed == []
+    assert created and created[0][1] == base_dir
+    assert created[0][2] is False
 
 
 def test_tts_test_worker_closes_provider_after_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6.QtCore")
     import app.ui.settings_dialog as settings_dialog
 
     events: list[str] = []
+    created: list[tuple[GPTSoVITSTTSSettings, Path | None, bool]] = []
 
     class FakeProvider:
         def __init__(self, settings: GPTSoVITSTTSSettings) -> None:
@@ -7542,14 +10082,28 @@ def test_tts_test_worker_closes_provider_after_failure(monkeypatch) -> None:  # 
         def close(self) -> None:
             events.append("closed")
 
-    monkeypatch.setattr(settings_dialog, "GPTSoVITSTTSProvider", FakeProvider)
+    import app.ui.settings.workers as settings_workers
+    base_dir = Path("runtime-root")
 
-    worker = settings_dialog.TTSTestWorker(_minimal_tts_settings())
+    def fake_create_tts_provider(
+        settings: GPTSoVITSTTSSettings,
+        *,
+        base_dir: Path | None = None,
+        adopt_existing_service: bool = True,
+    ) -> FakeProvider:
+        created.append((settings, base_dir, adopt_existing_service))
+        return FakeProvider(settings)
+
+    monkeypatch.setattr(settings_workers, "create_tts_provider", fake_create_tts_provider)
+
+    worker = settings_workers.TTSTestWorker(_minimal_tts_settings(), base_dir=base_dir)
     worker.failed.connect(lambda _message: events.append("failed"))
     worker.finished.connect(lambda: events.append("finished"))
     worker.run()
 
     assert events == ["failed", "closed", "finished"]
+    assert created and created[0][1] == base_dir
+    assert created[0][2] is False
 
 
 def _minimal_settings_window(pet_window_cls, settings_service, api_client, memory_store):  # type: ignore[no-untyped-def]
@@ -7571,14 +10125,44 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
         def set_provider(self, _provider):  # type: ignore[no-untyped-def]
             pass
 
+    class AgentRuntimeStub:
+        def __init__(self) -> None:
+            self.runtime_loop_settings = RuntimeLoopSettings()
+
+        def set_runtime_loop_settings(self, settings):  # type: ignore[no-untyped-def]
+            self.runtime_loop_settings = settings
+
     class MinimalSettingsWindow:
         show_settings = pet_window_cls.show_settings
+        _on_settings_dialog_finished = pet_window_cls._on_settings_dialog_finished
         _activate_settings_dialog = pet_window_cls._activate_settings_dialog
         _preview_layout = pet_window_cls._preview_layout
+        _prepare_secondary_window = pet_window_cls._prepare_secondary_window
+        _present_registered_secondary_window = pet_window_cls._present_registered_secondary_window
+        _register_secondary_window = pet_window_cls._register_secondary_window
+        _unregister_secondary_window = pet_window_cls._unregister_secondary_window
+        _sync_secondary_window_state = pet_window_cls._sync_secondary_window_state
+        _is_secondary_window_visible = pet_window_cls._is_secondary_window_visible
+        _set_secondary_windows_input_bar_hidden = (
+            pet_window_cls._set_secondary_windows_input_bar_hidden
+        )
+        _set_secondary_windows_topmost_suppressed = (
+            pet_window_cls._set_secondary_windows_topmost_suppressed
+        )
+        _set_settings_window_topmost_suppressed = (
+            pet_window_cls._set_settings_window_topmost_suppressed
+        )
         _retire_tts_provider = pet_window_cls._retire_tts_provider
+        _close_retired_tts_provider = pet_window_cls._close_retired_tts_provider
         _apply_subtitle_display_speed = pet_window_cls._apply_subtitle_display_speed
         _apply_launch_at_login_settings = pet_window_cls._apply_launch_at_login_settings
         _apply_bubble_settings = pet_window_cls._apply_bubble_settings
+
+        def _apply_stage_debug_overlay(self, enabled: bool, *, refresh: bool = False) -> None:
+            self.stage_debug_overlay_applied = (enabled, refresh)
+
+        def _apply_stage_collision_mask(self, enabled: bool, *, refresh: bool = False) -> None:
+            self.stage_collision_mask_applied = (enabled, refresh)
 
         def _create_tts_provider_from_settings(self, _settings):  # type: ignore[no-untyped-def]
             return object()
@@ -7623,6 +10207,7 @@ def _minimal_settings_window(pet_window_cls, settings_service, api_client, memor
     window.debug_log_settings = DebugLogSettings()
     window.startup_settings = StartupSettings()
     window.memory_store = memory_store
+    window.agent_runtime = AgentRuntimeStub()
     window.plugin_manager = PluginManagerStub()
     window.portrait_scale_percent = 100
     window.control_panel_width = 640
@@ -7947,7 +10532,6 @@ def test_send_message_injects_runtime_event_context_before_user_message() -> Non
 
 def _qt_app_or_skip():  # type: ignore[no-untyped-def]
     """统一获取/创建 QApplication；stub 环境下跳过。"""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication") or not hasattr(qtwidgets, "QWidget"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
@@ -8187,6 +10771,195 @@ def test_local_rect_to_global_keeps_size_and_uses_main_window_origin() -> None:
     host.deleteLater()
 
 
+def test_cursor_in_pet_region_requires_exposed_pet_window(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _cursor_in_pet_region = PetWindow._cursor_in_pet_region
+        _cursor_over_exposed_pet_window = PetWindow._cursor_over_exposed_pet_window
+        _input_bar_foreground_allowed = PetWindow._input_bar_foreground_allowed
+        always_on_top_enabled = True
+
+        def _any_dialog_open(self) -> bool:
+            return False
+
+        def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return True
+
+        def frameGeometry(self):  # type: ignore[no-untyped-def]
+            return qtcore.QRect(0, 0, 120, 80)
+
+        def windowHandle(self):  # type: ignore[no-untyped-def]
+            return object()
+
+        def isAncestorOf(self, _widget) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return False
+
+    pos = qtcore.QPoint(20, 20)
+    window = MinimalWindow()
+    monkeypatch.setattr(pet_window_module.QCursor, "pos", lambda: pos)
+    monkeypatch.setattr(pet_window_module.QApplication, "widgetAt", lambda _pos: None)
+    monkeypatch.setattr(pet_window_module.QApplication, "topLevelAt", lambda _pos: None, raising=False)
+
+    # 坐标在窗口矩形内，但光标下方实际不是桌宠时，不应触发 hover 浮现。
+    assert window._cursor_in_pet_region() is False
+
+
+def test_cursor_in_pet_region_accepts_exposed_child_widget(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _cursor_in_pet_region = PetWindow._cursor_in_pet_region
+        _cursor_over_exposed_pet_window = PetWindow._cursor_over_exposed_pet_window
+        _input_bar_foreground_allowed = PetWindow._input_bar_foreground_allowed
+        always_on_top_enabled = True
+
+        def _any_dialog_open(self) -> bool:
+            return False
+
+        def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return True
+
+        def frameGeometry(self):  # type: ignore[no-untyped-def]
+            return qtcore.QRect(0, 0, 120, 80)
+
+        def isAncestorOf(self, _widget) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return False
+
+    class ChildWidget:
+        def __init__(self, window: MinimalWindow) -> None:
+            self._window = window
+
+        def window(self) -> MinimalWindow:
+            return self._window
+
+    pos = qtcore.QPoint(20, 20)
+    window = MinimalWindow()
+    child = ChildWidget(window)
+    monkeypatch.setattr(pet_window_module.QCursor, "pos", lambda: pos)
+    monkeypatch.setattr(pet_window_module.QApplication, "widgetAt", lambda _pos: child)
+
+    assert window._cursor_in_pet_region() is True
+
+
+def test_cursor_in_pet_region_blocks_non_topmost_background_window(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _cursor_in_pet_region = PetWindow._cursor_in_pet_region
+        _cursor_over_exposed_pet_window = PetWindow._cursor_over_exposed_pet_window
+        _input_bar_foreground_allowed = PetWindow._input_bar_foreground_allowed
+        _is_pet_foreground_window = PetWindow._is_pet_foreground_window
+        always_on_top_enabled = False
+
+        def _any_dialog_open(self) -> bool:
+            return False
+
+        def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return True
+
+        def frameGeometry(self):  # type: ignore[no-untyped-def]
+            return qtcore.QRect(0, 0, 120, 80)
+
+        def isAncestorOf(self, _widget) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return False
+
+        def isActiveWindow(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return False
+
+    class ChildWidget:
+        def __init__(self, window: MinimalWindow) -> None:
+            self._window = window
+
+        def window(self) -> MinimalWindow:
+            return self._window
+
+    pos = qtcore.QPoint(20, 20)
+    window = MinimalWindow()
+    child = ChildWidget(window)
+    monkeypatch.setattr(pet_window_module.sys, "platform", "linux")
+    monkeypatch.setattr(pet_window_module.QCursor, "pos", lambda: pos)
+    monkeypatch.setattr(pet_window_module.QApplication, "activeWindow", lambda: None)
+    monkeypatch.setattr(pet_window_module.QApplication, "widgetAt", lambda _pos: child)
+
+    assert window._cursor_in_pet_region() is False
+
+
+def test_cursor_in_pet_region_allows_non_topmost_foreground_window(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtcore = pytest.importorskip("PySide6.QtCore")
+    import app.ui.pet_window as pet_window_module
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _cursor_in_pet_region = PetWindow._cursor_in_pet_region
+        _cursor_over_exposed_pet_window = PetWindow._cursor_over_exposed_pet_window
+        _input_bar_foreground_allowed = PetWindow._input_bar_foreground_allowed
+        _is_pet_foreground_window = PetWindow._is_pet_foreground_window
+        always_on_top_enabled = False
+
+        def _any_dialog_open(self) -> bool:
+            return False
+
+        def isVisible(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return True
+
+        def frameGeometry(self):  # type: ignore[no-untyped-def]
+            return qtcore.QRect(0, 0, 120, 80)
+
+        def isAncestorOf(self, _widget) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return False
+
+    class ChildWidget:
+        def __init__(self, window: MinimalWindow) -> None:
+            self._window = window
+
+        def window(self) -> MinimalWindow:
+            return self._window
+
+    pos = qtcore.QPoint(20, 20)
+    window = MinimalWindow()
+    child = ChildWidget(window)
+    monkeypatch.setattr(pet_window_module.sys, "platform", "linux")
+    monkeypatch.setattr(pet_window_module.QCursor, "pos", lambda: pos)
+    monkeypatch.setattr(pet_window_module.QApplication, "activeWindow", lambda: child)
+    monkeypatch.setattr(pet_window_module.QApplication, "widgetAt", lambda _pos: child)
+
+    assert window._cursor_in_pet_region() is True
+
+
+def test_input_bar_pinned_requires_foreground_when_not_topmost() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class InputStub:
+        def hasFocus(self) -> bool:  # noqa: N802 - Qt API 兼容命名。
+            return False
+
+        def text(self) -> str:
+            return "未发送文本"
+
+    class MinimalWindow:
+        _input_bar_pinned = PetWindow._input_bar_pinned
+        _input_bar_foreground_allowed = PetWindow._input_bar_foreground_allowed
+        always_on_top_enabled = False
+        input_edit = InputStub()
+        reply_waiting_ui_active = False
+        pending_tool_action = None
+
+        def _any_dialog_open(self) -> bool:
+            return False
+
+        def _is_pet_foreground_window(self) -> bool:
+            return False
+
+    assert MinimalWindow()._input_bar_pinned() is False
+
+
 def test_input_bar_animator_visibility_follows_hover_and_pin() -> None:
     _qt_app_or_skip()
     from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
@@ -8215,6 +10988,38 @@ def test_input_bar_animator_visibility_follows_hover_and_pin() -> None:
     animator._hover = False
     pinned["value"] = True
     assert animator._target_visible() is True
+
+    bar.deleteLater()
+    card.deleteLater()
+
+
+def test_input_bar_animator_force_visible_release_refreshes_hover() -> None:
+    _qt_app_or_skip()
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
+    from app.ui.input_bar_animator import InputBarAnimator
+
+    bar = QWidget()
+    card = QWidget()
+    effect = QGraphicsOpacityEffect(card)
+    hover = {"value": True}
+    animator = InputBarAnimator(
+        bar,
+        card,
+        effect,
+        lambda: False,
+        lambda: hover["value"],
+    )
+
+    animator._started = True
+    animator._hover = False
+    animator._shown = False
+
+    animator.set_force_visible(True)
+    assert animator._shown is True
+
+    # 释放强制显示时刷新真实 hover，避免旧缓存把刚唤出的输入栏立刻收回。
+    animator.set_force_visible(False)
+    assert animator._shown is True
 
     bar.deleteLater()
     card.deleteLater()

@@ -8,6 +8,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from app.agent.screen_awareness import SCREEN_AWARENESS_IMAGE_DETAIL
+from app.core.cancellation import CancelChecker, OperationCancelled
+from app.llm.prompts.runtime import wrap_untrusted_runtime_facts
+from app.storage.atomic import atomic_write_text
+
 
 VISUAL_OBSERVATION_RECENT_MINUTES = 10
 VISUAL_OBSERVATION_RETENTION_DAYS = 7
@@ -77,10 +82,8 @@ class VisualObservationStore:
         redacted_record, _ = _redact_record_dict(asdict(record))
         records = [*self._load_raw_records(), redacted_record]
         records = self._prune(records)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as file:
-            for item in records:
-                file.write(json.dumps(item, ensure_ascii=False) + "\n")
+        text = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in records)
+        atomic_write_text(self.path, text, encoding="utf-8")
 
     def recent(self, limit: int = 3, since_minutes: int | None = None) -> list[VisualObservationRecord]:
         threshold = None
@@ -161,6 +164,8 @@ def generate_visual_observation_id() -> str:
 def summarize_visual_observation(
     api_client: Any,
     job: VisualObservationJob,
+    *,
+    cancel_checker: CancelChecker | None = None,
 ) -> VisualObservationRecord:
     """调用视觉模型生成结构化观察；失败时返回可追踪的最小记录。"""
     metadata = _job_metadata(job)
@@ -185,7 +190,10 @@ def summarize_visual_observation(
                 }
             ],
             temperature=0.2,
+            cancel_checker=cancel_checker,
         )
+    except OperationCancelled:
+        raise
     except Exception as exc:
         return _fallback_record(job, metadata, f"视觉摘要生成失败：{exc}")
 
@@ -211,12 +219,15 @@ def build_visual_context_message(
     if not records:
         return None
 
-    lines = [
-        "以下是最近截图/屏幕观察提炼出的短期视觉记忆。它们是纯文本摘要，不包含原图；回答用户关于刚才截图、画面、台词或可见文字的问题时，应优先依据这些记录，不要臆造看不清的内容。",
-        f"用户当前问题：{user_text.strip()}",
-    ]
+    intro = "\n".join(
+        [
+            "以下是最近截图/屏幕观察提炼出的短期视觉记忆。它们是纯文本摘要，不包含原图；回答用户关于刚才截图、画面、台词或可见文字的问题时，应优先依据这些记录，不要臆造看不清的内容。",
+            f"用户当前问题：{user_text.strip()}",
+        ]
+    )
+    record_lines: list[str] = []
     for record in records:
-        lines.append(
+        record_lines.append(
             "\n".join(
                 [
                     f"- visual_id={record.id} source={record.source} time={record.created_at}",
@@ -228,7 +239,15 @@ def build_visual_context_message(
                 ]
             )
         )
-    return {"role": "system", "content": "\n".join(lines)}
+    # 截图 OCR 文本属于外部不可信内容（可能含注入），包进“事实非指令”信封并标 untrusted；
+    # 宿主对如何使用这些记录的引导（intro）保持可信、置于信封之外。
+    content = wrap_untrusted_runtime_facts(
+        "\n".join(record_lines),
+        source="visual_memory",
+        fragment_id="visual_memory",
+        intro=intro,
+    )
+    return {"role": "system", "content": content}
 
 
 def should_inject_visual_context(user_text: str) -> bool:
@@ -279,26 +298,41 @@ def _build_visual_summary_user_text(
 
 
 def _job_image_parts(job: VisualObservationJob) -> list[dict[str, Any]]:
-    image_urls: list[str] = []
+    image_urls: list[tuple[str, str]] = []
     if job.observation is not None:
         data_url = getattr(job.observation, "data_url", "")
         if isinstance(data_url, str) and data_url.startswith("data:image/"):
-            image_urls.append(data_url)
+            image_urls.append((data_url, "low"))
     for context in job.screen_contexts or []:
         data_url = context.get("data_url")
         if isinstance(data_url, str) and data_url.startswith("data:image/"):
-            image_urls.append(data_url)
+            image_urls.append(
+                (
+                    data_url,
+                    _normalize_image_detail(
+                        context.get("detail"),
+                        default=SCREEN_AWARENESS_IMAGE_DETAIL,
+                    ),
+                )
+            )
 
     return [
         {
             "type": "image_url",
             "image_url": {
                 "url": image_url,
-                "detail": "low",
+                "detail": detail,
             },
         }
-        for image_url in image_urls[:3]
+        for image_url, detail in image_urls[:3]
     ]
+
+
+def _normalize_image_detail(value: Any, *, default: str = "low") -> str:
+    detail = str(value or "").strip().lower()
+    if detail in {"low", "high", "original", "auto"}:
+        return detail
+    return default
 
 
 def _job_metadata(job: VisualObservationJob) -> dict[str, Any]:

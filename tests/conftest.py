@@ -29,6 +29,73 @@ def cleanup_qt_objects_after_test() -> Iterable[None]:
     _cleanup_qt_objects()
 
 
+@pytest.fixture(autouse=True)
+def cleanup_tts_providers_before_qt(
+    cleanup_qt_objects_after_test: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterable[None]:
+    """保持真实 TTS Provider 存活，并在 Qt 对象清理前统一关闭。"""
+    _ = cleanup_qt_objects_after_test
+    try:
+        from app.voice.tts import GPTSoVITSTTSProvider
+    except Exception:
+        yield
+        return
+
+    providers: list[Any] = []
+    original_init = GPTSoVITSTTSProvider.__init__
+
+    def _tracked_init(provider: Any, *args: object, **kwargs: object) -> None:
+        original_init(provider, *args, **kwargs)
+        providers.append(provider)
+
+    monkeypatch.setattr(GPTSoVITSTTSProvider, "__init__", _tracked_init)
+    yield
+
+    for provider in reversed(providers):
+        try:
+            is_closed = getattr(provider, "_is_closed", None)
+            if callable(is_closed) and is_closed():
+                continue
+            provider.close()
+        except RuntimeError:
+            # 测试主动删除过底层 QObject 时，Python wrapper 可能已失效。
+            continue
+
+
+@pytest.fixture(autouse=True)
+def block_memory_store_background_load(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterable[None]:
+    """全局阻断 MemoryStore.preload 的后台加载线程。
+
+    preload(wait=False) 会在后台线程 import sentence_transformers → transformers，
+    其 native 初始化与 Qt 事件循环并发时随机 access violation（0xC0000005，
+    见提交 71ea1a32 的局部修复；多个测试各自泄漏线程时崩溃概率叠加）。
+    需要真实 preload 行为的测试用 @pytest.mark.allow_memory_preload 豁免，
+    并自行保证 _create_memory_client 不触碰 native 库。
+    """
+    if request.node.get_closest_marker("allow_memory_preload"):
+        yield
+        return
+    try:
+        from app.agent.memory import MemoryStore
+    except Exception:
+        yield
+        return
+
+    def _blocked_create_memory_client(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("测试环境禁止初始化真实 mem0/sentence-transformers 后端")
+
+    # 双层拦截：preload 不起线程；其余路径（_get_memory 惰性加载、reload）
+    # 起的线程在触碰 native 库前立刻失败。子类 override 的 fake
+    # _create_memory_client 不受基类 patch 影响。
+    monkeypatch.setattr(MemoryStore, "preload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(MemoryStore, "_create_memory_client", _blocked_create_memory_client)
+    yield
+
+
 def _cleanup_qt_objects() -> None:
     if importlib.util.find_spec("PySide6") is None:
         return
@@ -51,16 +118,23 @@ def _cleanup_qt_objects() -> None:
     for thread in threads:
         _stop_thread(thread, QThread)
 
-    _drain_qt_events(app, QCoreApplication, QEvent)
-
     for widget in _safe_qt_list(QApplication.topLevelWidgets):
         try:
             widget.close()
+        except Exception:  # noqa: BLE001
+            # 部分 UI 测试只构造精简窗口，closeEvent 可能依赖未初始化字段。
+            pass
+        try:
             widget.deleteLater()
         except RuntimeError:
             pass
 
-    _drain_qt_events(app, QCoreApplication, QEvent)
+    # 只处理延迟删除；全局 processEvents 会执行跨测试残留的普通 queued event，
+    # 曾在 Windows/PySide6 中随机触发 0xC0000005。
+    try:
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    except RuntimeError:
+        pass
 
 
 def _collect_threads(obj: Any, qthread_type: type, seen: set[int] | None = None) -> list[Any]:
@@ -121,15 +195,6 @@ def _stop_thread(thread: Any, qthread_type: type) -> None:
     except RuntimeError:
         return
 
-
-def _drain_qt_events(app: Any, qcore_application: type, qevent: type) -> None:
-    for _ in range(3):
-        try:
-            app.processEvents()
-            qcore_application.sendPostedEvents(None, qevent.Type.DeferredDelete)
-            app.processEvents()
-        except RuntimeError:
-            return
 
 
 def _safe_qt_list(factory: Any) -> list[Any]:

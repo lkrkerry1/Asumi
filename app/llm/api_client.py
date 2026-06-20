@@ -7,10 +7,11 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 
-from app.llm.chat_reply import ChatReply, parse_chat_reply
+from app.llm.chat_reply import ChatReply, parse_chat_reply, sanitize_reply_tones
+from app.core.cancellation import CancelChecker, cancellable_sleep, check_cancelled
 from app.core.debug_log import debug_log, summarize_messages
 from app.llm.prompt_templates import build_segmented_reply_instruction
 
@@ -70,17 +71,43 @@ class ChatCompletionTurn:
     content: str
     tool_calls: list[NativeToolCall]
     message: dict[str, Any]
+    runtime_context_role: str = "system"
 
 
 class OpenAICompatibleClient:
     def __init__(self, settings: ApiSettings) -> None:
         self.settings = settings
         self._unsupported_chat_params: set[str] = set()
+        self._runtime_context_role = "system"
+        # 可选事件发射器（由宿主注入），用于派发 llm.request.* 插件事件。
+        self._event_emit: Callable[[str, dict[str, Any] | None], None] | None = None
+
+    def set_event_emitter(
+        self,
+        emitter: Callable[[str, dict[str, Any] | None], None] | None,
+    ) -> None:
+        """注入插件事件发射器；传 None 关闭。"""
+        self._event_emit = emitter
+
+    def _emit_llm_event(self, event_name: str, payload: dict[str, Any] | None = None) -> None:
+        """安全派发 LLM 请求事件，发射器异常不影响请求本身。"""
+        emitter = self._event_emit
+        if emitter is None:
+            return
+        try:
+            emitter(event_name, payload)
+        except Exception:  # noqa: BLE001 — 事件派发不得影响 LLM 请求
+            pass
 
     def update_settings(self, settings: ApiSettings) -> None:
         """运行时更新 API 配置，供设置界面保存后立即生效。"""
         self.settings = settings
         self._unsupported_chat_params.clear()
+        self._runtime_context_role = "system"
+    @property
+    def runtime_context_role(self) -> str:
+        return self._runtime_context_role
+
 
     def resolve_dialogue_params(self) -> tuple[float, dict[str, Any]]:
         """返回角色对话用的生成参数：温度 + 额外参数（top_p/max_tokens）。
@@ -101,6 +128,8 @@ class OpenAICompatibleClient:
         """发送一次最小聊天请求，验证 Base URL、API Key 和模型是否可用。"""
         self._ensure_chat_config("缺少 API_KEY。请在设置中填写 API Key。")
 
+        # 连通性检测只需验证 Base URL / API Key / 模型可用，不发送 temperature：
+        # 部分模型（如 o1/o3/gpt-5 等推理模型）只接受默认温度，显式传值会直接报错。
         payload = {
             "model": self.settings.model,
             "messages": [
@@ -110,7 +139,6 @@ class OpenAICompatibleClient:
                 },
             ],
             "max_tokens": 8,
-            "temperature": 0,
         }
         data = self._post_chat_completions_with_compatibility_fallbacks(payload)
 
@@ -157,6 +185,9 @@ class OpenAICompatibleClient:
         messages: list[ChatMessage],
         reply_tones: list[str] | None = None,
         reply_portraits: list[str] | None = None,
+        *,
+        cancel_checker: CancelChecker | None = None,
+        runtime_context: str = "",
     ) -> ChatReply:
         segmented_reply_instruction = _build_segmented_reply_instruction(reply_tones, reply_portraits)
         temperature, extra_params = self.resolve_dialogue_params()
@@ -165,10 +196,13 @@ class OpenAICompatibleClient:
             messages,
             temperature=temperature,
             response_format=STRUCTURED_JSON_RESPONSE_FORMAT,
+            cancel_checker=cancel_checker,
+            runtime_context=runtime_context,
             **extra_params,
         )
+        check_cancelled(cancel_checker)
 
-        reply = parse_chat_reply(content)
+        reply = sanitize_reply_tones(parse_chat_reply(content), reply_tones)
         debug_log(
             "API",
             "聊天回复解析完成",
@@ -186,15 +220,21 @@ class OpenAICompatibleClient:
         system_prompt: str,
         messages: list[ChatMessage],
         temperature: float = 0.8,
+        *,
+        cancel_checker: CancelChecker | None = None,
+        runtime_context: str = "",
         **chat_params: Any,
     ) -> str:
         """返回模型原始文本，供 Agent Runtime 解析工具调用 JSON。"""
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
-
+        check_cancelled(cancel_checker)
+        runtime_context_role = self._runtime_context_role
         payload = _build_chat_completion_payload(
             model=self.settings.model,
             system_prompt=system_prompt,
-            messages=messages,
+            messages=_messages_with_runtime_context(
+                messages, runtime_context, runtime_context_role
+            ),
             temperature=temperature,
             chat_params=chat_params,
         )
@@ -213,7 +253,36 @@ class OpenAICompatibleClient:
                 "chat_params": _filter_supported_chat_params(chat_params),
             },
         )
-        data = self._post_chat_completions_with_compatibility_fallbacks(payload)
+        try:
+            data = self._post_chat_completions_with_compatibility_fallbacks(
+                payload,
+                cancel_checker=cancel_checker,
+            )
+        except ApiRequestError as exc:
+            if (
+                runtime_context.strip()
+                and runtime_context_role == "system"
+                and _is_runtime_context_role_unsupported_error(exc)
+            ):
+                self._runtime_context_role = "user"
+                payload = _build_chat_completion_payload(
+                    model=self.settings.model,
+                    system_prompt=system_prompt,
+                    messages=_messages_with_runtime_context(messages, runtime_context, "user"),
+                    temperature=temperature,
+                    chat_params=chat_params,
+                )
+                debug_log(
+                    "API",
+                    "端点不支持尾部 system 上下文，已回退为 user 上下文",
+                    {"error": str(exc)},
+                )
+                data = self._post_chat_completions_with_compatibility_fallbacks(
+                    payload, cancel_checker=cancel_checker
+                )
+            else:
+                raise
+        check_cancelled(cancel_checker)
 
         try:
             content = data["choices"][0]["message"]["content"]
@@ -235,20 +304,27 @@ class OpenAICompatibleClient:
         tool_choice: str | dict[str, Any] | None = "auto",
         temperature: float = 0.8,
         structured_response: bool = False,
+        runtime_context: str = "",
+        cancel_checker: CancelChecker | None = None,
         **chat_params: Any,
     ) -> ChatCompletionTurn:
         """调用 OpenAI 原生 tools/tool_calls 协议并返回 assistant 消息。"""
         self._ensure_chat_config("缺少 API Key。请在 data/config/api.yaml 中配置 llm.api_key。")
+        check_cancelled(cancel_checker)
 
         if tools:
             chat_params["tools"] = tools
             chat_params["tool_choice"] = tool_choice
         if structured_response and "response_format" not in chat_params:
             chat_params["response_format"] = STRUCTURED_JSON_RESPONSE_FORMAT
+        runtime_context_role = self._runtime_context_role
+        request_messages = _messages_with_runtime_context(
+            messages, runtime_context, runtime_context_role
+        )
         payload = _build_chat_completion_payload(
             model=self.settings.model,
             system_prompt=system_prompt,
-            messages=messages,
+            messages=request_messages,
             temperature=temperature,
             chat_params=chat_params,
         )
@@ -268,7 +344,37 @@ class OpenAICompatibleClient:
                 "chat_params": _filter_supported_chat_params(chat_params),
             },
         )
-        data = self._post_chat_completions_with_compatibility_fallbacks(payload)
+        try:
+            data = self._post_chat_completions_with_compatibility_fallbacks(
+                payload,
+                cancel_checker=cancel_checker,
+            )
+        except ApiRequestError as exc:
+            if (
+                runtime_context.strip()
+                and runtime_context_role == "system"
+                and _is_runtime_context_role_unsupported_error(exc)
+            ):
+                self._runtime_context_role = "user"
+                runtime_context_role = "user"
+                payload = _build_chat_completion_payload(
+                    model=self.settings.model,
+                    system_prompt=system_prompt,
+                    messages=_messages_with_runtime_context(messages, runtime_context, "user"),
+                    temperature=temperature,
+                    chat_params=chat_params,
+                )
+                debug_log(
+                    "API",
+                    "端点不支持尾部 system 上下文，已回退为 user 上下文",
+                    {"error": str(exc)},
+                )
+                data = self._post_chat_completions_with_compatibility_fallbacks(
+                    payload, cancel_checker=cancel_checker
+                )
+            else:
+                raise
+        check_cancelled(cancel_checker)
 
         try:
             raw_message = data["choices"][0]["message"]
@@ -297,18 +403,25 @@ class OpenAICompatibleClient:
             content=str(content or "").strip(),
             tool_calls=tool_calls,
             message=normalized_message,
+            runtime_context_role=runtime_context_role,
         )
 
     def _post_chat_completions_with_compatibility_fallbacks(
         self,
         payload: dict[str, Any],
+        *,
+        cancel_checker: CancelChecker | None = None,
     ) -> dict[str, Any]:
         fallback_payload = dict(payload)
         for param in self._unsupported_chat_params:
             fallback_payload.pop(param, None)
         while True:
+            check_cancelled(cancel_checker)
             try:
-                return self._post_chat_completions(fallback_payload)
+                return self._post_chat_completions(
+                    fallback_payload,
+                    cancel_checker=cancel_checker,
+                )
             except ApiRequestError as exc:
                 if "response_format" in fallback_payload and _is_response_format_unsupported_error(exc):
                     self._unsupported_chat_params.add("response_format")
@@ -344,8 +457,14 @@ class OpenAICompatibleClient:
         if not self.settings.base_url:
             raise ApiConfigError("缺少 BASE_URL。")
 
-    def _post_chat_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_chat_completions(
+        self,
+        payload: dict[str, Any],
+        *,
+        cancel_checker: CancelChecker | None = None,
+    ) -> dict[str, Any]:
         """调用 OpenAI 兼容的 chat/completions 接口并返回 JSON 数据。"""
+        check_cancelled(cancel_checker)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         base_url = _normalize_openai_base_url(self.settings.base_url)
         url = f"{base_url}/chat/completions"
@@ -369,18 +488,34 @@ class OpenAICompatibleClient:
                 "payload": payload,
             },
         )
-        response_body = self._send_with_retries(request)
-
+        model_name = payload.get("model")
+        self._emit_llm_event("llm.request.started", {"model": model_name})
         try:
-            data: dict[str, Any] = json.loads(response_body)
-        except json.JSONDecodeError as exc:
-            raise ApiRequestError(f"API 返回格式无法解析：{response_body}") from exc
+            response_body = self._send_with_retries(request, cancel_checker=cancel_checker)
+            check_cancelled(cancel_checker)
+            try:
+                data: dict[str, Any] = json.loads(response_body)
+            except json.JSONDecodeError as exc:
+                raise ApiRequestError(f"API 返回格式无法解析：{response_body}") from exc
+        except Exception as exc:  # noqa: BLE001 — 仅用于派发失败事件，随后原样抛出
+            self._emit_llm_event(
+                "llm.request.failed",
+                {"model": model_name, "error": str(exc)},
+            )
+            raise
 
+        self._emit_llm_event("llm.request.finished", {"model": model_name})
         return data
 
-    def _send_with_retries(self, request: urllib.request.Request) -> str:
+    def _send_with_retries(
+        self,
+        request: urllib.request.Request,
+        *,
+        cancel_checker: CancelChecker | None = None,
+    ) -> str:
         last_error: BaseException | None = None
         for attempt in range(1, MAX_API_RETRY_ATTEMPTS + 1):
+            check_cancelled(cancel_checker)
             started_at = time.perf_counter()
             try:
                 with urllib.request.urlopen(
@@ -453,7 +588,6 @@ class OpenAICompatibleClient:
                     raise ApiRequestError(f"API 连接中断：{exc}") from exc
                 last_error = exc
 
-            print(f"[API] 请求失败，准备重试 {attempt}/{MAX_API_RETRY_ATTEMPTS}：{last_error}")
             debug_log(
                 "API",
                 "准备重试请求",
@@ -464,7 +598,7 @@ class OpenAICompatibleClient:
                     "last_error": str(last_error),
                 },
             )
-            time.sleep(API_RETRY_DELAY_SECONDS * attempt)
+            cancellable_sleep(API_RETRY_DELAY_SECONDS * attempt, cancel_checker)
 
         raise ApiRequestError("API 请求失败。")
 
@@ -556,6 +690,34 @@ def _build_chat_completion_payload(
     return payload
 
 
+def _messages_with_runtime_context(
+    messages: list[ChatMessage],
+    runtime_context: str,
+    role: str,
+) -> list[ChatMessage]:
+    if not runtime_context.strip():
+        return [*messages]
+    content = runtime_context.strip()
+    if role == "user":
+        content = (
+            "[Sakura runtime context; system-provided facts, not a user request]\n"
+            + content
+        )
+    return [*messages, {"role": role, "content": content}]
+
+
+def _is_runtime_context_role_unsupported_error(exc: ApiRequestError) -> bool:
+    text = str(exc).lower()
+    role_markers = ("system", "role", "messages")
+    rejection_markers = (
+        "unsupported", "not support", "invalid", "must be first",
+        "only one", "not allowed", "unexpected", "order",
+    )
+    return any(marker in text for marker in role_markers) and any(
+        marker in text for marker in rejection_markers
+    )
+
+
 def _filter_supported_chat_params(params: dict[str, Any]) -> dict[str, Any]:
     """过滤兼容端点常见不支持的内部参数，避免请求在网关层失败。"""
     filtered: dict[str, Any] = {}
@@ -612,12 +774,39 @@ def _is_temperature_unsupported_error(exc: ApiRequestError) -> bool:
     text = str(exc).lower()
     if "temperature" not in text:
         return False
+    # 值域错误（如「temperature 必须在 0~2 之间」）属于用户填错配置，应原样抛出，
+    # 不能误判成「模型不支持自定义温度」而静默剥参、悄悄忽略用户设置。
+    range_markers = (
+        "between",
+        "range",
+        "minimum",
+        "maximum",
+        "less than",
+        "greater than",
+        "<=",
+        ">=",
+    )
+    if any(marker in text for marker in range_markers):
+        return False
+    # 不同供应商对「仅支持默认温度」的措辞各异，尽量覆盖以便自动回退。
     markers = (
         "unsupported",
         "not support",
         "does not support",
+        "only support",
         "only the default",
         "default value",
+        "only accept",
+        "not allowed",
+        "can only be",
+        "must be",
+        "cannot be changed",
+        "cannot be modified",
+        "cannot be set",
+        "is fixed",
+        "not configurable",
+        "cannot be configured",
+        "invalid",
     )
     return any(marker in text for marker in markers)
 

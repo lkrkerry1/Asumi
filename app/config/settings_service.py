@@ -5,17 +5,19 @@ from pathlib import Path
 from typing import Any
 
 from app.agent.mcp.settings import MCPRuntimeSettings, normalize_mcp_runtime_settings
+from app.agent.runtime_limits import RuntimeLoopSettings, normalize_runtime_loop_settings
 from app.config.character_loader import DEFAULT_CHARACTER_ID, CharacterProfile, CharacterRegistry
 from app.config.yaml_config import load_yaml_mapping, save_yaml_mapping
 from app.llm.api_client import ApiSettings
+from app.storage.paths import StoragePaths
 from app.ui.theme import ThemeSettings, theme_from_mapping, theme_to_mapping
-from app.agent.proactive_care import (
-    PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES,
-    PROACTIVE_DEFAULT_COOLDOWN_MINUTES,
-    PROACTIVE_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
-    ProactiveCareSettings,
+from app.agent.screen_awareness import (
+    SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES,
+    SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES,
+    SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
+    ScreenAwarenessSettings,
 )
-from app.voice.tts import (
+from app.voice.tts_settings import (
     DEFAULT_GENIE_TTS_API_URL,
     DEFAULT_GPT_SOVITS_API_URL,
     TTS_PROVIDER_CUSTOM_GPT_SOVITS,
@@ -38,6 +40,10 @@ class DebugLogSettings:
     enabled: bool = False
     body_enabled: bool = False
     file_enabled: bool = False
+    # 开发者选项:舞台调试框(画窗口/布局/实际立绘三框 + DPR 数值,排查布局/HiDPI)。
+    stage_debug_overlay: bool = False
+    # 舞台碰撞遮罩(默认开):setMask 到内容矩形并集,立绘四周空白点击穿透,避免误拖/挡点击。
+    stage_collision_mask: bool = True
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,57 @@ class BubbleSettings:
         )
 
 
+BACKCHANNEL_MIN_DELAY_MS = 100
+BACKCHANNEL_MAX_DELAY_MS = 5000
+BACKCHANNEL_DEFAULT_DELAY_MS = 600
+BACKCHANNEL_MODES = ("off", "rules", "hybrid")
+BACKCHANNEL_DEFAULT_MODE = "rules"
+# hybrid 后台分类超时(安全网):超时按无标签落兜底,不阻塞迟到的接话。
+# 仅对 hybrid 生效;规则分类同步不触发。0 表示不设超时。
+BACKCHANNEL_MIN_TIMEOUT_MS = 0
+BACKCHANNEL_MAX_TIMEOUT_MS = 2000
+BACKCHANNEL_DEFAULT_TIMEOUT_MS = 400
+
+
+@dataclass(frozen=True)
+class BackchannelSettings:
+    """本地快速接话层配置。
+
+    默认关闭;rules 为纯规则模式,hybrid 为 rules-first + 本地 embedding 意图泛化。
+    """
+
+    enabled: bool = False
+    mode: str = BACKCHANNEL_DEFAULT_MODE
+    delay_ms: int = BACKCHANNEL_DEFAULT_DELAY_MS
+    probability: float = 1.0
+    tts_enabled: bool = False
+    timeout_ms: int = BACKCHANNEL_DEFAULT_TIMEOUT_MS
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and self.mode != "off"
+
+    def normalized(self) -> "BackchannelSettings":
+        mode = self.mode if self.mode in BACKCHANNEL_MODES else BACKCHANNEL_DEFAULT_MODE
+        delay = max(
+            BACKCHANNEL_MIN_DELAY_MS,
+            min(BACKCHANNEL_MAX_DELAY_MS, int(self.delay_ms)),
+        )
+        probability = max(0.0, min(1.0, float(self.probability)))
+        timeout = max(
+            BACKCHANNEL_MIN_TIMEOUT_MS,
+            min(BACKCHANNEL_MAX_TIMEOUT_MS, int(self.timeout_ms)),
+        )
+        return BackchannelSettings(
+            enabled=bool(self.enabled),
+            mode=mode,
+            delay_ms=delay,
+            probability=probability,
+            tts_enabled=bool(self.tts_enabled),
+            timeout_ms=timeout,
+        )
+
+
 @dataclass(frozen=True)
 class AppSettingsService:
     """集中管理运行配置；唯一持久化来源是 data/config/*.yaml。"""
@@ -78,7 +135,7 @@ class AppSettingsService:
 
     @property
     def config_dir(self) -> Path:
-        return self.base_dir / "data" / "config"
+        return StoragePaths(self.base_dir).config_dir
 
     @property
     def api_config_path(self) -> Path:
@@ -172,25 +229,13 @@ class AppSettingsService:
         work_dir = _optional_path(provider_data.get("work_dir"), self.base_dir)
         python_path = _optional_path(provider_data.get("python_path"), self.base_dir)
         tts_config_path = _optional_path(provider_data.get("tts_config_path"), self.base_dir)
-        ref_lang = str(provider_data.get("ref_lang", gpt_sovits.get("ref_lang", "zh"))).strip()
-        text_lang = str(provider_data.get("text_lang", gpt_sovits.get("text_lang", "zh"))).strip()
+        ref_lang = "ja"
+        text_lang = "ja"
         timeout_seconds = _int_value(provider_data.get("timeout_seconds"), 60)
         onnx_model_dir = _optional_path(genie_tts.get("onnx_model_dir"), self.base_dir)
         if character_profile is not None:
             if provider == TTS_PROVIDER_GENIE and onnx_model_dir is None:
-                onnx_model_dir = self.base_dir / "data" / "tts_bundles" / "onnx" / character_profile.id
-            ref_lang = str(
-                provider_data.get(
-                    "ref_lang",
-                    character_profile.voice.ref_lang if character_profile.voice is not None else ref_lang,
-                )
-            ).strip()
-            text_lang = str(
-                provider_data.get(
-                    "text_lang",
-                    character_profile.voice.text_lang if character_profile.voice is not None else text_lang,
-                )
-            ).strip()
+                onnx_model_dir = StoragePaths(self.base_dir).tts_bundle_onnx_for(character_profile.id)
             settings = GPTSoVITSTTSSettings.from_character_profile(
                 character_profile=character_profile,
                 enabled=enabled,
@@ -209,7 +254,7 @@ class AppSettingsService:
                 settings = replace(settings, playback_backend=playback_backend)
         else:
             if provider == TTS_PROVIDER_GENIE and onnx_model_dir is None:
-                onnx_model_dir = self.base_dir / "data" / "tts_bundles" / "onnx" / "default"
+                onnx_model_dir = StoragePaths(self.base_dir).tts_bundle_onnx_for("default")
             settings = GPTSoVITSTTSSettings(
                 enabled=enabled,
                 api_url=api_url,
@@ -284,12 +329,45 @@ class AppSettingsService:
             {"windows_enabled": bool(normalized_settings.windows_enabled)},
         )
 
+    def load_runtime_loop_settings(self) -> RuntimeLoopSettings:
+        tool_loop = self._system_section("tool_loop")
+        defaults = RuntimeLoopSettings()
+        return normalize_runtime_loop_settings(
+            RuntimeLoopSettings(
+                max_agent_steps_per_turn=_int_value(
+                    tool_loop.get("max_agent_steps_per_turn"),
+                    defaults.max_agent_steps_per_turn,
+                ),
+                max_tool_calls_per_step=_int_value(
+                    tool_loop.get("max_tool_calls_per_step"),
+                    defaults.max_tool_calls_per_step,
+                ),
+                max_tool_calls_per_turn=_int_value(
+                    tool_loop.get("max_tool_calls_per_turn"),
+                    defaults.max_tool_calls_per_turn,
+                ),
+            )
+        )
+
+    def save_runtime_loop_settings(self, settings: RuntimeLoopSettings) -> None:
+        normalized = normalize_runtime_loop_settings(settings)
+        self.save_system_values(
+            "tool_loop",
+            {
+                "max_agent_steps_per_turn": int(normalized.max_agent_steps_per_turn),
+                "max_tool_calls_per_step": int(normalized.max_tool_calls_per_step),
+                "max_tool_calls_per_turn": int(normalized.max_tool_calls_per_turn),
+            },
+        )
+
     def load_debug_log_settings(self) -> DebugLogSettings:
         debug = self._system_section("debug")
         return DebugLogSettings(
             enabled=_bool_value(debug.get("enabled"), False),
             body_enabled=_bool_value(debug.get("body_enabled"), False),
             file_enabled=_bool_value(debug.get("file_enabled"), False),
+            stage_debug_overlay=_bool_value(debug.get("stage_debug_overlay"), False),
+            stage_collision_mask=_bool_value(debug.get("stage_collision_mask"), True),
         )
 
     def save_debug_log_settings(self, settings: DebugLogSettings) -> None:
@@ -299,6 +377,8 @@ class AppSettingsService:
                 "enabled": bool(settings.enabled),
                 "body_enabled": bool(settings.body_enabled),
                 "file_enabled": bool(settings.file_enabled),
+                "stage_debug_overlay": bool(settings.stage_debug_overlay),
+                "stage_collision_mask": bool(settings.stage_collision_mask),
             },
         )
 
@@ -325,40 +405,49 @@ class AppSettingsService:
         data["ui"] = ui
         save_yaml_mapping(self.system_config_path, data)
 
-    def load_proactive_care_settings(self) -> ProactiveCareSettings:
-        proactive = self._system_section("proactive_care")
-        return ProactiveCareSettings(
-            enabled=_bool_value(proactive.get("enabled"), True),
+    def load_screen_awareness_settings(self) -> ScreenAwarenessSettings:
+        screen_awareness = self._system_section("screen_awareness")
+        if not screen_awareness:
+            screen_awareness = self._system_section("proactive_care")
+        return ScreenAwarenessSettings(
+            enabled=_bool_value(screen_awareness.get("enabled"), True),
             screen_context_enabled=_bool_value(
-                proactive.get("screen_context_enabled"),
+                screen_awareness.get("screen_context_enabled"),
                 True,
             ),
             check_interval_minutes=_int_value(
-                proactive.get("check_interval_minutes"),
-                PROACTIVE_DEFAULT_CHECK_INTERVAL_MINUTES,
+                screen_awareness.get("check_interval_minutes"),
+                SCREEN_AWARENESS_DEFAULT_CHECK_INTERVAL_MINUTES,
             ),
             cooldown_minutes=_int_value(
-                proactive.get("cooldown_minutes"),
-                PROACTIVE_DEFAULT_COOLDOWN_MINUTES,
+                screen_awareness.get("cooldown_minutes"),
+                SCREEN_AWARENESS_DEFAULT_COOLDOWN_MINUTES,
             ),
             screen_context_batch_limit=_int_value(
-                proactive.get("screen_context_batch_limit"),
-                PROACTIVE_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
+                screen_awareness.get("screen_context_batch_limit"),
+                SCREEN_AWARENESS_DEFAULT_SCREEN_CONTEXT_BATCH_LIMIT,
             ),
         )
 
-    def save_proactive_care_settings(self, settings: ProactiveCareSettings) -> None:
+    def save_screen_awareness_settings(self, settings: ScreenAwarenessSettings) -> None:
         normalized = settings.normalized()
-        self.save_system_values(
-            "proactive_care",
-            {
-                "enabled": bool(normalized.enabled),
-                "screen_context_enabled": bool(normalized.screen_context_enabled),
-                "check_interval_minutes": int(normalized.check_interval_minutes),
-                "cooldown_minutes": int(normalized.cooldown_minutes),
-                "screen_context_batch_limit": int(normalized.screen_context_batch_limit),
-            },
-        )
+        data = load_yaml_mapping(self.system_config_path)
+        data["screen_awareness"] = {
+            "enabled": bool(normalized.enabled),
+            "screen_context_enabled": bool(normalized.screen_context_enabled),
+            "check_interval_minutes": int(normalized.check_interval_minutes),
+            "cooldown_minutes": int(normalized.cooldown_minutes),
+            "screen_context_batch_limit": int(normalized.screen_context_batch_limit),
+        }
+        save_yaml_mapping(self.system_config_path, data)
+
+    def load_proactive_care_settings(self) -> ScreenAwarenessSettings:
+        """兼容旧调用点；新代码请使用 load_screen_awareness_settings。"""
+        return self.load_screen_awareness_settings()
+
+    def save_proactive_care_settings(self, settings: ScreenAwarenessSettings) -> None:
+        """兼容旧调用点；新代码请使用 save_screen_awareness_settings。"""
+        self.save_screen_awareness_settings(settings)
 
     def load_bubble_settings(self) -> BubbleSettings:
         ui = self._system_section("ui")
@@ -380,6 +469,30 @@ class AppSettingsService:
         data["ui"] = ui
         save_yaml_mapping(self.system_config_path, data)
 
+    def load_backchannel_settings(self) -> BackchannelSettings:
+        section = self._system_section("backchannel")
+        return BackchannelSettings(
+            enabled=_bool_value(section.get("enabled"), False),
+            mode=str(section.get("mode", BACKCHANNEL_DEFAULT_MODE) or BACKCHANNEL_DEFAULT_MODE),
+            delay_ms=_int_value(section.get("delay_ms"), BACKCHANNEL_DEFAULT_DELAY_MS),
+            probability=_float_value(section.get("probability"), 1.0),
+            tts_enabled=_bool_value(section.get("tts_enabled"), False),
+            timeout_ms=_int_value(section.get("timeout_ms"), BACKCHANNEL_DEFAULT_TIMEOUT_MS),
+        ).normalized()
+
+    def save_backchannel_settings(self, settings: BackchannelSettings) -> None:
+        normalized = settings.normalized()
+        data = load_yaml_mapping(self.system_config_path)
+        data["backchannel"] = {
+            "enabled": bool(normalized.enabled),
+            "mode": normalized.mode,
+            "delay_ms": int(normalized.delay_ms),
+            "probability": float(normalized.probability),
+            "tts_enabled": bool(normalized.tts_enabled),
+            "timeout_ms": int(normalized.timeout_ms),
+        }
+        save_yaml_mapping(self.system_config_path, data)
+
     def load_memory_curation_settings(self):
         from app.agent.memory_curator import MemoryCurationSettings
 
@@ -388,6 +501,18 @@ class AppSettingsService:
             enabled=_bool_value(memory.get("enabled"), True),
             trigger_turns=_int_value(memory.get("trigger_turns"), 8),
             backfill_limit=_int_value(memory.get("backfill_limit"), 200),
+        )
+
+    def save_memory_curation_settings(self, settings) -> None:
+        # 仅写入 memory_curation section 的三个字段；backfill_limit 不在 UI 暴露，
+        # 但持久化时一并保留，避免被默认值覆盖。
+        self.save_system_values(
+            "memory_curation",
+            {
+                "enabled": bool(settings.enabled),
+                "trigger_turns": int(settings.trigger_turns),
+                "backfill_limit": int(settings.backfill_limit),
+            },
         )
 
     def load_current_character_id(self, character_registry: CharacterRegistry) -> str:
@@ -456,6 +581,13 @@ def _path_for_config(path: Path | None, base_dir: Path) -> str:
 def _int_value(value: Any, default: int) -> int:
     try:
         return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_value(value: Any, default: float) -> float:
+    try:
+        return float(str(value).strip())
     except (TypeError, ValueError):
         return default
 

@@ -20,6 +20,9 @@ from app.agent.actions import AgentAction, AgentEvent, AgentResult, PendingToolA
 from app.agent.runtime import (
     AgentRuntime,
     _build_vision_unsupported_reply,
+)
+from app.core.cancellation import CancellationToken, OperationCancelled
+from app.agent.tool_routing import (
     _filter_openai_tools_for_browser_routing,
     _should_block_windows_tool_for_browser_page,
 )
@@ -32,10 +35,12 @@ from app.agent.runtime_limits import (
     MAX_TOOL_CALLS_PER_STEP,
     MAX_TOOL_CALLS_PER_TURN,
     MAX_TOOL_RESULT_CHARS,
+    RuntimeLoopSettings,
 )
-from app.agent.tool_registry import Tool, ToolRegistry
+from app.agent.tools import Tool, ToolRegistry
 from app.llm.api_client import ApiRequestError, ChatMessage, NativeToolCall, OpenAICompatibleClient
 from app.llm.chat_reply import ChatReply, ChatSegment
+from app.storage.chat_history import ChatHistoryEntry
 
 
 def _dummy_system_prompt() -> str:
@@ -72,6 +77,14 @@ def _dummy_api_client() -> MagicMock:
     return client
 
 
+class _FakeHistoryStore:
+    def __init__(self, entries: list[ChatHistoryEntry]) -> None:
+        self.entries = entries
+
+    def load(self) -> list[ChatHistoryEntry]:
+        return self.entries
+
+
 class TestRuntimeLimits:
     """运行时限制常量验证"""
 
@@ -97,6 +110,85 @@ class TestRuntimeLimits:
     def test_event_context_limits_positive(self) -> None:
         assert MAX_EVENT_RECENT_CONVERSATION_MESSAGES > 0
         assert MAX_EVENT_RECENT_CONVERSATION_CONTENT_CHARS > 0
+
+    def test_runtime_loop_settings_are_used_in_prompt(self) -> None:
+        runtime = AgentRuntime(
+            _dummy_api_client(),
+            _dummy_system_prompt(),
+            runtime_loop_settings=RuntimeLoopSettings(
+                max_agent_steps_per_turn=6,
+                max_tool_calls_per_step=4,
+                max_tool_calls_per_turn=12,
+            ),
+        )
+
+        prompt = runtime._build_tool_system_prompt()
+
+        assert "每步最多请求 4 个工具，整轮最多 12 个工具" in prompt
+
+    def test_session_state_is_rendered_into_runtime_context(self) -> None:
+        client = _dummy_api_client()
+        runtime = AgentRuntime(
+            client,
+            _dummy_system_prompt(),
+            history_store=_FakeHistoryStore(
+                [
+                    ChatHistoryEntry(
+                        created_at="2026-06-20T12:00:00+08:00",
+                        role="user",
+                        content="帮我继续执行计划",
+                    ),
+                    ChatHistoryEntry(
+                        created_at="2026-06-20T12:00:05+08:00",
+                        role="assistant",
+                        content="好的，已经记下计划的下一步。",
+                    ),
+                    ChatHistoryEntry(
+                        created_at="2026-06-20T12:00:10+08:00",
+                        role="user",
+                        content="本轮问题",
+                    ),
+                ]
+            ),
+        )
+
+        runtime.handle_user_message([ChatMessage(role="user", content="本轮问题")])
+
+        call = client.complete_with_tools.call_args
+        runtime_context = call.kwargs["runtime_context"]
+        request_messages = call.args[1]
+        assert "最近会话状态" in runtime_context
+        assert "继续执行计划" in runtime_context
+        assert "用户：本轮问题" not in runtime_context
+        assert all("最近会话状态" not in str(message.get("content", "")) for message in request_messages)
+
+    def test_session_state_skipped_when_live_window_is_deep(self) -> None:
+        client = _dummy_api_client()
+        runtime = AgentRuntime(
+            client,
+            _dummy_system_prompt(),
+            history_store=_FakeHistoryStore(
+                [
+                    ChatHistoryEntry(
+                        created_at="2026-06-20T12:00:00+08:00",
+                        role="user",
+                        content="帮我继续执行计划",
+                    ),
+                ]
+            ),
+        )
+
+        # 实时窗口已经够深时不再注入跨会话历史切片，避免重复 token。
+        runtime.handle_user_message(
+            [
+                ChatMessage(role="user", content="第一句"),
+                ChatMessage(role="assistant", content="第一句回复"),
+                ChatMessage(role="user", content="继续"),
+            ]
+        )
+
+        runtime_context = client.complete_with_tools.call_args.kwargs["runtime_context"]
+        assert "最近会话状态" not in runtime_context
 
 
 class TestToolCallCountLimits:
@@ -133,7 +225,7 @@ class TestPendingActionFlow:
         runtime = AgentRuntime(_dummy_api_client(), _dummy_system_prompt(), tools=registry)
         action = PendingToolAction(
             tool_name="test_tool", arguments={}, reason="test",
-            tool_call_id="call_1", continuation_messages=None, risk="low",
+            tool_call_id="call_1", continuation_messages=None,
         )
         result = runtime.handle_confirmed_action(action)
         assert isinstance(result, AgentResult)
@@ -145,7 +237,7 @@ class TestPendingActionFlow:
         runtime = AgentRuntime(_dummy_api_client(), _dummy_system_prompt(), tools=registry)
         action = PendingToolAction(
             tool_name="test_tool", arguments={}, reason="test",
-            tool_call_id="call_1", continuation_messages=None, risk="low",
+            tool_call_id="call_1", continuation_messages=None,
         )
         result = runtime.handle_cancelled_action(action)
         assert result.actions[0].type == "cancelled_action"
@@ -164,7 +256,7 @@ class TestPendingActionFlow:
         ]
         action = PendingToolAction(
             tool_name="test_tool", arguments={}, reason="test",
-            tool_call_id="c1", continuation_messages=continuation, risk="low",
+            tool_call_id="c1", continuation_messages=continuation,
         )
         result = runtime.handle_confirmed_action(action)
         assert client.complete_with_tools.called
@@ -255,6 +347,15 @@ class TestProactiveEventFlow:
         runtime.handle_event(event)
         assert client.complete_with_tools.called
 
+    def test_screen_awareness_check_enters_tool_loop(self) -> None:
+        client = _dummy_api_client()
+        runtime = AgentRuntime(client, _dummy_system_prompt())
+        event = AgentEvent(type="screen_awareness_check", payload={
+            "screen_context_allowed": False, "recent_conversation": [],
+        })
+        runtime.handle_event(event)
+        assert client.complete_with_tools.called
+
     def test_reminder_due_uses_chat_not_tools(self) -> None:
         client = _dummy_api_client()
         runtime = AgentRuntime(client, _dummy_system_prompt())
@@ -302,6 +403,8 @@ class TestAgentRuntimeBasics:
 
         assert client.complete_with_tools.call_count == 2
         assert result.reply.segments[0].text == "直したよ。"
+        repair_messages = client.complete_with_tools.call_args_list[1].args[1]
+        assert "不要用固定兜底句替代" in repair_messages[-1]["content"]
 
     def test_final_reply_retries_when_plain_japanese_lacks_translation(self) -> None:
         client = _dummy_api_client()
@@ -348,6 +451,7 @@ class TestAgentRuntimeBasics:
         assert client.complete_with_tools.call_count == 2
         assert result.reply.segments[0].text != bad_content
         assert "segments" not in result.reply.segments[0].text
+        assert result.reply.segments[0].suppress_tts is True
 
     def test_update_character_preserves_tools(self) -> None:
         tool = _dummy_tool("my_tool")
@@ -356,3 +460,42 @@ class TestAgentRuntimeBasics:
         runtime.update_character("新", reply_tones=["傲娇"])
         assert runtime.tools.get("my_tool") is not None
         assert runtime.reply_tones == ["傲娇"]
+
+    def test_cancel_after_planning_stops_before_tool_execution(self) -> None:
+        token = CancellationToken()
+        executed: list[str] = []
+        tool = _dummy_tool(
+            "my_tool",
+            handler=lambda _args: executed.append("called") or {"ok": True},
+        )
+        registry = ToolRegistry([tool])
+        client = _dummy_api_client()
+
+        def complete_with_tools(*_args: object, **_kwargs: object) -> MagicMock:
+            token.cancel()
+            return MagicMock(
+                content="準備するね。",
+                tool_calls=[NativeToolCall(id="call_1", name="my_tool", arguments={})],
+                message={
+                    "role": "assistant",
+                    "content": "準備するね。",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "my_tool", "arguments": "{}"},
+                        }
+                    ],
+                },
+            )
+
+        client.complete_with_tools.side_effect = complete_with_tools
+        runtime = AgentRuntime(client, _dummy_system_prompt(), tools=registry)
+
+        with pytest.raises(OperationCancelled):
+            runtime.handle_user_message(
+                [ChatMessage(role="user", content="do it")],
+                cancel_checker=token.throw_if_cancelled,
+            )
+
+        assert executed == []

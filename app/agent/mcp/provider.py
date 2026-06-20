@@ -9,8 +9,10 @@ from typing import Any, Callable, Protocol
 from app.agent.mcp.bridge import MCPBridge, MCPToolSpec
 from app.agent.mcp.config import MCPConfig, MCPServerConfig, load_mcp_config
 from app.agent.mcp.settings import MCPRuntimeSettings, apply_mcp_runtime_settings
-from app.agent.tool_registry import Tool, ToolRegistry
+from app.agent.tools import Tool, ToolRegistry
 from app.core.debug_log import debug_log
+from app.core.resource_manager import ResourceRegistry, ServiceResource
+from app.storage.paths import StoragePaths
 
 
 class MCPBridgeLike(Protocol):
@@ -37,12 +39,21 @@ class MCPToolProvider:
         self,
         config: MCPConfig,
         bridge_factory: BridgeFactory | None = None,
+        *,
+        resource_registry: ResourceRegistry | None = None,
     ) -> None:
         self.config = config
-        self.bridge_factory = bridge_factory or MCPBridge
+        self.bridge_factory = bridge_factory
+        self.resource_registry = resource_registry or ResourceRegistry()
         self._bridges: list[MCPBridgeLike] = []
         self._tool_targets: dict[str, tuple[MCPBridgeLike, str]] = {}
         self._closed = False
+        self._provider_resource: ServiceResource = self.resource_registry.track_service(
+            stop=self.close,
+            is_running=lambda: not self._closed and bool(self._bridges),
+            label="mcp_provider",
+            shutdown_order=800,
+        )
 
     def register_tools(self, registry: ToolRegistry) -> int:
         self._closed = False
@@ -55,7 +66,7 @@ class MCPToolProvider:
             if not server.enabled:
                 debug_log("MCP", "跳过未启用服务器", {"server": server.name})
                 continue
-            bridge = self.bridge_factory(server, self.config.default_call_timeout)
+            bridge = self._create_bridge(server)
             try:
                 debug_log(
                     "MCP",
@@ -74,7 +85,7 @@ class MCPToolProvider:
                     if server.allows_tool(tool_spec.name)
                 ]
             except Exception as exc:
-                print(f"[MCP] 连接或读取工具失败，已跳过 {server.name}：{exc}")
+                debug_log("MCP", "连接或读取工具失败，已跳过", {"server": server.name, "error": str(exc)})
                 debug_log("MCP", "连接或读取工具失败", {"server": server.name, "error": str(exc)})
                 _close_quietly(bridge)
                 continue
@@ -83,7 +94,7 @@ class MCPToolProvider:
             for tool_spec in tool_specs:
                 internal_name = _build_internal_tool_name(server, tool_spec.name)
                 if registry.get(internal_name) is not None:
-                    print(f"[MCP] 工具名冲突，已跳过 {internal_name}。")
+                    debug_log("MCP", "工具名冲突，已跳过", {"name": internal_name})
                     debug_log("MCP", "工具名冲突，已跳过", {"tool_name": internal_name})
                     continue
                 registry.register(
@@ -119,12 +130,24 @@ class MCPToolProvider:
         return registered
 
     def close(self) -> None:
+        if self._closed and not self._bridges:
+            return
         debug_log("MCP", "关闭 MCP Provider", {"bridges": len(self._bridges)})
         self._closed = True
         for bridge in self._bridges:
             _close_quietly(bridge)
         self._bridges = []
         self._tool_targets = {}
+        self._provider_resource.detach()
+
+    def _create_bridge(self, server: MCPServerConfig) -> MCPBridgeLike:
+        if self.bridge_factory is not None:
+            return self.bridge_factory(server, self.config.default_call_timeout)
+        return MCPBridge(
+            server,
+            self.config.default_call_timeout,
+            resource_registry=self.resource_registry,
+        )
 
     def _make_handler(self, internal_name: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
         def handler(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -144,23 +167,22 @@ def register_mcp_tools_from_config(
     registry: ToolRegistry,
     bridge_factory: BridgeFactory | None = None,
     runtime_settings: MCPRuntimeSettings | None = None,
+    resource_registry: ResourceRegistry | None = None,
 ) -> MCPToolProvider | None:
     try:
-        config = load_mcp_config(base_dir / "data" / "config" / "mcp.yaml")
+        config = load_mcp_config(StoragePaths(base_dir).mcp_config())
         mcp_settings = runtime_settings or MCPRuntimeSettings()
     except Exception as exc:
-        print(f"[MCP] 配置读取失败，已跳过 MCP：{exc}")
         debug_log("MCP", "配置读取失败，已跳过 MCP", {"error": str(exc)})
         return None
     config = apply_mcp_runtime_settings(config, mcp_settings)
     config = _resolve_runtime_tokens(config, base_dir)
-    provider = MCPToolProvider(config, bridge_factory=bridge_factory)
+    provider = MCPToolProvider(config, bridge_factory=bridge_factory, resource_registry=resource_registry)
     registered = provider.register_tools(registry)
     if registered == 0:
         provider.close()
         debug_log("MCP", "没有注册任何 MCP 工具")
         return None
-    print(f"[MCP] 已注册 {registered} 个 MCP 工具。")
     debug_log("MCP", "MCP 工具注册完成", {"registered": registered})
     return provider
 
@@ -235,5 +257,5 @@ def _close_quietly(bridge: MCPBridgeLike) -> None:
     try:
         bridge.close()
     except Exception as exc:
-        print(f"[MCP] 关闭连接失败：{exc}")
+        debug_log("MCP", "关闭连接失败", {"error": str(exc)})
         debug_log("MCP", "关闭连接失败", {"error": str(exc)})

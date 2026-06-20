@@ -10,7 +10,9 @@ from app.agent.desktop_tools import NotesStore, open_local_folder, open_url
 from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
 from app.agent.screen_tools import create_screen_observation_tool
-from app.agent.tool_registry import Tool, ToolRegistry
+from app.agent.tools import Tool, ToolRegistry
+from app.storage.atomic import atomic_write_text
+from app.storage.paths import StoragePaths
 
 
 def create_builtin_tool_registry(
@@ -18,10 +20,13 @@ def create_builtin_tool_registry(
     memory: MemoryStore | None = None,
     reminders: ReminderStore | None = None,
 ) -> ToolRegistry:
-    store = TodoStore(base_dir / "data" / "tasks.json")
-    notes = NotesStore(base_dir / "data" / "notes")
-    memory = memory or MemoryStore(base_dir / "data" / "memory.json")
-    reminders = reminders or ReminderStore(base_dir / "data" / "reminders.json")
+    paths = StoragePaths(base_dir)
+    store = TodoStore(paths.tasks_store())
+    notes = NotesStore(paths.notes_dir)
+    # MemoryStore 是 dataclass，第一个字段是 base_dir；旧写法把 json 路径误传成
+    # base_dir（主链路总会注入 memory，未实际触发），这里一并修正
+    memory = memory or MemoryStore(base_dir=base_dir)
+    reminders = reminders or ReminderStore(paths.reminders_store())
     registry = ToolRegistry(
         [
             create_screen_observation_tool(),
@@ -169,6 +174,12 @@ def create_builtin_tool_registry(
                     "properties": {
                         "query": {"type": "string", "description": "搜索关键词，可为空；为空时列出最近记忆。"},
                         "limit": {"type": "integer", "description": "最多返回多少条，默认 20。"},
+                        "layer": {
+                            "type": "string",
+                            "description": "可选记忆层级：core_profile、semantic、episodic、procedural、session。",
+                        },
+                        "category": {"type": "string", "description": "可选分类过滤。"},
+                        "scope": {"type": "string", "description": "可选角色/作用域，默认当前角色。"},
                     },
                 },
                 handler=lambda arguments: memory.search_memory(arguments, wait=False),
@@ -184,10 +195,41 @@ def create_builtin_tool_registry(
                     "type": "object",
                     "properties": {
                         "content": {"type": "string", "description": "要保存的长期记忆内容。"},
+                        "layer": {
+                            "type": "string",
+                            "description": "可选记忆层级，默认 semantic；稳定偏好/协作规则用 procedural，当前任务用 session。",
+                        },
+                        "category": {"type": "string", "description": "可选分类，如 preference/project/profile。"},
+                        "importance": {"type": "number", "description": "0-1 的重要性，默认 0.5。"},
+                        "confidence": {"type": "number", "description": "0-1 的置信度，默认 0.75。"},
                     },
                     "required": ["content"],
                 },
                 handler=lambda arguments: memory.remember_memory(arguments, wait=False),
+                group="memory",
+            ),
+            Tool(
+                name="memory_update",
+                description=(
+                    "更新一条已存在的长期记忆。先用 memory_search 找到 memory_id；"
+                    "只在用户明确纠正、补充、合并旧记忆，或已有记忆明显过时时使用。"
+                    "不要写入密码、token、密钥、身份证、银行卡等敏感凭据。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string", "description": "记忆 id，来自 memory_search 结果。"},
+                        "content": {"type": "string", "description": "更新后的完整长期记忆内容。"},
+                        "layer": {"type": "string", "description": "可选记忆层级。"},
+                        "category": {"type": "string", "description": "可选分类。"},
+                        "importance": {"type": "number", "description": "0-1 的重要性。"},
+                        "confidence": {"type": "number", "description": "0-1 的置信度。"},
+                    },
+                    "required": ["memory_id", "content"],
+                },
+                handler=lambda arguments: memory.update_memory(
+                    _memory_update_arguments(arguments), wait=False
+                ),
                 group="memory",
             ),
             Tool(
@@ -250,6 +292,15 @@ def _memory_forget_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"id": memory_id}
 
 
+def _memory_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    memory_id = arguments.get("memory_id") or arguments.get("id")
+    mapped = {"id": memory_id, "content": arguments.get("content")}
+    for key in ("layer", "category", "importance", "confidence"):
+        if key in arguments:
+            mapped[key] = arguments.get(key)
+    return mapped
+
+
 class TodoStore:
     """以 JSON 文件保存轻量待办，供内部工具使用。"""
 
@@ -299,8 +350,8 @@ class TodoStore:
         return {"tasks": tasks}
 
     def _save(self, data: dict[str, list[dict[str, Any]]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
+        atomic_write_text(
+            self.path,
             json.dumps(data, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )

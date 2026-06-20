@@ -11,8 +11,38 @@ from app.llm.api_client import (
     _build_segmented_reply_instruction,
     _build_chat_completion_payload,
     _filter_supported_chat_params,
+    _is_temperature_unsupported_error,
 )
-from app.llm.chat_reply import parse_chat_reply
+from app.llm.chat_reply import ChatReply, ChatSegment, parse_chat_reply, sanitize_reply_tones
+
+
+def test_sanitize_reply_tones_normalizes_out_of_set_tone() -> None:
+    allowed = ["中性", "不满", "害羞", "请求", "惊讶"]
+    reply = ChatReply(
+        [
+            ChatSegment("hi", "en", "你好", "站立待机"),
+            ChatSegment("おはよ", "害羞", "早", "害羞"),
+            ChatSegment("x", "坚定", "", ""),
+        ]
+    )
+
+    out = sanitize_reply_tones(reply, allowed)
+
+    assert [segment.tone for segment in out.segments] == ["中性", "害羞", "中性"]
+    # 仅改 tone，文本/译文/立绘保持不变
+    assert out.segments[0].text == "hi"
+    assert out.segments[0].translation == "你好"
+    assert out.segments[0].portrait == "站立待机"
+
+
+def test_sanitize_reply_tones_keeps_object_when_all_valid() -> None:
+    allowed = ["中性", "害羞"]
+    reply = ChatReply([ChatSegment("a", "中性"), ChatSegment("b", "害羞")])
+
+    # 全合法时原样返回，避免无谓拷贝
+    assert sanitize_reply_tones(reply, allowed) is reply
+    # allowed 为空时不处理（向后兼容）
+    assert sanitize_reply_tones(reply, None) is reply
 
 
 def test_chat_param_filter_keeps_supported_values() -> None:
@@ -82,7 +112,7 @@ def test_complete_raw_applies_param_filter(monkeypatch) -> None:  # type: ignore
         )
     )
 
-    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         captured.update(payload)
         return {"choices": [{"message": {"content": "OK"}}]}
 
@@ -111,7 +141,7 @@ def test_complete_raw_retries_without_temperature_when_provider_rejects(monkeypa
         )
     )
 
-    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         calls.append(dict(payload))
         if "temperature" in payload:
             raise ApiRequestError("Unsupported value: temperature only supports the default value")
@@ -129,6 +159,36 @@ def test_complete_raw_retries_without_temperature_when_provider_rejects(monkeypa
     assert "temperature" not in calls[1]
 
 
+def test_is_temperature_unsupported_error_matches_varied_provider_wordings() -> None:
+    # 各家供应商对「仅支持默认温度」的措辞不一，都应触发自动回退。
+    recoverable = [
+        "Unsupported value: 'temperature' does not support 0.8 with this model."
+        " Only the default (1) value is supported.",
+        "temperature only supports the default value",
+        "temperature is not supported with this model",
+        "temperature must be 1 for this model",
+        "temperature can only be set to the default",
+        "this model only accepts the default temperature",
+        "temperature cannot be modified for reasoning models",
+        "Invalid value for 'temperature'.",
+    ]
+    for message in recoverable:
+        assert _is_temperature_unsupported_error(ApiRequestError(message)), message
+
+
+def test_is_temperature_unsupported_error_ignores_value_range_and_unrelated_errors() -> None:
+    # 值域错误是用户配置问题，应原样抛出；与温度无关的错误更不该误判。
+    non_recoverable = [
+        "temperature must be between 0 and 2",
+        "temperature should be in the range [0, 2]",
+        "temperature must be less than or equal to 2",
+        "invalid api key",
+        "model not found",
+    ]
+    for message in non_recoverable:
+        assert not _is_temperature_unsupported_error(ApiRequestError(message)), message
+
+
 def test_complete_raw_remembers_temperature_unsupported(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     calls: list[dict[str, Any]] = []
     client = OpenAICompatibleClient(
@@ -139,7 +199,7 @@ def test_complete_raw_remembers_temperature_unsupported(monkeypatch) -> None:  #
         )
     )
 
-    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         calls.append(dict(payload))
         if "temperature" in payload:
             raise ApiRequestError("temperature does not support non-default values")
@@ -165,7 +225,7 @@ def test_update_settings_clears_cached_unsupported_params(monkeypatch) -> None: 
         )
     )
 
-    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         calls.append(dict(payload))
         if len(calls) == 1:
             raise ApiRequestError("temperature only supports the default value")
@@ -198,7 +258,7 @@ def test_complete_raw_requests_structured_json_by_default_for_chat(monkeypatch) 
         )
     )
 
-    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         captured.update(payload)
         return {"choices": [{"message": {"content": '{"segments":[{"ja":"うん。","zh":"嗯。"}]}'}}]}
 
@@ -219,7 +279,7 @@ def test_response_format_falls_back_when_provider_rejects(monkeypatch) -> None: 
         )
     )
 
-    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         calls.append(dict(payload))
         if "response_format" in payload:
             raise ApiRequestError("unsupported response_format json_object")
@@ -247,7 +307,7 @@ def test_complete_with_tools_sends_tools_and_parses_tool_calls(monkeypatch) -> N
         )
     )
 
-    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         captured.update(payload)
         return {
             "choices": [
@@ -305,7 +365,7 @@ def test_complete_with_tools_can_request_structured_json(monkeypatch) -> None:  
         )
     )
 
-    def fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+    def fake_post(payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         captured.update(payload)
         return {"choices": [{"message": {"role": "assistant", "content": '{"segments":[]}'}}]}
 
@@ -329,7 +389,7 @@ def test_complete_with_tools_parses_pseudo_tool_call_json_content(monkeypatch) -
         )
     )
 
-    def fake_post(_payload: dict[str, Any]) -> dict[str, Any]:
+    def fake_post(_payload: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         return {
             "choices": [
                 {
@@ -379,7 +439,7 @@ def test_complete_with_tools_ignores_plain_json_reply_without_tool_call(monkeypa
     monkeypatch.setattr(
         client,
         "_post_chat_completions",
-        lambda _payload: {
+        lambda _payload, **_kwargs: {
             "choices": [{"message": {"role": "assistant", "content": '{"segments":[]}'}}]
         },
     )
@@ -406,7 +466,7 @@ def test_complete_with_tools_parses_nested_pseudo_tool_call(monkeypatch) -> None
     monkeypatch.setattr(
         client,
         "_post_chat_completions",
-        lambda _payload: {
+        lambda _payload, **_kwargs: {
             "choices": [
                 {
                     "message": {
@@ -555,6 +615,38 @@ def test_chat_completions_normalizes_google_ai_studio_base_url(monkeypatch) -> N
 
     assert client.test_connection() == "OK"
     assert captured["url"] == "https://generativelanguage.googleapis.com/v1/openai/chat/completions"
+
+
+def test_connection_omits_temperature(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import json
+
+    captured: dict[str, Any] = {}
+    client = OpenAICompatibleClient(
+        ApiSettings(base_url="https://api.example.com/v1", api_key="key", model="o3")
+    )
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_args):  # type: ignore[no-untyped-def]
+            return None
+
+        def read(self) -> bytes:
+            return b'{"choices":[{"message":{"content":"OK"}}]}'
+
+    def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+        _ = timeout
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    # 只接受默认温度的模型在检测阶段不应被显式 temperature 拒绝。
+    assert client.test_connection() == "OK"
+    assert "temperature" not in captured["payload"]
 
 
 def test_list_models_allows_empty_model_but_requires_key() -> None:
@@ -707,3 +799,11 @@ def test_parse_chat_reply_replaces_chinese_ja_with_safe_japanese() -> None:
 
     assert "原因是" not in reply.segments[0].text
     assert reply.segments[0].translation == "原因是 Mermaid 语法。"
+    assert reply.segments[0].suppress_tts is True
+
+
+def test_parse_chat_reply_suppresses_tts_for_safe_parse_failure() -> None:
+    reply = parse_chat_reply('{"segments":')
+
+    assert reply.segments[0].text
+    assert reply.segments[0].suppress_tts is True
