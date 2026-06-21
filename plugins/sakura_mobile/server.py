@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import secrets
 import threading
+import time
+from collections import deque
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,9 +15,12 @@ from urllib.parse import parse_qs, urlparse
 from app.core.debug_log import debug_log
 
 
-DEFAULT_HOST = "0.0.0.0"
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_REQUEST_BYTES = 12 * 1024 * 1024
+SOCKET_TIMEOUT_SECONDS = 30
+MAX_CONCURRENT_REQUESTS = 8
+MAX_REQUESTS_PER_MINUTE = 60
 
 
 class SakuraMobileHTTPServer(ThreadingHTTPServer):
@@ -23,8 +28,39 @@ class SakuraMobileHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+        self._rate_lock = threading.Lock()
+        self._request_times: dict[str, deque[float]] = {}
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            request.close()
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+    def allow_client_request(self, client_address: object) -> bool:
+        client = _client_address_text(client_address).rsplit(":", 1)[0]
+        now = time.monotonic()
+        with self._rate_lock:
+            requests = self._request_times.setdefault(client, deque())
+            while requests and now - requests[0] >= 60:
+                requests.popleft()
+            if len(requests) >= MAX_REQUESTS_PER_MINUTE:
+                return False
+            requests.append(now)
+            return True
+
     def get_request(self):  # type: ignore[no-untyped-def]
         request, client_address = super().get_request()
+        request.settimeout(SOCKET_TIMEOUT_SECONDS)
         service = getattr(self, "service", None)
         _write_mobile_access_log(
             getattr(service, "base_dir", None),
@@ -99,6 +135,7 @@ def _build_handler(service: MobilePluginService, token: str) -> type[BaseHTTPReq
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parsed = urlparse(self.path)
+                self._require_rate_limit()
                 self._log_request_start("GET", parsed.path)
                 if parsed.path in {"", "/"}:
                     self._require_token(parsed)
@@ -126,6 +163,7 @@ def _build_handler(service: MobilePluginService, token: str) -> type[BaseHTTPReq
         def do_POST(self) -> None:  # noqa: N802
             try:
                 parsed = urlparse(self.path)
+                self._require_rate_limit()
                 self._log_request_start("POST", parsed.path)
                 if parsed.path != "/api/chat":
                     self._send_error(HTTPStatus.NOT_FOUND, "Not found")
@@ -188,6 +226,10 @@ def _build_handler(service: MobilePluginService, token: str) -> type[BaseHTTPReq
             ).strip()
             if provided != token:
                 raise ValueError("配对码无效。")
+
+        def _require_rate_limit(self) -> None:
+            if not self.server.allow_client_request(self.client_address):  # type: ignore[attr-defined]
+                raise ValueError("请求过于频繁，请稍后再试。")
 
         def _send_json(self, data: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
             payload = json.dumps(data, ensure_ascii=False).encode("utf-8")

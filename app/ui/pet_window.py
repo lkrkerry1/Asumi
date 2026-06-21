@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -99,6 +100,7 @@ from app.backchannel.models import BackchannelLabel, BackchannelManifest
 from app.backchannel.resolver import BackchannelChoice
 from app.core.interaction import clear_interaction_id, set_interaction_id
 from app.core.mobile_chat_bridge import MobileChatBridge
+from app.core.mobile_chat_worker import MobileChatWorker
 from app.core.resource_manager import ResourceManager
 from app.storage.atomic import atomic_write_text
 from app.storage.paths import StoragePaths
@@ -474,6 +476,7 @@ class PetWindow(QWidget):
     # 插件请求把文本填入输入框；用信号 marshal 回 UI 线程（ASR 等可能在后台线程触发）。
     plugin_input_text_requested = Signal(str)
     mobile_chat_completed = Signal(str)
+    mobile_chat_requested = Signal(object)
 
     def __init__(
         self,
@@ -483,6 +486,7 @@ class PetWindow(QWidget):
         # 插件填充输入框的信号在此连接，确保后台线程触发时 marshal 回 UI 线程。
         self.plugin_input_text_requested.connect(self._apply_plugin_input_text)
         self.mobile_chat_completed.connect(self._handle_mobile_chat_completed)
+        self.mobile_chat_requested.connect(self._enqueue_mobile_chat)
         self.context = context
         self.base_dir = context.base_dir
         self.startup_initializing = context.startup_initializing
@@ -513,6 +517,8 @@ class PetWindow(QWidget):
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = context.history_store
         self.mobile_chat_bridge = MobileChatBridge(self)
+        self._mobile_chat_requests: list[dict[str, Any]] = []
+        self._active_mobile_chat_request: dict[str, Any] | None = None
         self.runtime_event_log = context.runtime_event_log
         self.visual_observation_store = context.visual_observation_store
         self.mcp_settings = context.mcp_settings
@@ -4230,10 +4236,9 @@ class PetWindow(QWidget):
     @Slot(str)
     def _handle_mobile_chat_completed(self, character_id: str) -> None:
         """手机端完成一轮对话后，复用当前角色的新版自动记忆整理节奏。"""
-        if character_id != self.character_profile.id:
-            return
-        self._record_completed_memory_turn()
-        self._maybe_start_auto_memory_curation()
+        # Mobile sessions maintain per-character history and curation state in
+        # MobileChatBridge. Do not apply their turn to the desktop character.
+        del character_id
 
     def _maybe_start_auto_memory_curation(self) -> None:
         if getattr(self, "startup_initializing", False):
@@ -4506,6 +4511,60 @@ class PetWindow(QWidget):
 
     def _mobile_chat(self, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
         return self.mobile_chat_bridge.chat(character_id, text, image_data_url)
+
+    def submit_mobile_chat(self, bridge: MobileChatBridge, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
+        """Marshal an HTTP request into the single host Agent worker lane."""
+        request: dict[str, Any] = {"bridge": bridge, "character_id": character_id, "text": text, "image_data_url": image_data_url, "done": threading.Event(), "result": None, "error": ""}
+        self.mobile_chat_requested.emit(request)
+        if not request["done"].wait(timeout=300):
+            raise TimeoutError("移动端聊天等待超时。")
+        if request["error"]:
+            raise RuntimeError(str(request["error"]))
+        result = request["result"]
+        if not isinstance(result, dict):
+            raise RuntimeError("移动端聊天未返回有效结果。")
+        return result
+
+    @Slot(object)
+    def _enqueue_mobile_chat(self, request: object) -> None:
+        if not isinstance(request, dict):
+            return
+        if getattr(self, "_shutdown_in_progress", False):
+            request["error"] = "应用正在关闭。"
+            request["done"].set()
+            return
+        self._mobile_chat_requests.append(request)
+        self._start_next_mobile_chat()
+
+    def _start_next_mobile_chat(self) -> None:
+        if self.worker_thread is not None or self._active_mobile_chat_request is not None or not self._mobile_chat_requests:
+            return
+        request = self._mobile_chat_requests.pop(0)
+        self._active_mobile_chat_request = request
+        worker = MobileChatWorker(request["bridge"], str(request["character_id"]), str(request["text"]), str(request["image_data_url"]))
+        self.resource_manager.spawn_qt_worker(
+            worker, parent=self, owner=self, thread_attr="worker_thread", worker_attr="worker",
+            signal_bindings=[(worker.finished, self._handle_mobile_chat_result), (worker.failed, self._handle_mobile_chat_error)],
+            quit_on=[worker.finished, worker.failed], on_finished=self._finish_mobile_chat_worker,
+        )
+
+    @Slot(object)
+    def _handle_mobile_chat_result(self, result: object) -> None:
+        request = self._active_mobile_chat_request
+        if request is not None:
+            request["result"] = result
+            request["done"].set()
+
+    @Slot(str)
+    def _handle_mobile_chat_error(self, message: str) -> None:
+        request = self._active_mobile_chat_request
+        if request is not None:
+            request["error"] = message
+            request["done"].set()
+
+    def _finish_mobile_chat_worker(self) -> None:
+        self._active_mobile_chat_request = None
+        self._start_next_mobile_chat()
 
     def _request_fill_input_text(self, text: str) -> None:
         """插件侧入口：请求把文本填入输入框。

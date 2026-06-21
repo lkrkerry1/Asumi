@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.agent.runtime import AgentRuntime
+from app.agent.tools.registry import ToolRegistry
+from app.agent.memory_curator import MemoryCurator, MemoryCurationState
+from app.core.debug_log import debug_log
 from app.config.character_loader import CharacterProfile, load_character_system_prompt
 from app.llm.api_client import ChatMessage, OpenAICompatibleClient
 from app.llm.context_trimming import trim_messages_for_model
@@ -20,6 +23,8 @@ class _MobileCharacterSession:
     profile: CharacterProfile
     runtime: AgentRuntime
     history_store: ChatHistoryStore
+    memory_curation_state: MemoryCurationState
+    memory_curator: MemoryCurator
 
 
 class MobileChatBridge:
@@ -50,6 +55,13 @@ class MobileChatBridge:
         return [_history_entry_for_mobile(entry) for entry in entries]
 
     def chat(self, character_id: str, text: str, image_data_url: str = "") -> dict[str, Any]:
+        submit = getattr(self._host, "submit_mobile_chat", None)
+        if not callable(submit):
+            raise RuntimeError("移动端聊天调度器尚未就绪。")
+        return submit(self, character_id, text, image_data_url)
+
+    def execute_chat(self, character_id: str, text: str, image_data_url: str = "") -> dict[str, Any]:
+        """Execute one request inside the host-controlled Qt worker queue."""
         clean_text = text.strip()
         clean_image = image_data_url.strip()
         if not clean_text and not clean_image:
@@ -95,6 +107,8 @@ class MobileChatBridge:
                     segment.portrait,
                 )
 
+            self._maybe_curate_memory(session)
+
         self._notify_host_chat_completed(session.profile.id)
         return {
             "character_id": session.profile.id,
@@ -114,22 +128,53 @@ class MobileChatBridge:
 
         profile = self._host.character_registry.get(clean_id)
         history_store = self._host._create_history_store(profile)
+        memory_store = self._host.memory_store.scoped(profile.id)
         runtime = AgentRuntime(
             api_client=OpenAICompatibleClient(self._host.api_client.settings),
             system_prompt=load_character_system_prompt(profile),
             reply_tones=profile.reply_tones,
             reply_portraits=profile.portrait_choices,
-            tools=self._host.tool_registry,
-            memory=self._host.memory_store,
+            # Mobile has no confirmation UI yet. Do not advertise host tools
+            # and leave a user stranded with a pending high-risk action.
+            tools=ToolRegistry([]),
+            memory=memory_store,
             history_store=history_store,
             prompt_patches=self._host.agent_runtime.prompt_patches,
             context_providers=self._host.agent_runtime.context_providers,
             runtime_loop_settings=self._host.agent_runtime.runtime_loop_settings,
         )
         runtime.set_autonomous_screen_observation_enabled(False)
-        session = _MobileCharacterSession(profile, runtime, history_store)
+        state_path = self._host.base_dir / "data" / f"memory_curation_state.{profile.id}.json"
+        session = _MobileCharacterSession(
+            profile,
+            runtime,
+            history_store,
+            MemoryCurationState(state_path),
+            MemoryCurator(runtime.api_client, memory_store, system_prompt=runtime.system_prompt),
+        )
         self._sessions[profile.id] = session
         return session
+
+    def _maybe_curate_memory(self, session: _MobileCharacterSession) -> None:
+        """Apply the turn-based curation policy to every mobile character."""
+        settings = self._host.memory_curation_settings
+        if not settings.enabled:
+            return
+        pending_turns = session.memory_curation_state.increment_pending_turns()
+        if pending_turns < settings.trigger_turns:
+            return
+        entries = session.memory_curation_state.unprocessed_entries(session.history_store.load())
+        if not entries:
+            return
+        try:
+            result = session.memory_curator.curate_entries(entries)
+            session.memory_curation_state.mark_processed(
+                len(session.history_store.load()),
+                consumed_turns=pending_turns,
+            )
+            debug_log("Memory", "移动端角色记忆整理完成", {"character_id": session.profile.id, "processed": result.processed_entries})
+        except Exception as exc:  # noqa: BLE001
+            debug_log("Memory", "移动端角色记忆整理失败", {"character_id": session.profile.id, "error": str(exc)})
 
     def _notify_host_chat_completed(self, character_id: str) -> None:
         """让 UI 线程安全地把当前角色的手机对话纳入自动记忆整理。"""
