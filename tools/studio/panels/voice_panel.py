@@ -53,6 +53,18 @@ def _copy_into(package_dir: Path, src: Path, subdir: str) -> str:
     return f"{subdir}/{src.name}"
 
 
+
+def _remove_previous_model(package_dir: Path, old_rel: str, keep_rel: str) -> None:
+    if not old_rel or old_rel == keep_rel:
+        return
+    models_dir = (package_dir / MODELS_SUBDIR).resolve()
+    old_path = (package_dir / old_rel).resolve()
+    try:
+        old_path.relative_to(models_dir)
+    except ValueError:
+        return
+    if old_path.is_file():
+        old_path.unlink(missing_ok=True)
 def _with_button(edit: QLineEdit, text: str, slot) -> QWidget:
     wrap = QWidget()
     wrap.setObjectName("studioInlineField")
@@ -125,7 +137,10 @@ class VoiceModelPanel(StudioPanel):
             return
         path, _ = QFileDialog.getOpenFileName(self, "选择模型文件", "", MODEL_EXTS)
         if path:
-            edit.setText(_copy_into(self._package_dir, Path(path), MODELS_SUBDIR))
+            old_rel = edit.text().strip()
+            new_rel = _copy_into(self._package_dir, Path(path), MODELS_SUBDIR)
+            _remove_previous_model(self._package_dir, old_rel, new_rel)
+            edit.setText(new_rel)
 
     def load_from(self, doc: CharacterDoc) -> None:
         voice = doc.voice

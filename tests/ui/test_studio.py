@@ -160,6 +160,39 @@ def test_voice_model_and_reference_audio_merge_one_voice_draft(
     assert ref_panel.ref_table.verticalHeader().defaultSectionSize() >= 38
 
 
+
+def test_voice_model_picker_removes_previous_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _qt_app()
+    _disable_audio_player(monkeypatch)
+
+    from tools.studio.panels import voice_panel
+    from tools.studio.panels.voice_panel import VoiceModelPanel
+
+    package_dir = _studio_runtime_root("studio_voice_replace") / "character"
+    models_dir = package_dir / "voice" / "models"
+    models_dir.mkdir(parents=True)
+    old_model = models_dir / "old.ckpt"
+    old_model.write_bytes(b"old")
+    source_model = _studio_runtime_root("studio_voice_replace_source") / "new.ckpt"
+    source_model.write_bytes(b"new")
+
+    panel = VoiceModelPanel()
+    panel.bind_package_dir(package_dir)
+    panel.gpt_edit.setText("voice/models/old.ckpt")
+    monkeypatch.setattr(
+        voice_panel.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: (str(source_model), ""),
+    )
+
+    panel._pick_gpt()
+
+    assert panel.gpt_edit.text() == "voice/models/new.ckpt"
+    assert not old_model.exists()
+    assert (models_dir / "new.ckpt").read_bytes() == b"new"
+
 def test_portrait_panel_edits_portrait_description_tags() -> None:
     _qt_app()
 
