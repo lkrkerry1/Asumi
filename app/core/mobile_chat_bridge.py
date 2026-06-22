@@ -36,16 +36,14 @@ class MobileChatBridge:
         self._lock = threading.RLock()
 
     def characters(self) -> list[dict[str, str]]:
-        registry = self._host.character_registry
-        current_id = self._host.character_profile.id
+        profile = self._host.character_profile
         return [
             {
                 "id": profile.id,
                 "name": profile.display_name,
                 "initial_message": profile.initial_message,
-                "current": "true" if profile.id == current_id else "false",
+                "current": "true",
             }
-            for profile in registry.all()
         ]
 
     def history(self, character_id: str, limit: int = 50) -> list[dict[str, str]]:
@@ -126,6 +124,9 @@ class MobileChatBridge:
 
     def _session(self, character_id: str) -> _MobileCharacterSession:
         clean_id = character_id.strip() or self._host.character_profile.id
+        current_id = self._host.character_profile.id
+        if clean_id != current_id:
+            raise ValueError("手机端只能使用桌面当前角色。")
         session = self._sessions.get(clean_id)
         if session is not None:
             return session

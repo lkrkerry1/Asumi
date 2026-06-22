@@ -395,7 +395,7 @@ def _mobile_html(token: str) -> str:
 <main>
   <header>
     <h1>Sakura</h1>
-    <select id="character"></select>
+    <select id="character" disabled></select>
   </header>
   <section id="chat"></section>
   <div>
