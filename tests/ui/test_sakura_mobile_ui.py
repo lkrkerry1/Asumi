@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from PySide6.QtWidgets import QApplication, QLineEdit
 
 from app.llm.chat_reply import ChatSegment
+from app.ui.theme import DEFAULT_THEME_SETTINGS, build_settings_dialog_stylesheet
 
 
 def test_mobile_settings_panel_shows_token_and_links() -> None:
@@ -43,6 +44,16 @@ def test_mobile_settings_panel_shows_token_and_links() -> None:
 
     assert QApplication.clipboard().text() == "http://127.0.0.1:8765/?token=secret"
     assert panel.copy_local_button.text() == "已复制"
+
+
+def test_readonly_link_selection_stays_visible() -> None:
+    stylesheet = build_settings_dialog_stylesheet(DEFAULT_THEME_SETTINGS)
+    start = stylesheet.index('QLineEdit[readOnly="true"] {')
+    end = stylesheet.index("QComboBox {", start)
+    block = stylesheet[start:end]
+
+    assert "selection-background-color: transparent" not in block
+    assert "selection-color:" in block
 
 
 def test_mobile_chat_completion_syncs_current_desktop_context() -> None:
