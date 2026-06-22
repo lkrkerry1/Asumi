@@ -2947,9 +2947,12 @@ class SettingsDialog(QDialog):
                 selector.setStyleSheet(self.styleSheet())
 
             scroll = QScrollArea(selector)
+            scroll.setObjectName("settingsScrollArea")
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.viewport().setObjectName("settingsScrollViewport")
             body = QWidget(scroll)
+            body.setObjectName("settingsScrollContent")
             body_layout = QVBoxLayout(body)
             body_layout.setContentsMargins(0, 0, 0, 0)
             body_layout.setSpacing(4)
@@ -3950,11 +3953,11 @@ def _normalize_model_section(section: str | None) -> str:
 def _ensure_api_profiles(
     api_settings: ApiSettings,
     api_profiles: list[ApiConfigProfile] | None,
-    global_model_names: list[str] | None,
+    _global_model_names: list[str] | None,
 ) -> list[ApiConfigProfile]:
     if api_profiles:
-        return [*_normalize_profile_models(api_profiles, global_model_names)]
-    models = _dedupe([api_settings.model, *(global_model_names or [])])
+        return [*_normalize_profile_models(api_profiles)]
+    models = _dedupe([api_settings.model])
     return [
         ApiConfigProfile(
             id="default",
@@ -3980,11 +3983,10 @@ def _ensure_model_selection(
 
 def _normalize_profile_models(
     profiles: list[ApiConfigProfile],
-    global_model_names: list[str] | None,
 ) -> list[ApiConfigProfile]:
     result: list[ApiConfigProfile] = []
     for profile in profiles:
-        models = tuple(_dedupe([*profile.models, *(global_model_names or [])]))
+        models = tuple(_dedupe(profile.models))
         result.append(
             ApiConfigProfile(
                 id=profile.id,

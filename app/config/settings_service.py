@@ -236,7 +236,7 @@ class AppSettingsService:
                 alias=DEFAULT_PROFILE_ALIAS,
                 base_url=str(llm.get("base_url", DEFAULT_BASE_URL)).strip().rstrip("/"),
                 api_key=str(llm.get("api_key", "")).strip(),
-                models=tuple(_dedupe([old_model or DEFAULT_TEXT_MODEL, DEFAULT_VISION_MODEL])),
+                models=tuple(_dedupe([old_model or DEFAULT_TEXT_MODEL])),
             )
             # 写入新格式
             self.save_api_profiles([profile])

@@ -89,7 +89,7 @@ llm:
     selection = service.load_model_selection()
 
     assert profiles[0].base_url == "https://legacy.example/v1"
-    assert "legacy-chat" in profiles[0].models
+    assert profiles[0].models == ("legacy-chat",)
     assert selection.chat.profile_id == "default"
     assert selection.chat.model == "legacy-chat"
     assert load_yaml_mapping(service.api_config_path)["model_slots"]["chat"]["model"] == "legacy-chat"
