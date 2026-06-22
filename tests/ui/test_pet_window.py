@@ -3348,11 +3348,11 @@ def test_settings_dialog_uses_grouped_top_level_tabs() -> None:
     assert "QSpinBox::up-button:disabled" in dialog.styleSheet()
     assert "QGroupBox QWidget" not in dialog.styleSheet()
     assert isinstance(dialog.character_combo, QComboBox)
-    assert isinstance(dialog.model_edit, QComboBox)
+    assert isinstance(dialog.vision_model_combo, QComboBox)
     assert isinstance(dialog.tts_provider_combo, QComboBox)
     assert isinstance(dialog.theme_visual_effect_combo, QComboBox)
     assert not hasattr(dialog.character_combo, "_popup_frame")
-    assert not hasattr(dialog.model_edit, "_popup_frame")
+    assert not hasattr(dialog.vision_model_combo, "_popup_frame")
     assert app.styleSheet() == app_stylesheet_before
 
     combo_bottom = dialog.character_combo.mapToGlobal(dialog.character_combo.rect().bottomLeft()).y()
@@ -4536,7 +4536,7 @@ def test_settings_dialog_tests_api_when_api_changes(monkeypatch) -> None:  # typ
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
     )
-    dialog.model_edit.setText("new-model")
+    dialog.vision_model_combo.setText("new-model")
     calls: list[str] = []
 
     def fake_start_api_test(settings, accept_values=None):  # type: ignore[no-untyped-def]
@@ -4561,7 +4561,7 @@ def test_settings_dialog_model_combo_saves_manual_input(monkeypatch) -> None:  #
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
 
     dialog, app = _build_api_settings_dialog("api_manual_model")
-    dialog.model_edit.setText("manual-model")
+    dialog.vision_model_combo.setText("manual-model")
     monkeypatch.setattr(dialog, "_start_api_settings_test", lambda settings, accept_values=None: dialog._continue_accept_after_api_test(accept_values))
 
     dialog.accept()
@@ -4589,9 +4589,9 @@ def test_settings_dialog_model_probe_populates_candidates_and_selects_first(monk
 
     dialog._handle_api_model_probe_success(["z-model", "a-model"])
 
-    assert dialog.model_edit.currentText() == "z-model"
-    assert [dialog.model_edit.itemText(index) for index in range(dialog.model_edit.count())] == ["z-model", "a-model"]
-    assert not hasattr(dialog.model_edit, "_popup_list")
+    assert dialog.vision_model_combo.currentText() == "z-model"
+    assert [dialog.vision_model_combo.itemText(index) for index in range(dialog.vision_model_combo.count())] == ["z-model", "a-model"]
+    assert not hasattr(dialog.vision_model_combo, "_popup_list")
     assert infos and "2" in infos[0]
     dialog.deleteLater()
     app.processEvents()
@@ -4627,18 +4627,18 @@ def test_settings_dialog_model_popups_follow_current_theme_stylesheet() -> None:
         theme_settings=themed,
     )
 
-    dialog.model_edit.set_model_names(["alpha-model", "beta-model"])
+    dialog.vision_model_combo.set_model_names(["alpha-model", "beta-model"])
     stylesheet = dialog.styleSheet()
 
     assert "QComboBox QAbstractItemView" in stylesheet
     assert rgba("#102030", 246) in stylesheet
     assert rgba(themed.primary_color, 43) in stylesheet
     assert "#ddeeff" in stylesheet
-    assert [dialog.model_edit.itemText(index) for index in range(dialog.model_edit.count())] == [
+    assert [dialog.vision_model_combo.itemText(index) for index in range(dialog.vision_model_combo.count())] == [
         "alpha-model",
         "beta-model",
     ]
-    assert not hasattr(dialog.model_edit, "_popup_list")
+    assert not hasattr(dialog.vision_model_combo, "_popup_list")
 
     dialog.deleteLater()
     app.processEvents()
@@ -4656,8 +4656,8 @@ def test_settings_dialog_model_probe_keeps_current_input(monkeypatch) -> None:  
 
     dialog._handle_api_model_probe_success(["a-model", "b-model"])
 
-    assert dialog.model_edit.currentText() == "custom-model"
-    assert dialog.model_edit.completer().completionModel().rowCount() == 2
+    assert dialog.vision_model_combo.currentText() == "custom-model"
+    assert dialog.vision_model_combo.completer().completionModel().rowCount() == 2
     dialog.deleteLater()
     app.processEvents()
 
@@ -4682,7 +4682,7 @@ def test_settings_dialog_model_probe_failure_keeps_current_model(monkeypatch) ->
     assert len(warnings) == 1
     assert "处理建议" in warnings[0]
     assert "诊断信息（截图时请保留）：\n无法连接" in warnings[0]
-    assert dialog.model_edit.currentText() == "current-model"
+    assert dialog.vision_model_combo.currentText() == "current-model"
     assert dialog.result_api_settings is None
     dialog.deleteLater()
     app.processEvents()
@@ -4698,18 +4698,19 @@ def test_settings_dialog_model_probe_busy_state_disables_actions() -> None:
     dialog, app = _build_api_settings_dialog("api_model_probe_busy")
     save_button = dialog.button_box.button(QDialogButtonBox.StandardButton.Save)
 
+    dialog._active_test_section = "vision"
     dialog._set_api_model_probe_busy(True)
 
-    assert not dialog.api_model_probe_button.isEnabled()
-    assert not dialog.api_test_button.isEnabled()
+    assert not dialog.vision_probe_btn.isEnabled()
+    assert not dialog.vision_test_btn.isEnabled()
     assert save_button is not None
     assert not save_button.isEnabled()
     assert save_button.text() == "检测模型..."
 
     dialog._set_api_model_probe_busy(False)
 
-    assert dialog.api_model_probe_button.isEnabled()
-    assert dialog.api_test_button.isEnabled()
+    assert dialog.vision_probe_btn.isEnabled()
+    assert dialog.vision_test_btn.isEnabled()
     assert save_button.isEnabled()
     dialog.deleteLater()
     app.processEvents()
@@ -4738,7 +4739,7 @@ def test_settings_dialog_api_test_failure_blocks_save(monkeypatch) -> None:  # t
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
     )
-    dialog.model_edit.setText("bad-model")
+    dialog.vision_model_combo.setText("bad-model")
     warnings: list[str] = []
     monkeypatch.setattr(
         settings_dialog_module.QMessageBox,
@@ -4787,7 +4788,7 @@ def test_settings_dialog_api_success_continues_to_tts_test(monkeypatch) -> None:
         proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
         mcp_settings=MCPRuntimeSettings(windows_enabled=False),
     )
-    dialog.model_edit.setText("new-model")
+    dialog.vision_model_combo.setText("new-model")
     dialog.tts_enabled_check.setChecked(True)
     nanami_index = dialog.character_combo.findData("nanami")
     assert nanami_index >= 0

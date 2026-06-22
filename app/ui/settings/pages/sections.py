@@ -451,11 +451,25 @@ class ApiSettingsPage:
         self._set_profile_combo_value(owner.vision_profile_combo, owner._model_selection.vision_profile_id)
         owner.vision_model_combo.setText(owner._model_selection.vision_model)
 
+        owner.vision_probe_btn = QPushButton("检测模型列表", vision_group)
+        owner.vision_test_btn = QPushButton("测试 API", vision_group)
+        owner.vision_probe_btn.clicked.connect(lambda: owner._probe_api_models("vision"))
+        owner.vision_test_btn.clicked.connect(lambda: owner._test_api_settings("vision"))
+
+        vision_actions = QWidget(vision_group)
+        vision_actions_layout = QHBoxLayout(vision_actions)
+        vision_actions_layout.setContentsMargins(0, 0, 0, 0)
+        vision_actions_layout.setSpacing(8)
+        vision_actions_layout.addStretch(1)
+        vision_actions_layout.addWidget(owner.vision_probe_btn)
+        vision_actions_layout.addWidget(owner.vision_test_btn)
+
         vision_form = QFormLayout()
         vision_form.setContentsMargins(12, 8, 12, 8)
         vision_form.setSpacing(8)
         vision_form.addRow("API 配置集", owner.vision_profile_combo)
         vision_form.addRow("模型名称", owner.vision_model_combo)
+        vision_form.addRow("", vision_actions)
         vision_group.setLayout(vision_form)
 
         # ── 文本模型配置 ──
@@ -470,12 +484,26 @@ class ApiSettingsPage:
         self._set_profile_combo_value(owner.text_profile_combo, owner._model_selection.text_profile_id)
         owner.text_model_combo.setText(owner._model_selection.text_model)
 
+        owner.text_probe_btn = QPushButton("检测模型列表", text_group)
+        owner.text_test_btn = QPushButton("测试 API", text_group)
+        owner.text_probe_btn.clicked.connect(lambda: owner._probe_api_models("text"))
+        owner.text_test_btn.clicked.connect(lambda: owner._test_api_settings("text"))
+
+        text_actions = QWidget(text_group)
+        text_actions_layout = QHBoxLayout(text_actions)
+        text_actions_layout.setContentsMargins(0, 0, 0, 0)
+        text_actions_layout.setSpacing(8)
+        text_actions_layout.addStretch(1)
+        text_actions_layout.addWidget(owner.text_probe_btn)
+        text_actions_layout.addWidget(owner.text_test_btn)
+
         text_form = QFormLayout()
         text_form.setContentsMargins(12, 8, 12, 8)
         text_form.setSpacing(8)
         text_form.addRow("", owner.text_enabled_check)
         text_form.addRow("API 配置集", owner.text_profile_combo)
         text_form.addRow("模型名称", owner.text_model_combo)
+        text_form.addRow("", text_actions)
         text_group.setLayout(text_form)
 
         owner.text_enabled_check.toggled.connect(lambda enabled: self._sync_text_model_enabled(owner, enabled))
@@ -488,23 +516,10 @@ class ApiSettingsPage:
         owner.api_timeout_spin.setSuffix(" 秒")
         owner.api_timeout_spin.setValue(settings.timeout_seconds)
 
-        owner.api_model_probe_button = QPushButton("探测模型列表", basic_group)
-        owner.api_model_probe_button.clicked.connect(owner._probe_api_models)
-        owner.api_test_button = QPushButton("测试 API", basic_group)
-        owner.api_test_button.clicked.connect(owner._test_api_settings)
-
-        api_actions = QWidget(basic_group)
-        api_actions_layout = QHBoxLayout(api_actions)
-        api_actions_layout.setContentsMargins(0, 0, 0, 0)
-        api_actions_layout.setSpacing(8)
-        api_actions_layout.addWidget(owner.api_model_probe_button)
-        api_actions_layout.addWidget(owner.api_test_button)
-
         basic_form = QFormLayout()
         basic_form.setContentsMargins(12, 8, 12, 8)
         basic_form.setSpacing(8)
         basic_form.addRow("超时", owner.api_timeout_spin)
-        basic_form.addRow("", api_actions)
         basic_group.setLayout(basic_form)
 
         # ── 组装 ──
@@ -542,6 +557,8 @@ class ApiSettingsPage:
     def _sync_text_model_enabled(self, owner: Any, enabled: bool) -> None:
         owner.text_profile_combo.setEnabled(enabled)
         owner.text_model_combo.setEnabled(enabled)
+        owner.text_probe_btn.setEnabled(enabled)
+        owner.text_test_btn.setEnabled(enabled)
 
     def _build_advanced_llm_params_group(self, settings: ApiSettings, parent: QWidget) -> QGroupBox:
         owner = self.dialog

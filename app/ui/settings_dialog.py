@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QColorDialog,
@@ -268,6 +269,8 @@ class SettingsDialog(QDialog):
         self._api_test_worker: settings_workers.ApiConnectionTestWorker | None = None
         self._api_model_probe_thread: QThread | None = None
         self._api_model_probe_worker: settings_workers.ApiModelListProbeWorker | None = None
+        self._active_test_section: str | None = None  # "vision" | "text" | None，当前测试的 section
+        self._pending_test_queue: list[str] | None = None  # 保存流程中待测试的 section 队列
         self._tts_test_thread: QThread | None = None
         self._tts_test_worker: settings_workers.TTSTestWorker | None = None
         self._tts_bundle_download_dialog: TTSBundleDownloadDialog | None = None
@@ -2022,12 +2025,33 @@ class SettingsDialog(QDialog):
         accept_values = self._collect_accept_values()
         if accept_values is None:
             return
-        api_settings = accept_values["api_settings"]
-        if isinstance(api_settings, ApiSettings) and self._should_test_api_on_accept(api_settings):
-            self._start_api_settings_test(api_settings, accept_values)
+
+        # 构建需要测试的 section 队列：视觉始终测试，文本在启用且变动时测试
+        sections_to_test: list[str] = []
+        if self._should_test_model_on_accept("vision"):
+            sections_to_test.append("vision")
+        if self._should_test_model_on_accept("text"):
+            sections_to_test.append("text")
+
+        if sections_to_test:
+            self._pending_test_queue = sections_to_test
+            self._run_next_section_test(accept_values)
             return
 
         self._continue_accept_after_api_test(accept_values)
+
+    def _run_next_section_test(self, accept_values: dict[str, object]) -> None:
+        """从 _pending_test_queue 弹出下一个 section 进行 API 测试。"""
+        if not self._pending_test_queue:
+            self._continue_accept_after_api_test(accept_values)
+            return
+        section = self._pending_test_queue.pop(0)
+        settings = self._validated_api_settings(section)
+        if settings is None:
+            self._pending_test_queue = None
+            return
+        self._active_test_section = section
+        self._start_api_settings_test(settings, accept_values)
 
     def _continue_accept_after_api_test(self, accept_values: dict[str, object]) -> None:
         tts_settings = accept_values["tts_settings"]
@@ -2036,8 +2060,33 @@ class SettingsDialog(QDialog):
             return
         self._complete_accept(accept_values)
 
-    def _should_test_api_on_accept(self, api_settings: ApiSettings) -> bool:
-        return api_settings != self._initial_api_settings
+    def _should_test_model_on_accept(self, section: str) -> bool:
+        """判断指定 section 的模型配置在保存时是否需要重新测试。"""
+        current = self._collect_model_selection()
+        initial = self._initial_model_selection
+        if section == "vision":
+            return (
+                current.vision_profile_id != initial.vision_profile_id
+                or current.vision_model != initial.vision_model
+            )
+        if section == "text":
+            return (
+                current.text_enabled
+                and (
+                    current.text_profile_id != initial.text_profile_id
+                    or current.text_model != initial.text_model
+                )
+            )
+        return False
+
+    def _collect_model_selection(self) -> ModelSelectionSettings:
+        return ModelSelectionSettings(
+            vision_profile_id=str(self.vision_profile_combo.currentData() or ""),
+            vision_model=self.vision_model_combo.text().strip(),
+            text_enabled=self.text_enabled_check.isChecked(),
+            text_profile_id=str(self.text_profile_combo.currentData() or ""),
+            text_model=self.text_model_combo.text().strip(),
+        )
 
     def _should_test_tts_on_accept(
         self,
@@ -2148,13 +2197,7 @@ class SettingsDialog(QDialog):
             "memory_curation_settings": self._collect_memory_curation_settings(),
             "api_profiles": list(self._api_profiles),
             "global_model_names": list(self._global_model_names),
-            "model_selection": ModelSelectionSettings(
-                vision_profile_id=str(self.vision_profile_combo.currentData() or ""),
-                vision_model=self.vision_model_combo.text().strip(),
-                text_enabled=self.text_enabled_check.isChecked(),
-                text_profile_id=str(self.text_profile_combo.currentData() or ""),
-                text_model=self.text_model_combo.text().strip(),
-            ),
+            "model_selection": self._collect_model_selection(),
         }
 
     def _complete_accept(self, values: dict[str, object]) -> None:
@@ -2341,8 +2384,8 @@ class SettingsDialog(QDialog):
             return
         super().closeEvent(event)
 
-    def _test_api_settings(self) -> None:
-        settings = self._validated_api_settings()
+    def _test_api_settings(self, section: str = "vision") -> None:
+        settings = self._validated_api_settings(section)
         if (
             settings is None
             or self._api_test_thread is not None
@@ -2351,6 +2394,7 @@ class SettingsDialog(QDialog):
         ):
             return
 
+        self._active_test_section = section
         self._start_api_settings_test(settings)
 
     def _start_api_settings_test(
@@ -2382,18 +2426,27 @@ class SettingsDialog(QDialog):
     def _handle_api_test_success(self, message: str) -> None:
         accept_values = self._pending_api_accept_values
         if accept_values is not None:
+            if self._pending_test_queue:
+                self._run_next_section_test(accept_values)
+                return
             self._continue_accept_after_api_test(accept_values)
             return
-        QMessageBox.information(self, "测试成功", f"API 连接成功，模型返回：{message}")
+        # 手动点击测试按钮的情况
+        section = self._active_test_section or "vision"
+        label = "视觉模型" if section == "vision" else "文本模型"
+        QMessageBox.information(self, "测试成功", f"{label} API 连接成功，模型返回：{message}")
 
     @Slot(str)
     def _handle_api_test_failed(self, message: str) -> None:
+        section = self._active_test_section or "vision"
+        label = "视觉模型" if section == "vision" else "文本模型"
         if self._pending_api_accept_values is not None:
+            self._pending_test_queue = None
             QMessageBox.warning(
                 self,
                 "API 检测失败",
                 format_failure_message(
-                    "API 连接检测失败，设置尚未保存。",
+                    f"{label} API 连接检测失败，设置尚未保存。",
                     "请检查网络或代理，以及 Base URL、API Key 和模型名称后再保存。",
                     message,
                 ),
@@ -2403,7 +2456,7 @@ class SettingsDialog(QDialog):
             self,
             "测试失败",
             format_failure_message(
-                "API 连接测试没有成功。",
+                f"{label} API 连接测试没有成功。",
                 "请检查网络或代理，以及 Base URL、API Key 和模型名称后重试。",
                 message,
             ),
@@ -2414,12 +2467,20 @@ class SettingsDialog(QDialog):
         self._api_test_thread = None
         self._api_test_worker = None
         self._pending_api_accept_values = None
+        self._pending_test_queue = None
         self._set_api_test_busy(False)
+        self._active_test_section = None
 
     def _set_api_test_busy(self, busy: bool) -> None:
-        self.api_test_button.setEnabled(not busy)
-        self.api_test_button.setText("测试中..." if busy else "测试 API")
-        self.api_model_probe_button.setEnabled(not busy)
+        # 根据 _active_test_section 禁用对应的按钮
+        section = self._active_test_section or "vision"
+        test_btn = getattr(self, f"{section}_test_btn", None)
+        if test_btn:
+            test_btn.setEnabled(not busy)
+            test_btn.setText("测试中..." if busy else "测试 API")
+        probe_btn = getattr(self, f"{section}_probe_btn", None)
+        if probe_btn:
+            probe_btn.setEnabled(not busy)
         if not hasattr(self, "button_box"):
             return
         save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
@@ -2435,8 +2496,8 @@ class SettingsDialog(QDialog):
             save_button.setText(self._save_button_text)
             self._save_button_text = None
 
-    def _probe_api_models(self) -> None:
-        settings = self._validated_api_model_probe_settings()
+    def _probe_api_models(self, section: str = "vision") -> None:
+        settings = self._validated_api_model_probe_settings(section)
         if (
             settings is None
             or self._api_model_probe_thread is not None
@@ -2444,6 +2505,7 @@ class SettingsDialog(QDialog):
             or self._tts_test_thread is not None
         ):
             return
+        self._active_test_section = section
         self._set_api_model_probe_busy(True)
         thread = QThread()
         worker = settings_workers.ApiModelListProbeWorker(settings)
@@ -2473,16 +2535,97 @@ class SettingsDialog(QDialog):
                 ),
             )
             return
-        # 将探测结果合并到全局模型名称列表并更新下拉框
+        self._show_model_selection_dialog(model_names)
+
+    def _show_model_selection_dialog(self, model_names: list[str]) -> None:
+        """弹出可勾选的模型列表对话框，供用户选择要添加的模型。"""
+        from PySide6.QtWidgets import QCheckBox
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择模型 — 共 {} 个".format(len(model_names)))
+        dialog.setMinimumSize(380, 420)
+        dialog.setObjectName("modelSelectionDialog")
+        if self.styleSheet():
+            dialog.setStyleSheet(self.styleSheet())
+
+        scroll = QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        body = QWidget(scroll)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(4)
+
+        checkboxes: list[QCheckBox] = []
+        for name in model_names:
+            cb = QCheckBox(name, body)
+            cb.setChecked(False)  # 默认不选中，由用户自行选择
+            checkboxes.append(cb)
+            body_layout.addWidget(cb)
+        body_layout.addStretch(1)
+        scroll.setWidget(body)
+
+        # 快捷按钮行
+        quick_row = QWidget(dialog)
+        quick_layout = QHBoxLayout(quick_row)
+        quick_layout.setContentsMargins(0, 0, 0, 0)
+        quick_layout.setSpacing(8)
+
+        def select_all() -> None:
+            for cb in checkboxes:
+                cb.setChecked(True)
+
+        def deselect_all() -> None:
+            for cb in checkboxes:
+                cb.setChecked(False)
+
+        def invert_selection() -> None:
+            for cb in checkboxes:
+                cb.setChecked(not cb.isChecked())
+
+        quick_layout.addWidget(QPushButton("全选", clicked=select_all))
+        quick_layout.addWidget(QPushButton("全不选", clicked=deselect_all))
+        quick_layout.addWidget(QPushButton("反选", clicked=invert_selection))
+        quick_layout.addStretch(1)
+
+        # 确认/取消按钮
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialog)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+
+        main_layout = QVBoxLayout(dialog)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(10)
+        main_layout.addWidget(quick_row)
+        main_layout.addWidget(scroll, 1)
+        main_layout.addWidget(button_box)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected = [cb.text() for cb in checkboxes if cb.isChecked()]
+            if selected:
+                self._merge_selected_models(selected)
+
+    def _merge_selected_models(self, selected: list[str]) -> None:
+        """将用户选中的模型合并到全局列表并更新下拉框。"""
         existing = set(self._global_model_names)
-        added = [m for m in model_names if m not in existing]
+        added = [m for m in selected if m not in existing]
         if added:
             self._global_model_names.extend(added)
-            if hasattr(self, "vision_model_combo"):
-                self.vision_model_combo.addItems(added)
-            if hasattr(self, "text_model_combo"):
-                self.text_model_combo.addItems(added)
-        QMessageBox.information(self, "探测成功", f"已发现 {len(model_names)} 个模型。")
+            section = self._active_test_section or "vision"
+            combo = getattr(self, f"{section}_model_combo", None)
+            if combo is not None:
+                combo.addItems(added)
+            # 同时更新另一个 section 的 combo
+            other = "text" if section == "vision" else "vision"
+            other_combo = getattr(self, f"{other}_model_combo", None)
+            if other_combo is not None:
+                other_combo.addItems(added)
+        QMessageBox.information(
+            self,
+            "添加完成",
+            f"已添加 {len(added)} 个模型。" if added else "未添加新模型（已全部在列表中）。",
+        )
 
     @Slot(str)
     def _handle_api_model_probe_failed(self, message: str) -> None:
@@ -2501,6 +2644,7 @@ class SettingsDialog(QDialog):
         self._api_model_probe_thread = None
         self._api_model_probe_worker = None
         self._set_api_model_probe_busy(False)
+        self._active_test_section = None
 
     # ── API 配置集编辑器 ──
 
@@ -2540,7 +2684,6 @@ class SettingsDialog(QDialog):
         save_row_btn = QPushButton("保存到选中行", dialog)
         add_row_btn = QPushButton("添加新行", dialog)
         delete_btn = QPushButton("删除选中", dialog)
-        probe_btn = QPushButton("探测该配置的模型列表", dialog)
 
         profiles = list(self._api_profiles)
         _selected_id_for_edit: str | None = None
@@ -2585,9 +2728,17 @@ class SettingsDialog(QDialog):
             if not base_url:
                 QMessageBox.warning(dialog, "校验失败", "Base URL 不能为空。")
                 return
-            if _selected_id_for_edit:
+            # 检查别名是否与其他配置冲突
+            editing_id = _selected_id_for_edit
+            for p in profiles:
+                if p.alias == alias and p.id != editing_id:
+                    QMessageBox.warning(dialog, "校验失败", f"别名「{alias}」已被其他配置集使用，请更换名称。")
+                    alias_edit.setFocus()
+                    alias_edit.selectAll()
+                    return
+            if editing_id:
                 for i, p in enumerate(profiles):
-                    if p.id == _selected_id_for_edit:
+                    if p.id == editing_id:
                         profiles[i] = ApiConfigProfile(id=p.id, alias=alias, base_url=base_url, api_key=api_key)
                         break
             else:
@@ -2602,11 +2753,19 @@ class SettingsDialog(QDialog):
 
         def on_add_row() -> None:
             nonlocal _selected_id_for_edit
-            _selected_id_for_edit = None
+            # 在配置列表末尾添加一个空白行并自动选中
+            new_id = f"profile_{len(profiles) + 1}"
+            profiles.append(ApiConfigProfile(id=new_id, alias="", base_url="", api_key=""))
+            _selected_id_for_edit = new_id
             alias_edit.clear()
             url_edit.clear()
             key_edit.clear()
             alias_edit.setFocus()
+            refresh_table()
+            for i, p in enumerate(profiles):
+                if p.id == new_id:
+                    table.setCurrentCell(i, 0)
+                    break
 
         def on_delete_row() -> None:
             row = table.currentRow()
@@ -2614,8 +2773,8 @@ class SettingsDialog(QDialog):
                 return
             p = profiles[row]
             # 检查是否正在被使用（使用当前下拉值）
-            vision_id = str(getattr(self, "vision_profile_combo", _NoWheelComboBox()).currentData() or "")
-            text_id = str(getattr(self, "text_profile_combo", _NoWheelComboBox()).currentData() or "")
+            vision_id = str(getattr(self, "vision_profile_combo", QComboBox()).currentData() or "")
+            text_id = str(getattr(self, "text_profile_combo", QComboBox()).currentData() or "")
             text_enabled = getattr(self, "text_enabled_check", QCheckBox()).isChecked()
             in_use = []
             if p.id == vision_id:
@@ -2628,50 +2787,9 @@ class SettingsDialog(QDialog):
             profiles.pop(row)
             refresh_table()
 
-        def on_probe_models() -> None:
-            row = table.currentRow()
-            if row < 0 or row >= len(profiles):
-                QMessageBox.warning(dialog, "提示", "请先选中一个配置行。")
-                return
-            p = profiles[row]
-            from app.ui.settings.workers import ApiModelListProbeWorker
-            from PySide6.QtCore import QThread
-            probe_settings = ApiSettings(base_url=p.base_url, api_key=p.api_key, model="", timeout_seconds=60)
-            probe_btn.setEnabled(False)
-            probe_btn.setText("探测中...")
-            thread = QThread()
-            worker = ApiModelListProbeWorker(probe_settings)
-            worker.moveToThread(thread)
-
-            def on_probe_success(models: list[str]) -> None:
-                existing = set(self._global_model_names)
-                added = [m for m in models if m not in existing]
-                if added:
-                    self._global_model_names.extend(added)
-                    if hasattr(self, "vision_model_combo"):
-                        self.vision_model_combo.addItems(added)
-                    if hasattr(self, "text_model_combo"):
-                        self.text_model_combo.addItems(added)
-                    QMessageBox.information(dialog, "探测成功", f"已添加 {len(added)} 个新模型名。")
-                else:
-                    QMessageBox.information(dialog, "探测完成", "模型列表已是最新，没有新模型。")
-
-            def on_probe_failed(msg: str) -> None:
-                QMessageBox.warning(dialog, "探测失败", msg)
-
-            def on_probe_finished() -> None:
-                probe_btn.setEnabled(True)
-                probe_btn.setText("探测该配置的模型列表")
-                thread.quit()
-                thread.wait()
-                worker.deleteLater()
-                thread.deleteLater()
-
-            worker.succeeded.connect(on_probe_success)
-            worker.failed.connect(on_probe_failed)
-            worker.finished.connect(on_probe_finished)
-            thread.started.connect(worker.run)
-            thread.start()
+        save_row_btn.clicked.connect(on_save_row)
+        add_row_btn.clicked.connect(on_add_row)
+        delete_btn.clicked.connect(on_delete_row)
 
         table.itemSelectionChanged.connect(on_table_selection_changed)
 
@@ -2680,7 +2798,6 @@ class SettingsDialog(QDialog):
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.addWidget(add_row_btn)
         btn_layout.addWidget(delete_btn)
-        btn_layout.addWidget(probe_btn)
         btn_layout.addStretch(1)
 
         edit_layout = QHBoxLayout()
@@ -2708,8 +2825,22 @@ class SettingsDialog(QDialog):
         if profiles:
             table.setCurrentCell(0, 0)
 
-        if dialog.exec():
-            self._api_profiles = profiles
+        dialog.exec()
+        self._api_profiles = profiles
+        # 刷新视觉/文本配置集下拉框，并保持当前选中项不变
+        for combo_attr in ("vision_profile_combo", "text_profile_combo"):
+            combo = getattr(self, combo_attr, None)
+            if combo is not None:
+                old_id = str(combo.currentData() or "")
+                combo.clear()
+                for p in profiles:
+                    alias = p.alias if p.alias else p.id
+                    combo.addItem(alias, p.id)
+                if combo.count() == 0:
+                    combo.addItem("（无配置）", "")
+                idx = combo.findData(old_id)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
 
     # ── 模型名称编辑器 ──
 
@@ -2765,9 +2896,14 @@ class SettingsDialog(QDialog):
                 self.text_model_combo.blockSignals(False)
 
     def _set_api_model_probe_busy(self, busy: bool) -> None:
-        self.api_model_probe_button.setEnabled(not busy)
-        self.api_model_probe_button.setText("检测中..." if busy else "检测模型")
-        self.api_test_button.setEnabled(not busy)
+        section = self._active_test_section or "vision"
+        probe_btn = getattr(self, f"{section}_probe_btn", None)
+        if probe_btn:
+            probe_btn.setEnabled(not busy)
+            probe_btn.setText("检测中..." if busy else "检测模型列表")
+        test_btn = getattr(self, f"{section}_test_btn", None)
+        if test_btn:
+            test_btn.setEnabled(not busy)
         if not hasattr(self, "button_box"):
             return
         save_button = self.button_box.button(QDialogButtonBox.StandardButton.Save)
@@ -3210,23 +3346,33 @@ class SettingsDialog(QDialog):
             self.character_export_card_action.setToolTip("导出当前角色的人格与立绘，不包含语音模型。")
             self.character_export_voice_action.setToolTip("当前角色没有可导出的语音模型。")
 
-    def _validated_api_settings(self) -> ApiSettings | None:
-        # 从视觉模型配置中获取 base_url / api_key / model
-        vision_profile_id = str(self.vision_profile_combo.currentData() or "")
-        vision_model = self.vision_model_combo.text().strip()
-        profile = _find_profile(self._api_profiles, vision_profile_id)
+    def _validated_api_settings(self, section: str = "vision") -> ApiSettings | None:
+        if section == "vision":
+            profile_combo = self.vision_profile_combo
+            model_combo = self.vision_model_combo
+            label = "视觉模型"
+        elif section == "text":
+            profile_combo = self.text_profile_combo
+            model_combo = self.text_model_combo
+            label = "文本模型"
+        else:
+            raise ValueError(f"Unknown section: {section}")
+
+        profile_id = str(profile_combo.currentData() or "")
+        model_name = model_combo.text().strip()
+        profile = _find_profile(self._api_profiles, profile_id)
 
         if profile is None:
-            QMessageBox.warning(self, "配置无效", "请先添加 API 配置集。")
+            QMessageBox.warning(self, "配置无效", f"请先添加 API 配置集。")
             return None
         base_url = profile.base_url.strip().rstrip("/")
         api_key = profile.api_key.strip()
 
         if not base_url:
-            QMessageBox.warning(self, "配置无效", "当前视觉模型配置的 Base URL 不能为空。")
+            QMessageBox.warning(self, "配置无效", f"{label}配置的 Base URL 不能为空。")
             return None
-        if not vision_model:
-            QMessageBox.warning(self, "配置无效", "视觉模型名称不能为空。")
+        if not model_name:
+            QMessageBox.warning(self, "配置无效", f"{label}模型名称不能为空。")
             return None
 
         temperature = self.llm_temperature_spin.value()
@@ -3239,7 +3385,7 @@ class SettingsDialog(QDialog):
         return ApiSettings(
             base_url=base_url,
             api_key=api_key,
-            model=vision_model,
+            model=model_name,
             timeout_seconds=self.api_timeout_spin.value(),
             temperature=temperature,
             top_p=(
@@ -3254,9 +3400,16 @@ class SettingsDialog(QDialog):
             ),
         )
 
-    def _validated_api_model_probe_settings(self) -> ApiSettings | None:
-        vision_profile_id = str(self.vision_profile_combo.currentData() or "")
-        profile = _find_profile(self._api_profiles, vision_profile_id)
+    def _validated_api_model_probe_settings(self, section: str = "vision") -> ApiSettings | None:
+        if section == "vision":
+            profile_combo = self.vision_profile_combo
+        elif section == "text":
+            profile_combo = self.text_profile_combo
+        else:
+            raise ValueError(f"Unknown section: {section}")
+
+        profile_id = str(profile_combo.currentData() or "")
+        profile = _find_profile(self._api_profiles, profile_id)
 
         if profile is None:
             QMessageBox.warning(self, "配置无效", "请先添加 API 配置集。")
