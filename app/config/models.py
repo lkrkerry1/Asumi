@@ -29,7 +29,6 @@ MODEL_SLOT_UI_ORDER = (
     MODEL_SLOT_CHAT,
     MODEL_SLOT_VISION_CHAT,
     MODEL_SLOT_MEMORY_CURATION,
-    MODEL_SLOT_THEME_AI,
 )
 
 MODEL_SLOT_LABELS = {
@@ -42,7 +41,7 @@ MODEL_SLOT_LABELS = {
 
 MODEL_SLOT_DESCRIPTIONS = {
     MODEL_SLOT_CHAT: "全局默认的角色聊天模型，必填。",
-    MODEL_SLOT_VISION_CHAT: "当聊天模型不支持图片时使用；留空则由聊天模型直接看原图。",
+    MODEL_SLOT_VISION_CHAT: "当聊天模型不支持图片，或想要自定义视觉模型时使用；留空则由聊天模型直接看原图。",
     MODEL_SLOT_VISUAL_CONTEXT: "用于把截图/屏幕转成可检索的视觉摘要；默认继承视觉模型。",
     MODEL_SLOT_MEMORY_CURATION: "用于自动整理长期记忆；留空则继承聊天模型。",
     MODEL_SLOT_THEME_AI: "用于根据角色立绘生成主题配色；留空则继承视觉模型。",
