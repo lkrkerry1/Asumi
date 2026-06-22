@@ -89,7 +89,6 @@ class MobileChatBridge:
 
             runtime = session.runtime
             runtime.api_client.update_settings(self._host.api_client.settings)
-            runtime.tools = self._host.tool_registry
             runtime.set_prompt_patches(self._host.agent_runtime.prompt_patches)
             runtime.set_context_providers(self._host.agent_runtime.context_providers)
 
