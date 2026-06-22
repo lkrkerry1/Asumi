@@ -260,6 +260,111 @@ def test_mobile_chat_returns_without_inline_memory_curation(monkeypatch: pytest.
     assert [entry.role for entry in history_store.load()] == ["user", "assistant"]
 
 
+def test_mobile_chat_rebuilds_context_for_target_character(monkeypatch: pytest.MonkeyPatch) -> None:
+    import app.core.mobile_chat_bridge as bridge_module
+    base_dir = _runtime_root("target_context")
+
+    class FakeRuntime:
+        def __init__(self, *args: object, context_providers: list[object], **kwargs: object) -> None:
+            self.context_providers = context_providers
+            self.character_id = kwargs["character_id"]
+            self.character_name = kwargs["character_name"]
+            self.api_client = SimpleNamespace(update_settings=lambda _settings: None)
+
+        def set_autonomous_screen_observation_enabled(self, _enabled: bool) -> None:
+            pass
+
+        def set_prompt_patches(self, _patches: list[object]) -> None:
+            pass
+
+        def set_context_providers(self, providers: list[object]) -> None:
+            self.context_providers = providers
+
+        def handle_user_message(self, _messages: list[object]) -> AgentResult:
+            return AgentResult(ChatReply([ChatSegment("返事。", translation="回复。")]))
+
+    class HistoryStore:
+        def __init__(self) -> None:
+            self.entries: list[ChatHistoryEntry] = []
+
+        def append(
+            self,
+            role: str,
+            content: str,
+            translation: str = "",
+            tone: str = "",
+            portrait: str = "",
+            _debug: dict | None = None,
+        ) -> None:
+            self.entries.append(ChatHistoryEntry("now", role, content, translation, tone, portrait))
+
+        def load(self) -> list[ChatHistoryEntry]:
+            return list(self.entries)
+
+    current = CharacterProfile(
+        id="current",
+        display_name="Current",
+        package_dir=base_dir,
+        card_path=base_dir / "current.yaml",
+        initial_message="",
+        default_portrait_path=base_dir / "current.png",
+    )
+    target = CharacterProfile(
+        id="target",
+        display_name="Target",
+        package_dir=base_dir,
+        card_path=base_dir / "target.yaml",
+        initial_message="",
+        default_portrait_path=base_dir / "target.png",
+    )
+
+    class Registry:
+        def get(self, character_id: str) -> CharacterProfile:
+            return target if character_id == target.id else current
+
+        def all(self) -> list[CharacterProfile]:
+            return [current, target]
+
+    class Memory:
+        scope_id = "current"
+
+        def set_scope(self, scope_id: str) -> None:
+            self.scope_id = scope_id
+
+    provider_version = {"value": 0}
+
+    def mobile_context_providers(profile: CharacterProfile) -> list[str]:
+        return [f"context:{profile.id}:{provider_version['value']}"]
+
+    monkeypatch.setattr(bridge_module, "AgentRuntime", FakeRuntime)
+    monkeypatch.setattr(bridge_module, "OpenAICompatibleClient", lambda _settings: object())
+    monkeypatch.setattr(bridge_module, "load_character_system_prompt", lambda _profile: "")
+    host = SimpleNamespace(
+        character_profile=current,
+        character_registry=Registry(),
+        _create_history_store=lambda _profile: HistoryStore(),
+        memory_store=Memory(),
+        api_client=SimpleNamespace(settings=object()),
+        agent_runtime=SimpleNamespace(
+            prompt_patches=[],
+            context_providers=["desktop-current"],
+            runtime_loop_settings=RuntimeLoopSettings(),
+        ),
+        mobile_context_providers=mobile_context_providers,
+    )
+    bridge = MobileChatBridge(host)
+    session = bridge._session("target")
+
+    assert session.runtime.character_id == "target"
+    assert session.runtime.character_name == "Target"
+    assert session.runtime.context_providers == ["context:target:0"]
+
+    provider_version["value"] = 1
+    bridge.execute_chat("target", "hello")
+
+    assert session.runtime.context_providers == ["context:target:1"]
+
+
 def _runtime_root(name: str) -> Path:
     path = TEST_RUNTIME_ROOT / name / uuid.uuid4().hex
     path.mkdir(parents=True, exist_ok=True)

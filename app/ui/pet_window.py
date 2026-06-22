@@ -4538,6 +4538,9 @@ class PetWindow(QWidget):
     def _mobile_chat(self, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
         return self.mobile_chat_bridge.chat(character_id, text, image_data_url)
 
+    def mobile_context_providers(self, _profile: CharacterProfile) -> list[Any]:
+        return list(getattr(self.plugin_manager, "context_providers", []))
+
     def submit_mobile_chat(self, bridge: MobileChatBridge, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
         """Marshal an HTTP request into the single host Agent worker lane."""
         if self._mobile_chat_busy():
@@ -6335,7 +6338,13 @@ class PetWindow(QWidget):
         self.character_profile = profile
         self.system_prompt = load_character_system_prompt(profile)
         self.memory_store.set_scope(profile.id)
-        self.agent_runtime.update_character(self.system_prompt, profile.reply_tones, profile.portrait_choices)
+        self.agent_runtime.update_character(
+            self.system_prompt,
+            profile.reply_tones,
+            profile.portrait_choices,
+            character_id=profile.id,
+            character_name=profile.display_name,
+        )
         self.setWindowTitle(profile.display_name)
         self.name_label.setText(profile.display_name)
         self.input_edit.setPlaceholderText(self._normal_input_placeholder_text(profile))

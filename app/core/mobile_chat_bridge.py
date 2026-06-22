@@ -86,7 +86,7 @@ class MobileChatBridge:
             runtime = session.runtime
             runtime.api_client.update_settings(self._host.api_client.settings)
             runtime.set_prompt_patches(self._host.agent_runtime.prompt_patches)
-            runtime.set_context_providers(self._host.agent_runtime.context_providers)
+            runtime.set_context_providers(self._context_providers(session.profile))
 
             memory_store = self._host.memory_store
             previous_scope = memory_store.scope_id
@@ -144,8 +144,10 @@ class MobileChatBridge:
             memory=memory_store,
             history_store=history_store,
             prompt_patches=self._host.agent_runtime.prompt_patches,
-            context_providers=self._host.agent_runtime.context_providers,
+            context_providers=self._context_providers(profile),
             runtime_loop_settings=self._host.agent_runtime.runtime_loop_settings,
+            character_id=profile.id,
+            character_name=profile.display_name,
         )
         runtime.set_autonomous_screen_observation_enabled(False)
         session = _MobileCharacterSession(
@@ -155,6 +157,12 @@ class MobileChatBridge:
         )
         self._sessions[profile.id] = session
         return session
+
+    def _context_providers(self, profile: CharacterProfile) -> list[Any]:
+        provider_factory = getattr(self._host, "mobile_context_providers", None)
+        if callable(provider_factory):
+            return list(provider_factory(profile))
+        return list(getattr(self._host.agent_runtime, "context_providers", []))
 
     def _notify_host_chat_completed(self, payload: dict[str, Any]) -> None:
         """让 UI 线程安全地同步当前角色手机对话到桌面状态。"""
