@@ -5,8 +5,9 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import (
+    QApplication,
     QAbstractItemView,
     QCheckBox,
     QFileDialog,
@@ -138,8 +139,15 @@ class VoiceModelPanel(StudioPanel):
         path, _ = QFileDialog.getOpenFileName(self, "选择模型文件", "", MODEL_EXTS)
         if path:
             old_rel = edit.text().strip()
-            new_rel = _copy_into(self._package_dir, Path(path), MODELS_SUBDIR)
-            _remove_previous_model(self._package_dir, old_rel, new_rel)
+            self.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+            try:
+                new_rel = _copy_into(self._package_dir, Path(path), MODELS_SUBDIR)
+                _remove_previous_model(self._package_dir, old_rel, new_rel)
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.setEnabled(True)
             edit.setText(new_rel)
 
     def load_from(self, doc: CharacterDoc) -> None:

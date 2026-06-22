@@ -259,6 +259,14 @@ def test_voice_model_picker_removes_previous_model(
     panel = VoiceModelPanel()
     panel.bind_package_dir(package_dir)
     panel.gpt_edit.setText("voice/models/old.ckpt")
+    copy_states = []
+    real_copy2 = voice_panel.shutil.copy2
+
+    def fake_copy2(src, dst):  # type: ignore[no-untyped-def]
+        copy_states.append(panel.isEnabled())
+        return real_copy2(src, dst)
+
+    monkeypatch.setattr(voice_panel.shutil, "copy2", fake_copy2)
     monkeypatch.setattr(
         voice_panel.QFileDialog,
         "getOpenFileName",
@@ -267,6 +275,8 @@ def test_voice_model_picker_removes_previous_model(
 
     panel._pick_gpt()
 
+    assert copy_states == [False]
+    assert panel.isEnabled()
     assert panel.gpt_edit.text() == "voice/models/new.ckpt"
     assert not old_model.exists()
     assert (models_dir / "new.ckpt").read_bytes() == b"new"
@@ -343,6 +353,49 @@ def test_export_step_preview_does_not_write_reference_file(
 
     assert not (package_dir / DEFAULT_TONE_REFS).exists()
     assert "Demo" in window._panels["export"].summary_label.text()
+
+
+def test_studio_export_uses_busy_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _qt_app()
+    _disable_audio_player(monkeypatch)
+
+    from tools.studio.app_studio import StudioWindow
+
+    project_root = _studio_runtime_root("studio_export_busy")
+    package_dir = project_root / "tools" / "studio" / "workspace" / "characters" / "demo"
+    (package_dir / "portraits").mkdir(parents=True)
+    (package_dir / "portraits" / "default.png").write_bytes(b"png")
+    window = StudioWindow(project_root=project_root)
+    window._set_doc(
+        CharacterDoc(
+            id="demo",
+            display_name="Demo",
+            default_portrait="portraits/default.png",
+            expressions={"默认": "portraits/default.png"},
+        ),
+        package_dir,
+    )
+    export_states = []
+
+    def fake_export(doc, package, output):  # type: ignore[no-untyped-def]
+        export_states.append(window.isEnabled())
+
+    window.workspace.export = fake_export  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "tools.studio.app_studio.QFileDialog.getSaveFileName",
+        lambda *_args, **_kwargs: (str(project_root / "demo.char"), ""),
+    )
+    monkeypatch.setattr(
+        "tools.studio.app_studio.QMessageBox.information",
+        lambda *_args, **_kwargs: None,
+    )
+
+    window._on_export()
+
+    assert export_states == [False]
+    assert window.isEnabled()
 
 def test_theme_swatches_keep_individual_colors() -> None:
     _qt_app()

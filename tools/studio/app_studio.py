@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -414,7 +415,14 @@ class StudioWindow(QMainWindow):
         if not path:
             return
         try:
-            self.workspace.export(doc, self._package_dir, Path(path))
+            self.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+            try:
+                self.workspace.export(doc, self._package_dir, Path(path))
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.setEnabled(True)
         except CharacterConfigError as exc:
             QMessageBox.warning(self, "校验未通过", f"角色包存在问题，无法导出：\n\n{exc}")
             return
