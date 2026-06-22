@@ -271,7 +271,9 @@ class ReferenceAudioPanel(StudioPanel):
 
     def write_to(self, doc: CharacterDoc) -> None:
         rows = self._rows()
-        doc.reply_tones = self._tone_labels(rows)
+        tones = self._tone_labels(rows)
+        if tones:
+            doc.reply_tones = tones
 
         if self._package_dir is not None and (doc.voice is not None or rows):
             ref_path = self._package_dir / DEFAULT_TONE_REFS

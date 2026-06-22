@@ -119,6 +119,25 @@ def test_reference_audio_writes_ref_file_and_reply_tones(
     )
 
 
+
+def test_reference_audio_keeps_existing_reply_tones_when_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _qt_app()
+    _disable_audio_player(monkeypatch)
+
+    from tools.studio.panels.voice_panel import ReferenceAudioPanel
+
+    package_dir = _studio_runtime_root("studio_reference_audio_keep_tones") / "character"
+    panel = ReferenceAudioPanel()
+    panel.bind_package_dir(package_dir)
+    doc = CharacterDoc(id="test", display_name="测试", reply_tones=["温柔", "严肃"])
+
+    panel.write_to(doc)
+
+    assert doc.reply_tones == ["温柔", "严肃"]
+    assert not (package_dir / DEFAULT_TONE_REFS).exists()
+
 def test_voice_model_and_reference_audio_merge_one_voice_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
