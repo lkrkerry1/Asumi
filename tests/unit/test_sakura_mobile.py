@@ -40,6 +40,13 @@ def test_mobile_access_urls_include_local_and_lan(monkeypatch: pytest.MonkeyPatc
     assert urls["lan_urls"] == ["http://192.168.1.23:8765/?token=secret"]
 
 
+def test_mobile_page_scrolls_to_bottom_after_history_load() -> None:
+    html = mobile_server._mobile_html("secret")
+
+    assert "function scrollChatToBottom()" in html
+    assert "scrollChatToBottom();" in html[html.index("async function loadHistory()") : html.index("function readImage")]
+
+
 def test_mobile_chat_busy_returns_409() -> None:
     class BusyBackend:
         def characters(self) -> list[dict[str, str]]:

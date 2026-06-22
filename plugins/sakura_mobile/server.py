@@ -455,6 +455,9 @@ function errorText(err) {{
 function cleanAssistantText(value) {{
   return String(value || '').trim().replace(/^[.．…]+\\s*/, '').trimStart();
 }}
+function scrollChatToBottom() {{
+  requestAnimationFrame(() => {{ chat.scrollTop = chat.scrollHeight; }});
+}}
 function addMessage(role, content, options = {{}}) {{
   const node = document.createElement('div');
   node.className = 'msg ' + role;
@@ -467,7 +470,7 @@ function addMessage(role, content, options = {{}}) {{
   body.textContent = content;
   node.append(meta, body);
   chat.append(node);
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatToBottom();
   return node;
 }}
 function addTypingMessage() {{
@@ -530,6 +533,7 @@ async function loadHistory() {{
   for (const item of data.history || []) {{
     if (item.role === 'user' || item.role === 'assistant') addMessage(item.role, item.content);
   }}
+  scrollChatToBottom();
 }}
 function readImage(file) {{
   return new Promise((resolve, reject) => {{
