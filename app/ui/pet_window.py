@@ -476,7 +476,7 @@ class PetWindow(QWidget):
     memory_status_changed = Signal(str, str)
     # 插件请求把文本填入输入框；用信号 marshal 回 UI 线程（ASR 等可能在后台线程触发）。
     plugin_input_text_requested = Signal(str)
-    mobile_chat_completed = Signal(str)
+    mobile_chat_completed = Signal(object)
     mobile_chat_requested = Signal(object)
 
     def __init__(
@@ -4234,12 +4234,33 @@ class PetWindow(QWidget):
         if pending_turns >= self.memory_curation_settings.trigger_turns:
             QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
 
-    @Slot(str)
-    def _handle_mobile_chat_completed(self, character_id: str) -> None:
-        """手机端完成一轮对话后，复用当前角色的新版自动记忆整理节奏。"""
-        # Mobile sessions maintain per-character history and curation state in
-        # MobileChatBridge. Do not apply their turn to the desktop character.
-        del character_id
+    @Slot(object)
+    def _handle_mobile_chat_completed(self, payload: object) -> None:
+        """手机端完成当前桌面角色对话后，同步回桌面临时上下文和回溯。"""
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("character_id") or "") != self.character_profile.id:
+            return
+        user_text = str(payload.get("user_text") or "").strip()
+        assistant_text = str(payload.get("assistant_text") or "").strip()
+        self.messages = _without_transient_progress_messages(self.messages)
+        if user_text:
+            self.messages.append({"role": "user", "content": user_text})
+        if assistant_text:
+            self.messages.append({"role": "assistant", "content": assistant_text})
+        segments = [
+            segment
+            for segment in payload.get("segments") or []
+            if isinstance(segment, ChatSegment) and segment.text.strip()
+        ]
+        was_reviewing = self.reply_history_review_active
+        self._remember_reply_history_segments(segments)
+        if not was_reviewing and self.reply_history_segments:
+            self.reply_history_index = len(self.reply_history_segments) - 1
+            self._update_reply_history_buttons()
+        request_refresh = getattr(getattr(self, "history_window", None), "request_refresh", None)
+        if callable(request_refresh):
+            request_refresh()
 
     def _maybe_start_auto_memory_curation(self) -> None:
         if getattr(self, "startup_initializing", False):

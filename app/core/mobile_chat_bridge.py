@@ -113,7 +113,14 @@ class MobileChatBridge:
 
             self._maybe_curate_memory(session)
 
-        self._notify_host_chat_completed(session.profile.id)
+        self._notify_host_chat_completed(
+            {
+                "character_id": session.profile.id,
+                "user_text": user_history_text,
+                "assistant_text": result.reply.text,
+                "segments": segments,
+            }
+        )
         return {
             "character_id": session.profile.id,
             "reply": result.reply.display_text("zh"),
@@ -180,12 +187,12 @@ class MobileChatBridge:
         except Exception as exc:  # noqa: BLE001
             debug_log("Memory", "移动端角色记忆整理失败", {"character_id": session.profile.id, "error": str(exc)})
 
-    def _notify_host_chat_completed(self, character_id: str) -> None:
-        """让 UI 线程安全地把当前角色的手机对话纳入自动记忆整理。"""
+    def _notify_host_chat_completed(self, payload: dict[str, Any]) -> None:
+        """让 UI 线程安全地同步当前角色手机对话到桌面状态。"""
         signal = getattr(self._host, "mobile_chat_completed", None)
         emit = getattr(signal, "emit", None)
         if callable(emit):
-            emit(character_id)
+            emit(payload)
 
 
 def _messages_from_history(entries: list[ChatHistoryEntry]) -> list[ChatMessage]:
