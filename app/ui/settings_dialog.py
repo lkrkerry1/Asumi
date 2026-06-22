@@ -76,7 +76,20 @@ from app.config.character_loader import (
     THEME_SOURCE_COMPAT_DEFAULT,
     THEME_SOURCE_PACKAGE,
 )
-from app.config.models import ApiConfigProfile, ModelSelectionSettings
+from app.config.model_slots import find_profile, resolve_model_slot
+from app.config.models import (
+    MODEL_SLOT_CHAT,
+    MODEL_SLOT_DESCRIPTIONS,
+    MODEL_SLOT_LABELS,
+    MODEL_SLOT_MEMORY_CURATION,
+    MODEL_SLOT_ORDER,
+    MODEL_SLOT_THEME_AI,
+    MODEL_SLOT_VISION_CHAT,
+    MODEL_SLOT_VISUAL_CONTEXT,
+    ApiConfigProfile,
+    ModelSelectionSettings,
+    ModelSlotSelection,
+)
 from app.ui.portrait_controller import (
     PORTRAIT_SCALE_DEFAULT_PERCENT,
     normalize_portrait_scale_percent,
@@ -198,9 +211,14 @@ class SettingsDialog(QDialog):
         self.memory_curation_settings = memory_curation_settings or _MemoryCurationSettings()
         self._initial_api_settings = api_settings
         self._initial_tts_settings = tts_settings
-        self._api_profiles = list(api_profiles or [])
-        self._initial_model_selection = model_selection or ModelSelectionSettings()
-        self._global_model_names = list(global_model_names or [])
+        self._api_profiles = _ensure_api_profiles(api_settings, api_profiles, global_model_names)
+        self._initial_api_profiles = list(self._api_profiles)
+        self._initial_model_selection = _ensure_model_selection(
+            api_settings,
+            self._api_profiles,
+            model_selection,
+        )
+        self._global_model_names = []
         self._initial_character_id = current_character.id if current_character is not None else None
         self.theme_settings = merge_theme_with_character(
             theme_settings or DEFAULT_THEME_SETTINGS,
@@ -269,7 +287,7 @@ class SettingsDialog(QDialog):
         self._api_test_worker: settings_workers.ApiConnectionTestWorker | None = None
         self._api_model_probe_thread: QThread | None = None
         self._api_model_probe_worker: settings_workers.ApiModelListProbeWorker | None = None
-        self._active_test_section: str | None = None  # "vision" | "text" | None，当前测试的 section
+        self._active_test_section: str | None = None
         self._pending_test_queue: list[str] | None = None  # 保存流程中待测试的 section 队列
         self._tts_test_thread: QThread | None = None
         self._tts_test_worker: settings_workers.TTSTestWorker | None = None
@@ -1911,7 +1929,7 @@ class SettingsDialog(QDialog):
     def _generate_ai_theme(self) -> None:
         if self._theme_ai_thread is not None:
             return
-        api_settings = self._validated_api_settings()
+        api_settings = self._validated_api_settings(MODEL_SLOT_THEME_AI)
         if api_settings is None:
             return
         profile = self._selected_character_profile()
@@ -2026,12 +2044,10 @@ class SettingsDialog(QDialog):
         if accept_values is None:
             return
 
-        # 构建需要测试的 section 队列：视觉始终测试，文本在启用且变动时测试
         sections_to_test: list[str] = []
-        if self._should_test_model_on_accept("vision"):
-            sections_to_test.append("vision")
-        if self._should_test_model_on_accept("text"):
-            sections_to_test.append("text")
+        for slot in MODEL_SLOT_ORDER:
+            if self._should_test_model_on_accept(slot):
+                sections_to_test.append(slot)
 
         if sections_to_test:
             self._pending_test_queue = sections_to_test
@@ -2061,31 +2077,149 @@ class SettingsDialog(QDialog):
         self._complete_accept(accept_values)
 
     def _should_test_model_on_accept(self, section: str) -> bool:
-        """判断指定 section 的模型配置在保存时是否需要重新测试。"""
-        current = self._collect_model_selection()
-        initial = self._initial_model_selection
-        if section == "vision":
-            return (
-                current.vision_profile_id != initial.vision_profile_id
-                or current.vision_model != initial.vision_model
-            )
-        if section == "text":
-            return (
-                current.text_enabled
-                and (
-                    current.text_profile_id != initial.text_profile_id
-                    or current.text_model != initial.text_model
-                )
-            )
-        return False
+        """判断指定功能槽位保存时是否需要重新测试。"""
+        if section != MODEL_SLOT_CHAT:
+            inherit_check = getattr(self, "_slot_inherit_checks", {}).get(section)
+            if inherit_check is not None and inherit_check.isChecked():
+                return False
+        current = self._api_settings_for_slot(section, self._collect_model_selection())
+        initial = self._api_settings_for_slot(section, self._initial_model_selection, self._initial_api_profiles)
+        return current is not None and current != initial
 
     def _collect_model_selection(self) -> ModelSelectionSettings:
         return ModelSelectionSettings(
-            vision_profile_id=str(self.vision_profile_combo.currentData() or ""),
-            vision_model=self.vision_model_combo.text().strip(),
-            text_enabled=self.text_enabled_check.isChecked(),
-            text_profile_id=str(self.text_profile_combo.currentData() or ""),
-            text_model=self.text_model_combo.text().strip(),
+            chat=self._collect_slot_selection(MODEL_SLOT_CHAT) or ModelSlotSelection(),
+            vision_chat=self._collect_slot_selection(MODEL_SLOT_VISION_CHAT),
+            visual_context=self._collect_slot_selection(MODEL_SLOT_VISUAL_CONTEXT),
+            memory_curation=self._collect_slot_selection(MODEL_SLOT_MEMORY_CURATION),
+            theme_ai=self._collect_slot_selection(MODEL_SLOT_THEME_AI),
+        )
+
+    def _collect_slot_selection(self, slot: str) -> ModelSlotSelection | None:
+        inherit_check = getattr(self, "_slot_inherit_checks", {}).get(slot)
+        if slot != MODEL_SLOT_CHAT and inherit_check is not None and inherit_check.isChecked():
+            return None
+        profile_id = self._slot_profile_id(slot)
+        model_combo = getattr(self, "_slot_model_combos", {}).get(slot)
+        model = model_combo.text().strip() if model_combo is not None else ""
+        if not profile_id and not model:
+            return None
+        return ModelSlotSelection(profile_id=profile_id, model=model)
+
+    def _slot_profile_id(self, slot: str) -> str:
+        profile_combo = getattr(self, "_slot_profile_combos", {}).get(slot)
+        return str(profile_combo.currentData() or "") if profile_combo is not None else ""
+
+    def _api_settings_for_slot(
+        self,
+        slot: str,
+        model_selection: ModelSelectionSettings,
+        profiles: list[ApiConfigProfile] | None = None,
+    ) -> ApiSettings | None:
+        return (
+            resolved.settings
+            if (
+                resolved := resolve_model_slot(
+                    profiles or self._api_profiles,
+                    model_selection,
+                    slot,
+                    self._initial_api_settings,
+                )
+            )
+            is not None
+            else None
+        )
+
+    def _sync_slot_model_combo(self, slot: str, *, keep_current: bool = True) -> None:
+        profile_id = self._slot_profile_id(slot)
+        combo = getattr(self, "_slot_model_combos", {}).get(slot)
+        if combo is None:
+            return
+        current = combo.text().strip()
+        profile = find_profile(self._api_profiles, profile_id)
+        models = list(profile.models) if profile is not None else []
+        combo.blockSignals(True)
+        combo.set_model_names(models)
+        if current and (keep_current or current in models):
+            combo.setText(current)
+        elif models:
+            combo.setCurrentIndex(0)
+        else:
+            combo.setText("")
+        combo.blockSignals(False)
+
+    def _sync_slot_inherit_state(self, slot: str) -> None:
+        inherited = False
+        inherit_check = getattr(self, "_slot_inherit_checks", {}).get(slot)
+        if slot != MODEL_SLOT_CHAT and inherit_check is not None:
+            inherited = inherit_check.isChecked()
+        for mapping_name in (
+            "_slot_profile_combos",
+            "_slot_model_combos",
+            "_slot_probe_buttons",
+            "_slot_test_buttons",
+        ):
+            widget = getattr(self, mapping_name, {}).get(slot)
+            if widget is not None:
+                widget.setEnabled(not inherited)
+
+    def _refresh_all_slot_model_combos(self) -> None:
+        if hasattr(self, "provider_summary_label"):
+            self.provider_summary_label.setText(self._provider_summary(self._api_profiles))
+        for slot in MODEL_SLOT_ORDER:
+            self._sync_slot_model_combo(slot)
+
+    def _replace_profile(self, profile: ApiConfigProfile) -> None:
+        for index, item in enumerate(self._api_profiles):
+            if item.id == profile.id:
+                self._api_profiles[index] = profile
+                return
+        self._api_profiles.append(profile)
+
+    def _refresh_profile_combos(self) -> None:
+        for slot, combo in getattr(self, "_slot_profile_combos", {}).items():
+            old_id = str(combo.currentData() or "")
+            combo.blockSignals(True)
+            combo.clear()
+            for profile in self._api_profiles:
+                combo.addItem(profile.alias or profile.id, profile.id)
+            if combo.count() == 0:
+                combo.addItem("（无供应商）", "")
+            idx = combo.findData(old_id)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+            self._sync_slot_model_combo(slot)
+
+    def _used_slots_for_profile(self, profile_id: str) -> list[str]:
+        used: list[str] = []
+        for slot in MODEL_SLOT_ORDER:
+            selection = self._collect_slot_selection(slot)
+            if selection is not None and selection.profile_id == profile_id:
+                used.append(MODEL_SLOT_LABELS.get(slot, slot))
+        return used
+
+    def _used_slots_for_profile_models(
+        self,
+        profile_id: str,
+        removed_models: set[str],
+    ) -> list[str]:
+        used: list[str] = []
+        for slot in MODEL_SLOT_ORDER:
+            selection = self._collect_slot_selection(slot)
+            if (
+                selection is not None
+                and selection.profile_id == profile_id
+                and selection.model in removed_models
+            ):
+                used.append(f"{MODEL_SLOT_LABELS.get(slot, slot)}:{selection.model}")
+        return used
+
+    def _provider_summary(self, profiles: list[ApiConfigProfile]) -> str:
+        if not profiles:
+            return "暂无供应商。"
+        return "；".join(
+            f"{profile.alias or profile.id}：{len(profile.models)} 个模型"
+            for profile in profiles
         )
 
     def _should_test_tts_on_accept(
@@ -2384,7 +2518,8 @@ class SettingsDialog(QDialog):
             return
         super().closeEvent(event)
 
-    def _test_api_settings(self, section: str = "vision") -> None:
+    def _test_api_settings(self, section: str = MODEL_SLOT_CHAT) -> None:
+        section = _normalize_model_section(section)
         settings = self._validated_api_settings(section)
         if (
             settings is None
@@ -2427,19 +2562,18 @@ class SettingsDialog(QDialog):
         accept_values = self._pending_api_accept_values
         if accept_values is not None:
             if self._pending_test_queue:
-                self._run_next_section_test(accept_values)
                 return
             self._continue_accept_after_api_test(accept_values)
             return
         # 手动点击测试按钮的情况
-        section = self._active_test_section or "vision"
-        label = "视觉模型" if section == "vision" else "文本模型"
+        section = _normalize_model_section(self._active_test_section or MODEL_SLOT_CHAT)
+        label = MODEL_SLOT_LABELS.get(section, "模型")
         QMessageBox.information(self, "测试成功", f"{label} API 连接成功，模型返回：{message}")
 
     @Slot(str)
     def _handle_api_test_failed(self, message: str) -> None:
-        section = self._active_test_section or "vision"
-        label = "视觉模型" if section == "vision" else "文本模型"
+        section = _normalize_model_section(self._active_test_section or MODEL_SLOT_CHAT)
+        label = MODEL_SLOT_LABELS.get(section, "模型")
         if self._pending_api_accept_values is not None:
             self._pending_test_queue = None
             QMessageBox.warning(
@@ -2464,21 +2598,25 @@ class SettingsDialog(QDialog):
 
     @Slot()
     def _reset_api_test_state(self) -> None:
+        accept_values = self._pending_api_accept_values
+        has_next_test = bool(self._pending_test_queue)
         self._api_test_thread = None
         self._api_test_worker = None
-        self._pending_api_accept_values = None
-        self._pending_test_queue = None
         self._set_api_test_busy(False)
         self._active_test_section = None
+        if accept_values is not None and has_next_test:
+            self._run_next_section_test(accept_values)
+            return
+        self._pending_api_accept_values = None
+        self._pending_test_queue = None
 
     def _set_api_test_busy(self, busy: bool) -> None:
-        # 根据 _active_test_section 禁用对应的按钮
-        section = self._active_test_section or "vision"
-        test_btn = getattr(self, f"{section}_test_btn", None)
+        section = _normalize_model_section(self._active_test_section or MODEL_SLOT_CHAT)
+        test_btn = getattr(self, "_slot_test_buttons", {}).get(section)
         if test_btn:
             test_btn.setEnabled(not busy)
             test_btn.setText("测试中..." if busy else "测试 API")
-        probe_btn = getattr(self, f"{section}_probe_btn", None)
+        probe_btn = getattr(self, "_slot_probe_buttons", {}).get(section)
         if probe_btn:
             probe_btn.setEnabled(not busy)
         if not hasattr(self, "button_box"):
@@ -2496,7 +2634,8 @@ class SettingsDialog(QDialog):
             save_button.setText(self._save_button_text)
             self._save_button_text = None
 
-    def _probe_api_models(self, section: str = "vision") -> None:
+    def _probe_api_models(self, section: str = MODEL_SLOT_CHAT) -> None:
+        section = _normalize_model_section(section)
         settings = self._validated_api_model_probe_settings(section)
         if (
             settings is None
@@ -2535,92 +2674,30 @@ class SettingsDialog(QDialog):
                 ),
             )
             return
-        self._show_model_selection_dialog(model_names)
+        self._merge_selected_models(model_names, replace=True)
 
-    def _show_model_selection_dialog(self, model_names: list[str]) -> None:
-        """弹出可勾选的模型列表对话框，供用户选择要添加的模型。"""
-        from PySide6.QtWidgets import QCheckBox
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("选择模型 — 共 {} 个".format(len(model_names)))
-        dialog.setMinimumSize(380, 420)
-        dialog.setObjectName("modelSelectionDialog")
-        if self.styleSheet():
-            dialog.setStyleSheet(self.styleSheet())
-
-        scroll = QScrollArea(dialog)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-
-        body = QWidget(scroll)
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(4)
-
-        checkboxes: list[QCheckBox] = []
-        for name in model_names:
-            cb = QCheckBox(name, body)
-            cb.setChecked(False)  # 默认不选中，由用户自行选择
-            checkboxes.append(cb)
-            body_layout.addWidget(cb)
-        body_layout.addStretch(1)
-        scroll.setWidget(body)
-
-        # 快捷按钮行
-        quick_row = QWidget(dialog)
-        quick_layout = QHBoxLayout(quick_row)
-        quick_layout.setContentsMargins(0, 0, 0, 0)
-        quick_layout.setSpacing(8)
-
-        def select_all() -> None:
-            for cb in checkboxes:
-                cb.setChecked(True)
-
-        def deselect_all() -> None:
-            for cb in checkboxes:
-                cb.setChecked(False)
-
-        def invert_selection() -> None:
-            for cb in checkboxes:
-                cb.setChecked(not cb.isChecked())
-
-        quick_layout.addWidget(QPushButton("全选", clicked=select_all))
-        quick_layout.addWidget(QPushButton("全不选", clicked=deselect_all))
-        quick_layout.addWidget(QPushButton("反选", clicked=invert_selection))
-        quick_layout.addStretch(1)
-
-        # 确认/取消按钮
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialog)
-        button_box.accepted.connect(dialog.accept)
-        button_box.rejected.connect(dialog.reject)
-
-        main_layout = QVBoxLayout(dialog)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(10)
-        main_layout.addWidget(quick_row)
-        main_layout.addWidget(scroll, 1)
-        main_layout.addWidget(button_box)
-
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            selected = [cb.text() for cb in checkboxes if cb.isChecked()]
-            if selected:
-                self._merge_selected_models(selected)
-
-    def _merge_selected_models(self, selected: list[str]) -> None:
-        """将用户选中的模型合并到全局列表并更新下拉框。"""
-        existing = set(self._global_model_names)
-        added = [m for m in selected if m not in existing]
-        if added:
-            self._global_model_names.extend(added)
-            section = self._active_test_section or "vision"
-            combo = getattr(self, f"{section}_model_combo", None)
-            if combo is not None:
-                combo.addItems(added)
-            # 同时更新另一个 section 的 combo
-            other = "text" if section == "vision" else "vision"
-            other_combo = getattr(self, f"{other}_model_combo", None)
-            if other_combo is not None:
-                other_combo.addItems(added)
+    def _merge_selected_models(self, selected: list[str], *, replace: bool = False) -> None:
+        """将用户选中的模型合并到当前供应商并更新相关下拉框。"""
+        section = _normalize_model_section(self._active_test_section or MODEL_SLOT_CHAT)
+        profile_id = self._slot_profile_id(section)
+        profile = find_profile(self._api_profiles, profile_id)
+        if profile is None:
+            QMessageBox.warning(self, "添加失败", "当前供应商不存在。")
+            return
+        model_names = _dedupe(selected)
+        existing = set(profile.models)
+        added = [model for model in model_names if model not in existing]
+        if replace or added:
+            self._replace_profile(
+                ApiConfigProfile(
+                    id=profile.id,
+                    alias=profile.alias,
+                    base_url=profile.base_url,
+                    api_key=profile.api_key,
+                    models=tuple(model_names if replace else [*profile.models, *added]),
+                )
+            )
+            self._refresh_all_slot_model_combos()
         QMessageBox.information(
             self,
             "添加完成",
@@ -2657,9 +2734,9 @@ class SettingsDialog(QDialog):
         if self.styleSheet():
             dialog.setStyleSheet(self.styleSheet())
 
-        table = QTableWidget(0, 3, dialog)
+        table = QTableWidget(0, 4, dialog)
         table.setObjectName("apiProfileTable")
-        table.setHorizontalHeaderLabels(["别名", "Base URL", "API Key"])
+        table.setHorizontalHeaderLabels(["别名", "Base URL", "API Key", "模型"])
         table.horizontalHeader().setStretchLastSection(True)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -2675,6 +2752,9 @@ class SettingsDialog(QDialog):
         key_edit = QLineEdit(dialog)
         key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         key_edit.setPlaceholderText("API Key（本地模型可留空）")
+        models_edit = QPlainTextEdit(dialog)
+        models_edit.setPlaceholderText("每行一个模型名称")
+        models_edit.setFixedHeight(86)
         show_key_check = QCheckBox("显示 Key", dialog)
 
         def toggle_key_visibility(checked: bool) -> None:
@@ -2695,6 +2775,7 @@ class SettingsDialog(QDialog):
                 table.setItem(i, 1, QTableWidgetItem(p.base_url))
                 key_display = "********" if p.api_key else "（空）"
                 table.setItem(i, 2, QTableWidgetItem(key_display))
+                table.setItem(i, 3, QTableWidgetItem(f"{len(p.models)} 个"))
                 table.item(i, 0).setData(Qt.ItemDataRole.UserRole, p.id)
             _clear_edit()
 
@@ -2704,6 +2785,7 @@ class SettingsDialog(QDialog):
             alias_edit.clear()
             url_edit.clear()
             key_edit.clear()
+            models_edit.clear()
 
         def on_table_selection_changed() -> None:
             nonlocal _selected_id_for_edit
@@ -2716,12 +2798,14 @@ class SettingsDialog(QDialog):
             alias_edit.setText(p.alias)
             url_edit.setText(p.base_url)
             key_edit.setText(p.api_key)
+            models_edit.setPlainText("\n".join(p.models))
 
         def on_save_row() -> None:
             nonlocal _selected_id_for_edit
             alias = alias_edit.text().strip()
             base_url = url_edit.text().strip()
             api_key = key_edit.text().strip()
+            model_names = tuple(_dedupe(models_edit.toPlainText().splitlines()))
             if not alias:
                 QMessageBox.warning(dialog, "校验失败", "别名不能为空。")
                 return
@@ -2739,11 +2823,22 @@ class SettingsDialog(QDialog):
             if editing_id:
                 for i, p in enumerate(profiles):
                     if p.id == editing_id:
-                        profiles[i] = ApiConfigProfile(id=p.id, alias=alias, base_url=base_url, api_key=api_key)
+                        removed = set(p.models) - set(model_names)
+                        used = self._used_slots_for_profile_models(p.id, removed)
+                        if used:
+                            QMessageBox.warning(dialog, "无法保存", f"这些模型正在被使用：{'、'.join(used)}。请先切换模型配置。")
+                            return
+                        profiles[i] = ApiConfigProfile(
+                            id=p.id,
+                            alias=alias,
+                            base_url=base_url,
+                            api_key=api_key,
+                            models=model_names,
+                        )
                         break
             else:
-                new_id = f"profile_{len(profiles) + 1}"
-                profiles.append(ApiConfigProfile(id=new_id, alias=alias, base_url=base_url, api_key=api_key))
+                new_id = _next_profile_id(profiles)
+                profiles.append(ApiConfigProfile(id=new_id, alias=alias, base_url=base_url, api_key=api_key, models=model_names))
                 _selected_id_for_edit = new_id
             refresh_table()
             for i, p in enumerate(profiles):
@@ -2754,12 +2849,13 @@ class SettingsDialog(QDialog):
         def on_add_row() -> None:
             nonlocal _selected_id_for_edit
             # 在配置列表末尾添加一个空白行并自动选中
-            new_id = f"profile_{len(profiles) + 1}"
-            profiles.append(ApiConfigProfile(id=new_id, alias="", base_url="", api_key=""))
+            new_id = _next_profile_id(profiles)
+            profiles.append(ApiConfigProfile(id=new_id, alias="", base_url="", api_key="", models=()))
             _selected_id_for_edit = new_id
             alias_edit.clear()
             url_edit.clear()
             key_edit.clear()
+            models_edit.clear()
             alias_edit.setFocus()
             refresh_table()
             for i, p in enumerate(profiles):
@@ -2772,17 +2868,9 @@ class SettingsDialog(QDialog):
             if row < 0 or row >= len(profiles):
                 return
             p = profiles[row]
-            # 检查是否正在被使用（使用当前下拉值）
-            vision_id = str(getattr(self, "vision_profile_combo", QComboBox()).currentData() or "")
-            text_id = str(getattr(self, "text_profile_combo", QComboBox()).currentData() or "")
-            text_enabled = getattr(self, "text_enabled_check", QCheckBox()).isChecked()
-            in_use = []
-            if p.id == vision_id:
-                in_use.append("视觉模型")
-            if p.id == text_id and text_enabled:
-                in_use.append("文本模型")
+            in_use = self._used_slots_for_profile(p.id)
             if in_use:
-                QMessageBox.warning(dialog, "无法删除", f"此配置集正在被{'、'.join(in_use)}使用，请先切换到其他配置集再删除。")
+                QMessageBox.warning(dialog, "无法删除", f"此供应商正在被{'、'.join(in_use)}使用，请先切换到其他供应商再删除。")
                 return
             profiles.pop(row)
             refresh_table()
@@ -2800,13 +2888,19 @@ class SettingsDialog(QDialog):
         btn_layout.addWidget(delete_btn)
         btn_layout.addStretch(1)
 
-        edit_layout = QHBoxLayout()
-        edit_layout.setSpacing(8)
-        edit_layout.addWidget(alias_edit, 2)
-        edit_layout.addWidget(url_edit, 3)
-        edit_layout.addWidget(key_edit, 2)
-        edit_layout.addWidget(show_key_check)
-        edit_layout.addWidget(save_row_btn)
+        edit_form = QFormLayout()
+        edit_form.setContentsMargins(0, 0, 0, 0)
+        top_edit = QWidget(dialog)
+        top_edit_layout = QHBoxLayout(top_edit)
+        top_edit_layout.setContentsMargins(0, 0, 0, 0)
+        top_edit_layout.setSpacing(8)
+        top_edit_layout.addWidget(alias_edit, 2)
+        top_edit_layout.addWidget(url_edit, 3)
+        top_edit_layout.addWidget(key_edit, 2)
+        top_edit_layout.addWidget(show_key_check)
+        top_edit_layout.addWidget(save_row_btn)
+        edit_form.addRow("供应商", top_edit)
+        edit_form.addRow("模型", models_edit)
 
         main_layout = QVBoxLayout(dialog)
         main_layout.setContentsMargins(12, 12, 12, 12)
@@ -2815,7 +2909,7 @@ class SettingsDialog(QDialog):
         main_layout.addWidget(table, 1)
         main_layout.addWidget(btn_row)
         main_layout.addWidget(QLabel("编辑选中的配置行：", dialog))
-        main_layout.addLayout(edit_layout)
+        main_layout.addLayout(edit_form)
 
         close_btn = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
         close_btn.rejected.connect(dialog.reject)
@@ -2827,20 +2921,8 @@ class SettingsDialog(QDialog):
 
         dialog.exec()
         self._api_profiles = profiles
-        # 刷新视觉/文本配置集下拉框，并保持当前选中项不变
-        for combo_attr in ("vision_profile_combo", "text_profile_combo"):
-            combo = getattr(self, combo_attr, None)
-            if combo is not None:
-                old_id = str(combo.currentData() or "")
-                combo.clear()
-                for p in profiles:
-                    alias = p.alias if p.alias else p.id
-                    combo.addItem(alias, p.id)
-                if combo.count() == 0:
-                    combo.addItem("（无配置）", "")
-                idx = combo.findData(old_id)
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
+        self._refresh_profile_combos()
+        self._refresh_all_slot_model_combos()
 
     # ── 模型名称编辑器 ──
 
@@ -2896,12 +2978,12 @@ class SettingsDialog(QDialog):
                 self.text_model_combo.blockSignals(False)
 
     def _set_api_model_probe_busy(self, busy: bool) -> None:
-        section = self._active_test_section or "vision"
-        probe_btn = getattr(self, f"{section}_probe_btn", None)
+        section = _normalize_model_section(self._active_test_section or MODEL_SLOT_CHAT)
+        probe_btn = getattr(self, "_slot_probe_buttons", {}).get(section)
         if probe_btn:
             probe_btn.setEnabled(not busy)
             probe_btn.setText("检测中..." if busy else "检测模型列表")
-        test_btn = getattr(self, f"{section}_test_btn", None)
+        test_btn = getattr(self, "_slot_test_buttons", {}).get(section)
         if test_btn:
             test_btn.setEnabled(not busy)
         if not hasattr(self, "button_box"):
@@ -3346,33 +3428,23 @@ class SettingsDialog(QDialog):
             self.character_export_card_action.setToolTip("导出当前角色的人格与立绘，不包含语音模型。")
             self.character_export_voice_action.setToolTip("当前角色没有可导出的语音模型。")
 
-    def _validated_api_settings(self, section: str = "vision") -> ApiSettings | None:
-        if section == "vision":
-            profile_combo = self.vision_profile_combo
-            model_combo = self.vision_model_combo
-            label = "视觉模型"
-        elif section == "text":
-            profile_combo = self.text_profile_combo
-            model_combo = self.text_model_combo
-            label = "文本模型"
-        else:
-            raise ValueError(f"Unknown section: {section}")
-
-        profile_id = str(profile_combo.currentData() or "")
-        model_name = model_combo.text().strip()
-        profile = _find_profile(self._api_profiles, profile_id)
-
-        if profile is None:
-            QMessageBox.warning(self, "配置无效", f"请先添加 API 配置集。")
+    def _validated_api_settings(self, section: str = MODEL_SLOT_CHAT) -> ApiSettings | None:
+        section = _normalize_model_section(section)
+        self._ensure_slot_model_registered(section)
+        resolved = resolve_model_slot(
+            self._api_profiles,
+            self._collect_model_selection(),
+            section,
+            self._initial_api_settings,
+        )
+        label = MODEL_SLOT_LABELS.get(section, "模型")
+        if resolved is None:
+            QMessageBox.warning(self, "配置无效", f"{label}没有可用模型，请先在供应商中添加模型。")
             return None
-        base_url = profile.base_url.strip().rstrip("/")
-        api_key = profile.api_key.strip()
-
-        if not base_url:
-            QMessageBox.warning(self, "配置无效", f"{label}配置的 Base URL 不能为空。")
-            return None
-        if not model_name:
-            QMessageBox.warning(self, "配置无效", f"{label}模型名称不能为空。")
+        settings = resolved.settings
+        profile = find_profile(self._api_profiles, resolved.selection.profile_id)
+        if profile is None or settings.model not in profile.models:
+            QMessageBox.warning(self, "配置无效", f"{label}必须选择当前供应商已添加的模型。")
             return None
 
         temperature = self.llm_temperature_spin.value()
@@ -3383,9 +3455,9 @@ class SettingsDialog(QDialog):
             temperature = None
 
         return ApiSettings(
-            base_url=base_url,
-            api_key=api_key,
-            model=model_name,
+            base_url=settings.base_url,
+            api_key=settings.api_key,
+            model=settings.model,
             timeout_seconds=self.api_timeout_spin.value(),
             temperature=temperature,
             top_p=(
@@ -3400,19 +3472,13 @@ class SettingsDialog(QDialog):
             ),
         )
 
-    def _validated_api_model_probe_settings(self, section: str = "vision") -> ApiSettings | None:
-        if section == "vision":
-            profile_combo = self.vision_profile_combo
-        elif section == "text":
-            profile_combo = self.text_profile_combo
-        else:
-            raise ValueError(f"Unknown section: {section}")
-
-        profile_id = str(profile_combo.currentData() or "")
-        profile = _find_profile(self._api_profiles, profile_id)
+    def _validated_api_model_probe_settings(self, section: str = MODEL_SLOT_CHAT) -> ApiSettings | None:
+        section = _normalize_model_section(section)
+        profile_id = self._slot_profile_id(section)
+        profile = find_profile(self._api_profiles, profile_id)
 
         if profile is None:
-            QMessageBox.warning(self, "配置无效", "请先添加 API 配置集。")
+            QMessageBox.warning(self, "配置无效", "请先添加供应商。")
             return None
         base_url = profile.base_url.strip().rstrip("/")
         api_key = profile.api_key.strip()
@@ -3424,9 +3490,27 @@ class SettingsDialog(QDialog):
         return ApiSettings(
             base_url=base_url,
             api_key=api_key,
-            model=self.vision_model_combo.text().strip(),
+            model="",
             timeout_seconds=self.api_timeout_spin.value(),
         )
+
+    def _ensure_slot_model_registered(self, section: str) -> None:
+        selection = self._collect_slot_selection(section)
+        if selection is None or not selection.configured:
+            return
+        profile = find_profile(self._api_profiles, selection.profile_id)
+        if profile is None or selection.model in profile.models:
+            return
+        self._replace_profile(
+            ApiConfigProfile(
+                id=profile.id,
+                alias=profile.alias,
+                base_url=profile.base_url,
+                api_key=profile.api_key,
+                models=tuple([*profile.models, selection.model]),
+            )
+        )
+        self._refresh_all_slot_model_combos()
 
     def _validated_tts_settings(
         self,
@@ -3730,9 +3814,74 @@ def _set_combo_current_data(combo: object, value: str) -> None:
     setter(index if index >= 0 else 0)
 
 
-def _find_profile(profiles: list[ApiConfigProfile], profile_id: str) -> ApiConfigProfile | None:
-    """在 API 配置集列表中按 id 查找配置集。"""
-    for p in profiles:
-        if p.id == profile_id:
-            return p
-    return None
+def _normalize_model_section(section: str | None) -> str:
+    if section in {"vision", "text", None, ""}:
+        return MODEL_SLOT_CHAT
+    return str(section)
+
+
+def _ensure_api_profiles(
+    api_settings: ApiSettings,
+    api_profiles: list[ApiConfigProfile] | None,
+    global_model_names: list[str] | None,
+) -> list[ApiConfigProfile]:
+    if api_profiles:
+        return [*_normalize_profile_models(api_profiles, global_model_names)]
+    models = _dedupe([api_settings.model, *(global_model_names or [])])
+    return [
+        ApiConfigProfile(
+            id="default",
+            alias="默认",
+            base_url=api_settings.base_url,
+            api_key=api_settings.api_key,
+            models=tuple(models),
+        )
+    ]
+
+
+def _ensure_model_selection(
+    api_settings: ApiSettings,
+    profiles: list[ApiConfigProfile],
+    model_selection: ModelSelectionSettings | None,
+) -> ModelSelectionSettings:
+    if model_selection is not None and model_selection.chat.configured:
+        return model_selection
+    profile_id = profiles[0].id if profiles else "default"
+    model = api_settings.model or (profiles[0].models[0] if profiles and profiles[0].models else "")
+    return ModelSelectionSettings(chat=ModelSlotSelection(profile_id=profile_id, model=model))
+
+
+def _normalize_profile_models(
+    profiles: list[ApiConfigProfile],
+    global_model_names: list[str] | None,
+) -> list[ApiConfigProfile]:
+    result: list[ApiConfigProfile] = []
+    for profile in profiles:
+        models = tuple(_dedupe([*profile.models, *(global_model_names or [])]))
+        result.append(
+            ApiConfigProfile(
+                id=profile.id,
+                alias=profile.alias,
+                base_url=profile.base_url,
+                api_key=profile.api_key,
+                models=models,
+            )
+        )
+    return result
+
+
+def _dedupe(values: list[str] | tuple[str, ...]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _next_profile_id(profiles: list[ApiConfigProfile]) -> str:
+    existing = {profile.id for profile in profiles}
+    index = len(existing) + 1
+    while f"profile_{index}" in existing:
+        index += 1
+    return f"profile_{index}"
