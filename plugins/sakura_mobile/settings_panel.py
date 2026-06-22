@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtWidgets import QApplication, QCheckBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QCheckBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget
+
+from plugins.sakura_mobile.server import DEFAULT_HOST
 
 
 class SakuraMobileSettingsPanel(QWidget):
@@ -18,7 +20,7 @@ class SakuraMobileSettingsPanel(QWidget):
         self.port.setRange(1, 65535)
         self.port.setValue(int(config["port"]))
         self.token = QLineEdit(str(config["token"]), self)
-        self.token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token.setEchoMode(QLineEdit.EchoMode.Normal)
         self.status_label = QLabel("", self)
         self.local_url = QLineEdit(self)
         self.local_url.setReadOnly(True)
@@ -67,18 +69,26 @@ class SakuraMobileSettingsPanel(QWidget):
     def _save(self) -> None:
         token = self.token.text().strip()
         if self.enabled.isChecked() and not token:
+            QMessageBox.warning(self, "配置无效", "启用手机网页端时访问 token 不能为空。")
+            self.token.setFocus()
             return
         self.plugin.save_config(
             {
                 "enabled": self.enabled.isChecked(),
-                "host": self.host.text().strip() or "127.0.0.1",
+                "host": self.host.text().strip() or DEFAULT_HOST,
                 "port": self.port.value(),
                 "token": token or "sakura",
             }
         )
-        self._refresh_status()
+        status = self._refresh_status()
+        if not self.enabled.isChecked():
+            QMessageBox.information(self, "手机端已关闭", "手机网页端已关闭。")
+        elif status.get("running"):
+            QMessageBox.information(self, "手机端已启动", self._status_links_message(status))
+        else:
+            QMessageBox.warning(self, "手机端启动失败", str(status.get("error") or "服务未启动。"))
 
-    def _refresh_status(self) -> None:
+    def _refresh_status(self) -> dict[str, Any]:
         status = self.plugin.status()
         if not status["enabled"]:
             self.status_label.setText("未启动")
@@ -92,6 +102,12 @@ class SakuraMobileSettingsPanel(QWidget):
         self.lan_url.setText(" ; ".join(lan_urls) if lan_urls else "未发现内网地址")
         self.local_url.setCursorPosition(0)
         self.lan_url.setCursorPosition(0)
+        return status
+
+    def _status_links_message(self, status: dict[str, Any]) -> str:
+        lan_urls = status.get("lan_urls") or []
+        lan_text = "\n".join(lan_urls) if lan_urls else "未发现内网地址"
+        return f"本机链接：\n{status.get('local_url', '')}\n\n内网链接：\n{lan_text}"
 
     def _copy(self, text: str) -> None:
         clean = text.strip()
