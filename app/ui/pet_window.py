@@ -4560,6 +4560,7 @@ class PetWindow(QWidget):
             self.worker_thread is not None
             or self._active_mobile_chat_request is not None
             or self._mobile_chat_requests
+            or self.memory_curation_thread is not None
             or self.active_reminder_id is not None
             or self.active_event_type
             or self.pending_tool_action is not None

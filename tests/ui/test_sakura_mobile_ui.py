@@ -176,3 +176,25 @@ def test_mobile_chat_completion_ignores_other_character() -> None:
     )
 
     assert window.messages == []
+
+
+def test_mobile_chat_is_busy_while_memory_curation_runs() -> None:
+    from app.ui.pet_window import PetWindow
+
+    class MinimalWindow:
+        _mobile_chat_busy = PetWindow._mobile_chat_busy
+
+    window = MinimalWindow()
+    window.worker_thread = None
+    window._active_mobile_chat_request = None
+    window._mobile_chat_requests = []
+    window.memory_curation_thread = object()
+    window.active_reminder_id = None
+    window.active_event_type = ""
+    window.pending_tool_action = None
+    window.pending_screen_observation_messages = None
+    window.screen_observation_followup_in_progress = False
+    window.screen_observation_encode_thread = None
+    window.active_interaction_id = ""
+
+    assert window._mobile_chat_busy()

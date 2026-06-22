@@ -87,6 +87,7 @@ def test_mobile_session_keeps_empty_tool_registry(monkeypatch: pytest.MonkeyPatc
     class FakeRuntime:
         def __init__(self, *args: object, tools: ToolRegistry, **kwargs: object) -> None:
             self.tools = tools
+            self.memory = kwargs["memory"]
             self.api_client = object()
             self.system_prompt = ""
 
@@ -113,7 +114,7 @@ def test_mobile_session_keeps_empty_tool_registry(monkeypatch: pytest.MonkeyPatc
         scope_id = "host"
 
         def scoped(self, _scope_id: str) -> "Memory":
-            return self
+            raise AssertionError("mobile chat must reuse the host memory store")
 
     monkeypatch.setattr(bridge_module, "AgentRuntime", FakeRuntime)
     monkeypatch.setattr(bridge_module, "OpenAICompatibleClient", lambda _settings: object())
@@ -129,11 +130,12 @@ def test_mobile_session_keeps_empty_tool_registry(monkeypatch: pytest.MonkeyPatc
             )
         ]
     )
+    memory = Memory()
     host = SimpleNamespace(
         character_profile=profile,
         character_registry=Registry(),
         _create_history_store=lambda _profile: object(),
-        memory_store=Memory(),
+        memory_store=memory,
         api_client=SimpleNamespace(settings=object()),
         agent_runtime=SimpleNamespace(
             prompt_patches=[],
@@ -147,6 +149,7 @@ def test_mobile_session_keeps_empty_tool_registry(monkeypatch: pytest.MonkeyPatc
     session = MobileChatBridge(host)._session("demo")
 
     assert session.runtime.tools.get("host_tool") is None
+    assert session.runtime.memory is memory
 
 
 def test_mobile_chat_returns_without_inline_memory_curation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -209,7 +212,7 @@ def test_mobile_chat_returns_without_inline_memory_curation(monkeypatch: pytest.
         scope_id = "host"
 
         def scoped(self, _scope_id: str) -> "Memory":
-            return self
+            raise AssertionError("mobile chat must reuse the host memory store")
 
         def set_scope(self, scope_id: str) -> None:
             self.scope_id = scope_id

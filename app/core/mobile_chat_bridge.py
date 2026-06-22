@@ -132,7 +132,7 @@ class MobileChatBridge:
 
         profile = self._host.character_registry.get(clean_id)
         history_store = self._host._create_history_store(profile)
-        memory_store = self._host.memory_store.scoped(profile.id)
+        memory_store = self._host.memory_store
         runtime = AgentRuntime(
             api_client=OpenAICompatibleClient(self._host.api_client.settings),
             system_prompt=load_character_system_prompt(profile),
