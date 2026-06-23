@@ -3528,10 +3528,18 @@ def test_pet_window_syncs_plugin_chat_ui_widgets() -> None:
     app.processEvents()
 
 
-def test_settings_dialog_exposes_experimental_windows_mcp_restart_setting() -> None:
+def test_settings_dialog_exposes_experimental_windows_mcp_restart_setting(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     qtwidgets = pytest.importorskip("PySide6.QtWidgets")
     if not hasattr(qtwidgets, "QApplication"):
         pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.agent.mcp import DesktopMCP
+
+    # 桌面控制选项按平台展示；固定为 Windows，使断言不依赖 CI 运行平台。
+    monkeypatch.setattr(
+        "app.ui.settings.pages.sections.resolve_desktop_mcp",
+        lambda platform=None: DesktopMCP(server_name="windows", label="Windows MCP"),
+    )
 
     from app.ui.settings_dialog import SettingsDialog
 
@@ -3564,6 +3572,81 @@ def test_settings_dialog_exposes_experimental_windows_mcp_restart_setting() -> N
     dialog.accept()
 
     assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=True)
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_desktop_mcp_option_uses_platform_label(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    from app.agent.mcp import DesktopMCP
+
+    # 模拟 macOS：选项文案显示 macOS MCP，开关仍写回 windows_enabled（向后兼容字段）。
+    monkeypatch.setattr(
+        "app.ui.settings.pages.sections.resolve_desktop_mcp",
+        lambda platform=None: DesktopMCP(server_name="macos", label="macOS MCP"),
+    )
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("mcp_macos_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+
+    assert "macOS MCP" in dialog.windows_mcp_enabled_check.text()
+    dialog.windows_mcp_enabled_check.setChecked(True)
+    dialog.accept()
+    assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=True)
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_settings_dialog_hides_desktop_mcp_option_when_platform_unsupported(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    qtwidgets = pytest.importorskip("PySide6.QtWidgets")
+    if not hasattr(qtwidgets, "QApplication"):
+        pytest.skip("当前测试环境只提供了 PySide6 stub。")
+
+    # 模拟无内置桌面控制 MCP 的平台（如 Linux）：不展示该选项，开关回落为 False。
+    monkeypatch.setattr(
+        "app.ui.settings.pages.sections.resolve_desktop_mcp",
+        lambda platform=None: None,
+    )
+
+    from app.ui.settings_dialog import SettingsDialog
+
+    QApplication = qtwidgets.QApplication
+    app = QApplication.instance() or QApplication([])
+    root = _ui_runtime_root("mcp_unsupported_dialog")
+    dialog = SettingsDialog(
+        api_settings=ApiSettings(
+            base_url="https://api.example.com/v1",
+            api_key="test-key",
+            model="test-model",
+        ),
+        tts_settings=_minimal_tts_settings(),
+        base_dir=root,
+        **_settings_dialog_character_kwargs(root),
+        proactive_care_settings=ProactiveCareSettings(screen_context_enabled=True),
+        mcp_settings=MCPRuntimeSettings(windows_enabled=False),
+    )
+
+    assert dialog.windows_mcp_enabled_check is None
+    dialog.accept()
+    assert dialog.result_mcp_settings == MCPRuntimeSettings(windows_enabled=False)
     dialog.deleteLater()
     app.processEvents()
 
