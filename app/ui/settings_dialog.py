@@ -2293,7 +2293,11 @@ class SettingsDialog(QDialog):
                 screen_context_batch_limit=self.proactive_batch_limit_spin.value(),
             ),
             "mcp_settings": MCPRuntimeSettings(
-                windows_enabled=self.windows_mcp_enabled_check.isChecked(),
+                windows_enabled=(
+                    self.windows_mcp_enabled_check.isChecked()
+                    if getattr(self, "windows_mcp_enabled_check", None) is not None
+                    else False
+                ),
             ),
             "runtime_loop_settings": RuntimeLoopSettings(
                 max_agent_steps_per_turn=self.agent_steps_per_turn_spin.value(),

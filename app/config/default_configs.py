@@ -72,6 +72,35 @@ servers:
       Screenshot:
         risk: medium
         requires_confirmation: false
+  macos:
+    enabled: false
+    transport: stdio
+    command: "{uvx}"
+    args:
+      - "macos-mcp"
+    env:
+      ANONYMIZED_TELEMETRY: "false"
+    name_prefix: macos__
+    call_timeout: 30
+    risk: high
+    requires_confirmation: true
+    include_tools:
+      - App
+      - Snapshot
+      - Click
+      - Type
+      - Wait
+    exclude_tools:
+      - Shell
+      - Scrape
+      - Notification
+      - Move
+      - Scroll
+      - Shortcut
+    tool_policies:
+      Snapshot:
+        risk: medium
+        requires_confirmation: false
 """
 
 # 内置插件的默认启停（与各插件 plugin.yaml 的 manifest 默认一致）

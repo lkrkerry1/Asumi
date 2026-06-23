@@ -5476,7 +5476,7 @@ class PetWindow(QWidget):
         if api_changed:
             message += "\n\n长期记忆系统正在后台刷新 API 配置。"
         if mcp_restart_required:
-            message += "\n\nWindows MCP 开关需要重启 Sakura 后才会生效。"
+            message += "\n\n桌面控制 MCP 开关需要重启 Sakura 后才会生效。"
         if startup_settings_changed:
             message += "\n\n登录自启动设置已更新。"
         if getattr(dialog, "result_plugin_config_changed", False):

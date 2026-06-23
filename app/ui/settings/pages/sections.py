@@ -31,7 +31,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.agent.mcp import MCPRuntimeSettings, WINDOWS_MCP_EXPERIMENTAL_TEXT
+from app.agent.mcp import (
+    DESKTOP_MCP_EXPERIMENTAL_TEXT,
+    MCPRuntimeSettings,
+    resolve_desktop_mcp,
+)
 from app.agent.runtime_limits import (
     MAX_CONFIGURABLE_AGENT_STEPS_PER_TURN,
     MAX_CONFIGURABLE_TOOL_CALLS_PER_STEP,
@@ -817,22 +821,31 @@ class ToolsSettingsPage:
         owner = self.dialog
         tab = QWidget(owner)
         runtime_loop_settings = runtime_loop_settings.normalized()
-        owner.windows_mcp_enabled_check = QCheckBox("启用 Windows MCP 桌面控制（实验性）", tab)
-        owner.windows_mcp_enabled_check.setChecked(settings.windows_enabled)
-        owner.windows_mcp_enabled_check.setToolTip(WINDOWS_MCP_EXPERIMENTAL_TEXT)
-
-        restart_hint = QLabel(
-            f"{WINDOWS_MCP_EXPERIMENTAL_TEXT}。保存后需要重启 Sakura 才会加载或卸载 Windows MCP 工具。",
-            tab,
-        )
-        restart_hint.setWordWrap(True)
-        owner.system_restart_hint_label = restart_hint
+        desktop_mcp = resolve_desktop_mcp()
 
         form_layout = QFormLayout()
         form_layout.setContentsMargins(16, 18, 16, 16)
         form_layout.setSpacing(12)
-        form_layout.addRow("", owner.windows_mcp_enabled_check)
-        form_layout.addRow("生效方式", restart_hint)
+
+        if desktop_mcp is not None:
+            owner.windows_mcp_enabled_check = QCheckBox(
+                f"启用 {desktop_mcp.label} 桌面控制（实验性）", tab
+            )
+            owner.windows_mcp_enabled_check.setChecked(settings.windows_enabled)
+            owner.windows_mcp_enabled_check.setToolTip(DESKTOP_MCP_EXPERIMENTAL_TEXT)
+
+            restart_hint = QLabel(
+                f"{DESKTOP_MCP_EXPERIMENTAL_TEXT}。保存后需要重启 Sakura 才会加载或卸载 {desktop_mcp.label} 工具。",
+                tab,
+            )
+            restart_hint.setWordWrap(True)
+            owner.system_restart_hint_label = restart_hint
+
+            form_layout.addRow("", owner.windows_mcp_enabled_check)
+            form_layout.addRow("生效方式", restart_hint)
+        else:
+            # 当前平台暂无内置桌面控制 MCP（如 Linux），不显示桌面控制开关。
+            owner.windows_mcp_enabled_check = None
         form_layout.addRow("", self._build_runtime_loop_group(runtime_loop_settings, tab))
         for contribution in sorted(tools_tab_contributions, key=lambda item: item.order):
             try:
