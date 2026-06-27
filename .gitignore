@@ -26,10 +26,13 @@ characters/
 .mypy_cache/
 .ruff_cache/
 temp/
+tools/studio/workspace/
 
 *.log
+data/backchannel_eval.jsonl
 data/chat_history.jsonl
 data/chat_history/
+data/tasks.json
 data/memory/
 data/memory.json
 data/memory_curation_state.json

@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -88,7 +89,17 @@ from app.llm.context_trimming import trim_messages_for_model
 from app.core.chat_worker import ChatWorker, EventWorker
 from app.core.cancellation import CancellationToken, OperationCancelled
 from app.core.debug_log import debug_log, summarize_messages
+from app.config.model_slots import ResolvedModelSlot, resolve_model_slot
+from app.config.models import (
+    MODEL_SLOT_CHAT,
+    MODEL_SLOT_MEMORY_CURATION,
+    MODEL_SLOT_VISION_CHAT,
+    MODEL_SLOT_VISUAL_CONTEXT,
+    ApiConfigProfile,
+    ModelSelectionSettings,
+)
 from app.config.settings_service import BackchannelSettings, BubbleSettings, StartupSettings
+from app.llm.api_client import ApiSettings, OpenAICompatibleClient
 from app.backchannel.audio_cache import BackchannelAudioCache, voice_fingerprint
 from app.backchannel.classifier import RuleClassifier
 from app.backchannel.controller import BackchannelController
@@ -98,6 +109,8 @@ from app.backchannel.eval_log import BackchannelEvalLogger
 from app.backchannel.models import BackchannelLabel, BackchannelManifest
 from app.backchannel.resolver import BackchannelChoice
 from app.core.interaction import clear_interaction_id, set_interaction_id
+from app.core.mobile_chat_bridge import MobileChatBridge, MobileChatBusyError
+from app.core.mobile_chat_worker import MobileChatWorker
 from app.core.resource_manager import ResourceManager
 from app.storage.atomic import atomic_write_text
 from app.storage.paths import StoragePaths
@@ -144,6 +157,10 @@ from app.agent.screen_observation import (
     capture_screen_image,
 )
 from app.ui.settings_dialog import SettingsDialog
+from app.ui.tts_bundle_dialog import (
+    cancel_active_tts_bundle_downloads_for_shutdown,
+    has_active_tts_bundle_download,
+)
 from app.ui.portrait_controller import (
     PORTRAIT_BASE_MAX_HEIGHT,
     PORTRAIT_BASE_MAX_WIDTH,
@@ -210,6 +227,7 @@ from app.ui.theme import (
     build_app_chrome_stylesheet,
     build_message_box_stylesheet,
     merge_theme_with_character,
+    theme_colors_to_mapping,
 )
 from app.voice import VoicePlaybackController
 
@@ -242,6 +260,7 @@ LEGACY_PROACTIVE_EVENT_TYPE = "proactive_check"
 SCREEN_AWARENESS_VISUAL_SOURCE = "screen_awareness_context"
 SCREEN_AWARENESS_STATE_FILE = "screen_awareness_state.json"
 SCREEN_AWARENESS_HEALTH_TOPIC = "health_reminder"
+MOBILE_CHAT_BUSY_MESSAGE = "Sakura 正忙，请稍后再试。"
 SCREEN_AWARENESS_HEALTH_KEYWORDS = (
     "休息",
     "休憩",
@@ -472,6 +491,8 @@ class PetWindow(QWidget):
     memory_status_changed = Signal(str, str)
     # 插件请求把文本填入输入框；用信号 marshal 回 UI 线程（ASR 等可能在后台线程触发）。
     plugin_input_text_requested = Signal(str)
+    mobile_chat_completed = Signal(object)
+    mobile_chat_requested = Signal(object)
 
     def __init__(
         self,
@@ -480,6 +501,8 @@ class PetWindow(QWidget):
         super().__init__()
         # 插件填充输入框的信号在此连接，确保后台线程触发时 marshal 回 UI 线程。
         self.plugin_input_text_requested.connect(self._apply_plugin_input_text)
+        self.mobile_chat_completed.connect(self._handle_mobile_chat_completed)
+        self.mobile_chat_requested.connect(self._enqueue_mobile_chat)
         self.context = context
         self.base_dir = context.base_dir
         self.startup_initializing = context.startup_initializing
@@ -509,6 +532,9 @@ class PetWindow(QWidget):
         self.tts_provider = context.tts_provider
         self.retired_tts_providers: list[TTSProvider] = []
         self.history_store = context.history_store
+        self.mobile_chat_bridge = MobileChatBridge(self)
+        self._mobile_chat_requests: list[dict[str, Any]] = []
+        self._active_mobile_chat_request: dict[str, Any] | None = None
         self.runtime_event_log = context.runtime_event_log
         self.visual_observation_store = context.visual_observation_store
         self.mcp_settings = context.mcp_settings
@@ -537,8 +563,7 @@ class PetWindow(QWidget):
         self.always_on_top_enabled = self._load_always_on_top_enabled()
         # 普通副窗口打开期间临时压低桌宠的实际置顶层级，避免副窗口被桌宠盖住；不改变用户配置。
         self._secondary_windows_suppress_topmost = False
-        self._secondary_windows_hide_input_bar = False
-        # 副窗口可见期间暂停桌宠后台 hover 轮询，减少与副窗口下拉弹层抢占合成器。
+        # 副窗口可见期间暂停桌宠气泡后台 hover 轮询，减少与副窗口下拉弹层抢占合成器。
         self._secondary_windows_background_quiesced = False
         self._registered_secondary_windows: set[QWidget] = set()
         self.history_window: HistoryWindow | None = None
@@ -1269,6 +1294,25 @@ class PetWindow(QWidget):
             suppress()
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if has_active_tts_bundle_download():
+            reply = QMessageBox.question(
+                self,
+                "TTS 下载中",
+                "TTS 整合包正在后台下载。退出 Sakura 会暂停本次下载，已下载部分会保留，下次可继续。\n\n确定要退出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            if not cancel_active_tts_bundle_downloads_for_shutdown():
+                QMessageBox.information(
+                    self,
+                    "TTS 下载中",
+                    "下载线程仍在停止，请稍后再退出 Sakura。",
+                )
+                event.ignore()
+                return
         self.close_external_tools()
         super().closeEvent(event)
 
@@ -1521,11 +1565,11 @@ class PetWindow(QWidget):
         controller = getattr(self, "bubble_auto_hide", None)
         if controller is not None:
             controller.handle_pet_clicked()
-        # 无副窗口/对话框占用且模型未在思考时，让输入栏现身并把焦点移入输入框。
+        # 模型未在思考时，让输入栏现身并把焦点移入输入框。
         # 先 set_force_visible(True) 使 input_card 同步 show()（hidden widget 无法接收焦点），
         # 设完焦点后立即释放 force_visible——_input_bar_pinned 会通过焦点继续维持可见。
         # 思考中不浮现：避免用户点击桌宠时反而让输入栏被焦点固定、无法随思考态收起。
-        if not self._any_dialog_open() and not getattr(self, "reply_waiting_ui_active", False):
+        if not getattr(self, "reply_waiting_ui_active", False):
             animator = getattr(self, "input_bar_animator", None)
             input_edit = getattr(self, "input_edit", None)
             if animator is not None:
@@ -2228,16 +2272,6 @@ class PetWindow(QWidget):
             if self._is_secondary_window_visible(dialog):
                 dialog.raise_()
 
-    def _any_dialog_open(self) -> bool:
-        for dialog in (
-            getattr(self, "settings_dialog", None),
-            getattr(self, "history_window", None),
-            getattr(self, "runtime_log_window", None),
-        ):
-            if self._is_secondary_window_visible(dialog):
-                return True
-        return False
-
     def _update_tray_icon_pixmap(self, pixmap: QPixmap) -> None:
         _ = pixmap
         if hasattr(self, "tray_icon"):
@@ -2509,9 +2543,6 @@ class PetWindow(QWidget):
         return make_blurred_pixmap(cropped, radius=4.0, downscale=2)
 
     def _cursor_in_pet_region(self) -> bool:
-        # 普通副窗口打开时禁用输入栏浮现，避免盖住对话框。
-        if self._any_dialog_open():
-            return False
         if not self._input_bar_foreground_allowed():
             return False
         # 单窗口重构后气泡/输入栏已并入主窗口，主窗口几何即桌宠整体区域；
@@ -2578,9 +2609,6 @@ class PetWindow(QWidget):
         注意：不把「对话进行中(active_interaction_id)」和「等待模型回复」算进来；
         思考中只更新输入区状态，不强制输入栏常显。
         """
-        # 设置/历史窗口打开时不固定输入栏，配合 hover 禁用一起彻底收起。
-        if self._any_dialog_open():
-            return False
         if not self._input_bar_foreground_allowed():
             return False
         return (
@@ -4223,6 +4251,38 @@ class PetWindow(QWidget):
         if pending_turns >= self.memory_curation_settings.trigger_turns:
             QTimer.singleShot(0, self._maybe_start_auto_memory_curation)
 
+    @Slot(object)
+    def _handle_mobile_chat_completed(self, payload: object) -> None:
+        """手机端完成当前桌面角色对话后，同步回桌面临时上下文和回溯。"""
+        if not isinstance(payload, dict):
+            return
+        if str(payload.get("character_id") or "") != self.character_profile.id:
+            return
+        user_text = str(payload.get("user_text") or "").strip()
+        assistant_text = str(payload.get("assistant_text") or "").strip()
+        self.messages = _without_transient_progress_messages(self.messages)
+        if user_text:
+            self.messages.append({"role": "user", "content": user_text})
+        if assistant_text:
+            self.messages.append({"role": "assistant", "content": assistant_text})
+        segments = [
+            segment
+            for segment in payload.get("segments") or []
+            if isinstance(segment, ChatSegment) and segment.text.strip()
+        ]
+        previous_count = len(self.reply_history_segments)
+        was_reviewing = self.reply_history_review_active
+        self._remember_reply_history_segments(segments)
+        if not was_reviewing and previous_count > 0 and len(self.reply_history_segments) > previous_count:
+            self.reply_history_index = previous_count - 1
+            self._update_reply_history_buttons()
+        request_refresh = getattr(getattr(self, "history_window", None), "request_refresh", None)
+        if callable(request_refresh):
+            request_refresh()
+        record_completed_memory_turn = getattr(self, "_record_completed_memory_turn", None)
+        if callable(record_completed_memory_turn):
+            record_completed_memory_turn()
+
     def _maybe_start_auto_memory_curation(self) -> None:
         if getattr(self, "startup_initializing", False):
             return
@@ -4386,11 +4446,10 @@ class PetWindow(QWidget):
         self.agent_runtime.set_context_providers(services.plugin_manager.context_providers)
         # 把插件事件总线接到工具执行与 LLM 请求链路，供插件订阅 tool.* / llm.request.*。
         emit_bus_event = getattr(services.plugin_manager, "emit_bus_event", None)
+        self._llm_event_emitter = emit_bus_event if callable(emit_bus_event) else None
         if callable(emit_bus_event):
             services.tool_registry.set_event_emitter(emit_bus_event)
-            api_client = getattr(self.agent_runtime, "api_client", None)
-            if api_client is not None and hasattr(api_client, "set_event_emitter"):
-                api_client.set_event_emitter(emit_bus_event)
+        _wire_runtime_llm_event_emitters(self, self._llm_event_emitter)
         self.mcp_tool_provider = services.mcp_tool_provider
         self.plugin_manager = services.plugin_manager
         self._wire_plugin_service_backends()
@@ -4477,9 +4536,111 @@ class PetWindow(QWidget):
         if services is None:
             return
         try:
-            services.set_backends(input_text_sink=self._request_fill_input_text)
+            services.set_backends(
+                input_text_sink=self._request_fill_input_text,
+                mobile_characters_sink=self._mobile_characters,
+                mobile_history_sink=self._mobile_history,
+                mobile_chat_sink=self._mobile_chat,
+                mobile_theme_sink=self._mobile_theme,
+            )
         except Exception as exc:  # noqa: BLE001 — 装配失败不得阻断启动
             debug_log("PetWindow", "注入插件服务后端失败", {"error": str(exc)})
+
+    def _mobile_characters(self) -> list[dict[str, str]]:
+        return self.mobile_chat_bridge.characters()
+
+    def _mobile_history(self, character_id: str, limit: int) -> list[dict[str, str]]:
+        return self.mobile_chat_bridge.history(character_id, limit=limit)
+
+    def _mobile_chat(self, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
+        return self.mobile_chat_bridge.chat(character_id, text, image_data_url)
+
+    def _mobile_theme(self) -> dict[str, object]:
+        return theme_colors_to_mapping(getattr(self, "theme_settings", DEFAULT_THEME_SETTINGS))
+
+    def mobile_context_providers(self, _profile: CharacterProfile) -> list[Any]:
+        return list(getattr(self.plugin_manager, "context_providers", []))
+
+    def submit_mobile_chat(self, bridge: MobileChatBridge, character_id: str, text: str, image_data_url: str) -> dict[str, Any]:
+        """Marshal an HTTP request into the single host Agent worker lane."""
+        if self._mobile_chat_busy():
+            raise MobileChatBusyError(MOBILE_CHAT_BUSY_MESSAGE)
+        request: dict[str, Any] = {"bridge": bridge, "character_id": character_id, "text": text, "image_data_url": image_data_url, "done": threading.Event(), "result": None, "error": "", "busy": False}
+        self.mobile_chat_requested.emit(request)
+        if not request["done"].wait(timeout=300):
+            raise TimeoutError("移动端聊天等待超时。")
+        if request["busy"]:
+            raise MobileChatBusyError(str(request["error"] or MOBILE_CHAT_BUSY_MESSAGE))
+        if request["error"]:
+            raise RuntimeError(str(request["error"]))
+        result = request["result"]
+        if not isinstance(result, dict):
+            raise RuntimeError("移动端聊天未返回有效结果。")
+        return result
+
+    def _mobile_chat_busy(self) -> bool:
+        subtitle_controller = getattr(self, "subtitle_controller", None)
+        is_reply_sequence_active = getattr(subtitle_controller, "is_reply_sequence_active", None)
+        reply_sequence_active = callable(is_reply_sequence_active) and bool(is_reply_sequence_active())
+        return bool(
+            self.worker_thread is not None
+            or self._active_mobile_chat_request is not None
+            or self._mobile_chat_requests
+            or self.active_reminder_id is not None
+            or self.active_event_type
+            or self.pending_tool_action is not None
+            or self.pending_screen_observation_messages is not None
+            or self.screen_observation_followup_in_progress
+            or self.screen_observation_encode_thread is not None
+            or reply_sequence_active
+        )
+
+    @Slot(object)
+    def _enqueue_mobile_chat(self, request: object) -> None:
+        if not isinstance(request, dict):
+            return
+        if getattr(self, "_shutdown_in_progress", False):
+            request["error"] = "应用正在关闭。"
+            request["done"].set()
+            return
+        if self._mobile_chat_busy():
+            request["busy"] = True
+            request["error"] = MOBILE_CHAT_BUSY_MESSAGE
+            request["done"].set()
+            return
+        self._mobile_chat_requests.append(request)
+        self._start_next_mobile_chat()
+
+    def _start_next_mobile_chat(self) -> None:
+        if self.worker_thread is not None or self._active_mobile_chat_request is not None or not self._mobile_chat_requests:
+            return
+        request = self._mobile_chat_requests.pop(0)
+        self._active_mobile_chat_request = request
+        worker = MobileChatWorker(request["bridge"], str(request["character_id"]), str(request["text"]), str(request["image_data_url"]))
+        self.resource_manager.spawn_qt_worker(
+            worker, parent=self, owner=self, thread_attr="worker_thread", worker_attr="worker",
+            signal_bindings=[(worker.finished, self._handle_mobile_chat_result), (worker.failed, self._handle_mobile_chat_error)],
+            quit_on=[worker.finished, worker.failed], on_finished=self._finish_mobile_chat_worker,
+        )
+
+    @Slot(object)
+    def _handle_mobile_chat_result(self, result: object) -> None:
+        request = self._active_mobile_chat_request
+        if request is not None:
+            request["result"] = result
+            request["done"].set()
+
+    @Slot(str)
+    def _handle_mobile_chat_error(self, message: str) -> None:
+        request = self._active_mobile_chat_request
+        if request is not None:
+            request["error"] = message
+            request["done"].set()
+
+    def _finish_mobile_chat_worker(self) -> None:
+        self._active_mobile_chat_request = None
+        self._start_next_mobile_chat()
+        self._update_reply_history_buttons()
 
     def _request_fill_input_text(self, text: str) -> None:
         """插件侧入口：请求把文本填入输入框。
@@ -4950,6 +5111,11 @@ class PetWindow(QWidget):
             ),
             on_layout_preview=self._preview_layout,
             memory_curation_settings=getattr(self, "memory_curation_settings", None),
+            on_prepare_secondary_window=self._prepare_secondary_window,
+            on_present_secondary_window=self._present_registered_secondary_window,
+            on_release_secondary_window=self._release_secondary_window,
+            api_profiles=self.settings_service.load_api_profiles(),
+            model_selection=self.settings_service.load_model_selection(),
         )
         self.settings_dialog = dialog
         # 非模态打开：设置窗口开着时仍可正常点击/拖动桌宠。可最小化、有独立任务栏按钮、不置顶。
@@ -5120,6 +5286,13 @@ class PetWindow(QWidget):
         try:
             if api_changed:
                 self.settings_service.save_api_settings(dialog.result_api_settings)
+            # 保存 API 配置集和模型选择（新格式）
+            api_profiles = getattr(dialog, "result_api_profiles", None)
+            model_selection = getattr(dialog, "result_model_selection", None)
+            if api_profiles is not None:
+                self.settings_service.save_api_profiles(api_profiles)
+            if model_selection is not None:
+                self.settings_service.save_model_selection(model_selection)
             self.settings_service.save_tts_settings(dialog.result_tts_settings)
             if should_write_character_theme:
                 save_character_theme(
@@ -5191,7 +5364,16 @@ class PetWindow(QWidget):
             )
             return
 
-        if api_changed:
+        # 更新 API client（新格式统一处理，替代旧 api_changed 块）
+        if api_profiles is not None and model_selection is not None:
+            _update_runtime_api_clients(
+                self,
+                api_profiles=api_profiles,
+                model_selection=model_selection,
+                base_settings=dialog.result_api_settings,
+            )
+        elif api_changed:
+            # 旧格式回退
             self.api_client.update_settings(dialog.result_api_settings)
             self.memory_store.reload_api_settings(dialog.result_api_settings, wait=False)
         self.agent_runtime.set_runtime_loop_settings(result_runtime_loop_settings)
@@ -5294,7 +5476,7 @@ class PetWindow(QWidget):
         if api_changed:
             message += "\n\n长期记忆系统正在后台刷新 API 配置。"
         if mcp_restart_required:
-            message += "\n\nWindows MCP 开关需要重启 Sakura 后才会生效。"
+            message += "\n\n桌面控制 MCP 开关需要重启 Sakura 后才会生效。"
         if startup_settings_changed:
             message += "\n\n登录自启动设置已更新。"
         if getattr(dialog, "result_plugin_config_changed", False):
@@ -5408,7 +5590,7 @@ class PetWindow(QWidget):
         self._apply_window_flags()
         if checked and not bool(getattr(self, "_secondary_windows_suppress_topmost", False)):
             self.raise_()
-        # 已打开的设置/历史/日志窗口需跟随桌宠置顶状态更新，否则桌宠置顶后会反盖住它们。
+        # 已打开的副窗口需跟随桌宠置顶状态更新，否则桌宠置顶后会反盖住它们。
         self._sync_secondary_windows_topmost()
         if hasattr(self, "tray_icon"):
             self.tray_icon.setContextMenu(self._build_menu())
@@ -5416,12 +5598,8 @@ class PetWindow(QWidget):
     def _sync_secondary_windows_topmost(self) -> None:
         """桌宠置顶状态切换时，让已打开的副窗口跟随更新置顶，保持在桌宠之上。"""
         keep_on_top = bool(getattr(self, "always_on_top_enabled", False))
-        for window in (
-            getattr(self, "settings_dialog", None),
-            getattr(self, "history_window", None),
-            getattr(self, "runtime_log_window", None),
-        ):
-            if window is None or not window.isVisible():
+        for window in tuple(getattr(self, "_registered_secondary_windows", set())):
+            if not self._is_secondary_window_visible(window):
                 continue
             _configure_secondary_window(window, keep_on_top=keep_on_top)
             _present_secondary_window(window)
@@ -5755,7 +5933,6 @@ class PetWindow(QWidget):
     def _present_registered_secondary_window(self, window: QWidget) -> None:
         """打开已登记的普通副窗口，并在显示前临时取消桌宠实际置顶。"""
         self._set_secondary_windows_topmost_suppressed(True)
-        self._set_secondary_windows_input_bar_hidden(True)
         _present_secondary_window(window)
         self._sync_secondary_window_state()
 
@@ -5782,6 +5959,10 @@ class PetWindow(QWidget):
             except RuntimeError:
                 pass
 
+    def _release_secondary_window(self, window: QWidget) -> None:
+        self._unregister_secondary_window(window)
+        self._sync_secondary_window_state()
+
     def _is_registered_secondary_window(self, window: object) -> bool:
         registered = getattr(self, "_registered_secondary_windows", None)
         return registered is not None and window in registered
@@ -5792,7 +5973,6 @@ class PetWindow(QWidget):
             for window in tuple(getattr(self, "_registered_secondary_windows", set()))
         )
         self._set_secondary_windows_topmost_suppressed(has_visible_secondary_window)
-        self._set_secondary_windows_input_bar_hidden(has_visible_secondary_window)
         set_background_quiesced = getattr(
             self,
             "_set_secondary_windows_background_quiesced",
@@ -5802,22 +5982,19 @@ class PetWindow(QWidget):
             set_background_quiesced(has_visible_secondary_window)
 
     def _set_secondary_windows_background_quiesced(self, quiesced: bool) -> None:
-        """副窗口可见期间暂停桌宠后台 hover 轮询，关闭后恢复。
+        """副窗口可见期间暂停气泡后台 hover 轮询，关闭后恢复。
 
-        设置/历史/日志窗口打开时输入栏已被强制隐藏、hover 也不生效，此时轮询纯属
-        无谓的原生命中测试与重绘，会与副窗口（尤其设置里的下拉弹层）抢占合成器。
-        仅停/起轮询计时器，零视觉变化。
+        输入栏不能被副窗口占用，仍需持续 hover 轮询；这里只让气泡自动隐藏控制器安静。
         """
         quiesced = bool(quiesced)
         if quiesced == bool(getattr(self, "_secondary_windows_background_quiesced", False)):
             return
         self._secondary_windows_background_quiesced = quiesced
         polling_enabled = not quiesced
-        for controller_attr in ("input_bar_animator", "bubble_auto_hide"):
-            controller = getattr(self, controller_attr, None)
-            set_polling_enabled = getattr(controller, "set_polling_enabled", None)
-            if callable(set_polling_enabled):
-                set_polling_enabled(polling_enabled)
+        controller = getattr(self, "bubble_auto_hide", None)
+        set_polling_enabled = getattr(controller, "set_polling_enabled", None)
+        if callable(set_polling_enabled):
+            set_polling_enabled(polling_enabled)
 
     def _is_secondary_window_visible(self, window: object | None) -> bool:
         if window is None:
@@ -5829,17 +6006,6 @@ class PetWindow(QWidget):
             except RuntimeError:
                 return False
         return bool(getattr(window, "visible", False))
-
-    def _set_secondary_windows_input_bar_hidden(self, hidden: bool) -> None:
-        """副窗口打开期间强制隐藏输入栏，避免输入区挡住副窗口。"""
-        hidden = bool(hidden)
-        if hidden == bool(getattr(self, "_secondary_windows_hide_input_bar", False)):
-            return
-        self._secondary_windows_hide_input_bar = hidden
-        input_bar_animator = getattr(self, "input_bar_animator", None)
-        set_force_hidden = getattr(input_bar_animator, "set_force_hidden", None)
-        if callable(set_force_hidden):
-            set_force_hidden(hidden)
 
     def _set_secondary_windows_topmost_suppressed(self, suppressed: bool) -> None:
         """副窗口存活期间临时取消桌宠原生置顶，关闭后按用户配置恢复。"""
@@ -6199,7 +6365,13 @@ class PetWindow(QWidget):
         self.character_profile = profile
         self.system_prompt = load_character_system_prompt(profile)
         self.memory_store.set_scope(profile.id)
-        self.agent_runtime.update_character(self.system_prompt, profile.reply_tones, profile.portrait_choices)
+        self.agent_runtime.update_character(
+            self.system_prompt,
+            profile.reply_tones,
+            profile.portrait_choices,
+            character_id=profile.id,
+            character_name=profile.display_name,
+        )
         self.setWindowTitle(profile.display_name)
         self.name_label.setText(profile.display_name)
         self.input_edit.setPlaceholderText(self._normal_input_placeholder_text(profile))
@@ -6487,7 +6659,7 @@ def _build_screen_awareness_visual_observation_jobs(event: AgentEvent) -> list[V
         VisualObservationJob(
             id=generate_visual_observation_id(),
             source=SCREEN_AWARENESS_VISUAL_SOURCE,
-            user_text="主动屏幕感知上下文批次",
+            user_text=_screen_awareness_visual_user_text(event),
             screen_contexts=[
                 dict(context)
                 for context in screen_contexts
@@ -6495,6 +6667,25 @@ def _build_screen_awareness_visual_observation_jobs(event: AgentEvent) -> list[V
             ],
         )
     ]
+
+
+def _screen_awareness_visual_user_text(event: AgentEvent) -> str:
+    reason = _screen_awareness_text_value(event.payload.get("screen_observation_reason"))
+    if reason:
+        return reason
+    recent = event.payload.get("recent_conversation")
+    if not isinstance(recent, list):
+        return "主动屏幕感知上下文批次"
+    lines = ["主动屏幕感知上下文批次；最近对话："]
+    for item in recent[-4:]:
+        if not isinstance(item, dict):
+            continue
+        role = _screen_awareness_text_value(item.get("role"))
+        content = _screen_awareness_text_value(item.get("content"))
+        if role not in {"user", "assistant"} or not content:
+            continue
+        lines.append(f"- {role}: {_truncate_screen_awareness_recent_conversation_content(content, 160)}")
+    return "\n".join(lines) if len(lines) > 1 else "主动屏幕感知上下文批次"
 
 
 def _build_screen_awareness_recent_conversation(
@@ -6923,3 +7114,91 @@ def _set_macos_window_topmost(window_id: int, enabled: bool) -> None:
         ctypes.c_void_p(selector(b"setCollectionBehavior:")),
         collection_behavior,
     )
+
+
+def _update_runtime_api_clients(
+    window: Any,
+    *,
+    api_profiles: list[ApiConfigProfile],
+    model_selection: ModelSelectionSettings,
+    base_settings: ApiSettings,
+) -> None:
+    """运行时按功能槽位更新 API client。"""
+    chat_slot = resolve_model_slot(api_profiles, model_selection, MODEL_SLOT_CHAT, base_settings)
+    if chat_slot is None:
+        return
+
+    window.api_client.update_settings(chat_slot.settings)
+    window.memory_store.reload_api_settings(chat_slot.settings, wait=False)
+
+    vision_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_VISION_CHAT,
+        base_settings,
+    )
+    window.agent_runtime.vision_api_client = _client_for_explicit_slot(
+        vision_slot,
+        MODEL_SLOT_VISION_CHAT,
+    )
+
+    visual_context_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_VISUAL_CONTEXT,
+        base_settings,
+    )
+    window.agent_runtime.visual_context_api_client = _client_for_explicit_slot(
+        visual_context_slot,
+        MODEL_SLOT_VISUAL_CONTEXT,
+    )
+
+    memory_slot = resolve_model_slot(
+        api_profiles,
+        model_selection,
+        MODEL_SLOT_MEMORY_CURATION,
+        base_settings,
+    )
+    memory_curator = getattr(window, "memory_curator", None)
+    set_api_client = getattr(memory_curator, "set_api_client", None)
+    if callable(set_api_client):
+        set_api_client(
+            OpenAICompatibleClient(memory_slot.settings)
+            if memory_slot is not None
+            else window.api_client
+        )
+    _wire_runtime_llm_event_emitters(window, getattr(window, "_llm_event_emitter", None))
+
+
+def _client_for_explicit_slot(
+    resolved: ResolvedModelSlot | None,
+    slot: str,
+) -> OpenAICompatibleClient | None:
+    if resolved is None or resolved.source_slot != slot:
+        return None
+    return OpenAICompatibleClient(resolved.settings)
+
+
+def _wire_runtime_llm_event_emitters(
+    window: Any,
+    emitter: Callable[[str, dict[str, Any] | None], None] | None,
+) -> None:
+    runtime = getattr(window, "agent_runtime", None)
+    if runtime is not None:
+        for client in (
+            getattr(runtime, "api_client", None),
+            getattr(runtime, "vision_api_client", None),
+            getattr(runtime, "visual_context_api_client", None),
+        ):
+            _set_llm_event_emitter(client, emitter)
+    memory_curator = getattr(window, "memory_curator", None)
+    _set_llm_event_emitter(getattr(memory_curator, "api_client", None), emitter)
+
+
+def _set_llm_event_emitter(
+    client: Any,
+    emitter: Callable[[str, dict[str, Any] | None], None] | None,
+) -> None:
+    set_event_emitter = getattr(client, "set_event_emitter", None)
+    if callable(set_event_emitter):
+        set_event_emitter(emitter)
